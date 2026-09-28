@@ -1,0 +1,26 @@
+# Secrets — the single most important line in this file
+.env
+*.env
+!.env.example
+
+# Runtime output
+logs/
+*.jsonl
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
