@@ -38,7 +38,8 @@ with no paid API key required.
 ## Quick start
 
 ```bash
-cd dex-arb
+git clone https://github.com/samahmed18156/trying.git
+cd trying                                            # the code is at the repo root
 python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
@@ -56,12 +57,23 @@ the reference instead.
 
 ## Two things to do before anything else
 
-### 1. Rotate your CoinMarketCap key
+### 1. Rotate the CoinMarketCap key from the original script
 
-The key `a400d3b15907485fb5ff7820b43af26d` was hard-coded in the original
-`cmc_fetcher.py` and has now been pasted into a chat. Treat it as public:
-revoke it at <https://pro.coinmarketcap.com> and issue a new one. Keys belong
-in `.env`, which is git-ignored — never in source.
+The original `cmc-fetcher.py` hard-coded a live API key as the fallback default:
+
+```python
+CMC_API_KEY = os.getenv("CMC_API_KEY", "<a real key was pasted here>")
+```
+
+That key has been in a public place (a chat transcript, and then this repo's git
+history) so it must be treated as compromised. **Revoke it** at
+<https://pro.coinmarketcap.com> → API Keys, and issue a new one. The new key goes
+in `.env` as `CMC_API_KEY=...`; `.env` is git-ignored, so it never reaches GitHub.
+
+Note that deleting the old file in a later commit does **not** remove the key —
+it is still readable in the first commit's tree. If the repo stays public, purge
+the history (see "Repo hygiene" below). Revoking the key is the step that
+actually matters; everything else is tidiness.
 
 ### 2. Understand why `convert=USDT` does not work
 
@@ -294,6 +306,52 @@ arbitrage is actually profitable:
 
 Set `MIN_EDGE_BPS` high enough to cover all of that, and treat the output as a
 research feed rather than a trade instruction.
+
+---
+
+## Repo hygiene
+
+If this repository stays public:
+
+**Purge the leaked key from history.** Deleting `cmc-fetcher.py` in a new commit
+does not help — `git show <first-commit>:cmc-fetcher.py` still prints the key.
+With only two commits, the simplest fix is to start over:
+
+```bash
+# from a fresh copy of the working tree (no .git)
+rm -rf .git
+git init && git add -A && git commit -m "DEX price fetcher & arbitrage monitor"
+git branch -M main
+git remote add origin https://github.com/samahmed18156/trying.git
+git push --force origin main
+```
+
+Or keep the history and rewrite it with
+[`git filter-repo`](https://github.com/newren/git-filter-repo):
+
+```bash
+pip install git-filter-repo
+git filter-repo --invert-paths --path cmc-fetcher.py
+git push --force origin main
+```
+
+Either way: **revoke the key first.** A purged history does not un-leak a key
+that has already been scraped — GitHub repos are crawled within minutes of
+going public, and leaked API keys are harvested automatically.
+
+**Confirm nothing else is tracked that shouldn't be:**
+
+```bash
+git ls-files | grep -Ei '\.env$|key|secret|credential'   # should print nothing
+```
+
+`.gitignore` here already excludes `.env`, `logs/` and `__pycache__`. Note that
+`.gitignore` only protects files that were *never* committed — it does nothing
+for a secret that is already in history.
+
+**Consider a `LICENSE`.** Right now there is none, which legally means nobody
+may copy or modify the code, even though it is publicly visible. If you want it
+usable, add MIT or Apache-2.0.
 
 ---
 
