@@ -37,10 +37,25 @@ with no paid API key required.
 
 ## Quick start
 
+**Windows (PyCharm / cmd / PowerShell)** — double-click `run.bat`, or:
+
+```bat
+cd C:\Users\SERVER\PycharmProjects\trying
+run.bat                 REM creates .venv, installs deps, runs a scan
+run.bat scan --both     REM any main.py subcommand works
+run.bat verify          REM cross-checks the maths against the live chain
+run.bat selftest        REM 36 offline tests, no network needed
+```
+
+`run.bat` must be run **from the project root** (it `cd`s there itself) — the
+imports are flat, so launching `main.py` from a parent directory fails.
+
+**macOS / Linux:**
+
 ```bash
 git clone https://github.com/samahmed18156/trying.git
 cd trying                                            # the code is at the repo root
-python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # optional — it runs with no keys at all
@@ -48,6 +63,31 @@ python main.py selftest     # 36 offline maths tests, no network needed
 python main.py info         # config + live check of every RPC and price source
 python main.py scan         # one-shot ETH/USDT comparison
 ```
+
+### Running it inside PyCharm
+
+Right-click `main.py` → *Modify Run Configuration* and set:
+
+| Field | Value |
+|---|---|
+| Script path | `C:\Users\SERVER\PycharmProjects\trying\main.py` |
+| Parameters | `scan` (or `verify`, `watch --every 10`, `selftest`) |
+| Working directory | `C:\Users\SERVER\PycharmProjects\trying` |
+| Python interpreter | the project's `.venv` |
+
+The **working directory** is the field people miss: `config.py` loads `.env`
+relative to it, and a wrong value silently means "no CMC key found".
+
+### `cmc_fetcher.py` — note the underscore
+
+The original file was `cmc-fetcher.py` (hyphen). It has been **replaced** by
+`cmc_fetcher.py` (underscore) and the hyphenated file no longer exists — that is
+by design, since the old one contained the hard-coded API key. Do not restore it
+from git history.
+
+`cmc_fetcher.py` is a compatibility shim only: it prints one number and needs
+`CMC_API_KEY` in `.env`, or it exits 1 with *"CMC_API_KEY is not set"*. The real
+entry point is `main.py`, which needs no key at all.
 
 `scan` needs no API key: it falls back to free public RPC endpoints and to
 Coinbase/Kraken public order books. Add `CMC_API_KEY` to use CoinMarketCap as
