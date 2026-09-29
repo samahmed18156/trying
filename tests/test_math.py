@@ -61,7 +61,17 @@ class SkipTest(Exception):
     README promises works on a bare Python install) look like the project is
     broken. Reporting it as a silent pass would be worse: it would claim coverage
     that does not exist.
+
+    `hint` is advice specific to THIS reason, and may be empty. A blanket "install
+    the requirements" under every skip is actively misleading: the solc
+    execute-bit test skips on Windows because the OS has no execute bit, and no
+    amount of pip installing will ever make it run there.
     """
+
+    def __init__(self, reason: str, hint: str = ""):
+        super().__init__(reason)
+        self.reason = reason
+        self.hint = hint
 
 
 def requires(*modules: str):
@@ -84,7 +94,9 @@ def requires(*modules: str):
                 missing.append(f"{name} ({type(exc).__name__})")
         if missing:
             def skipped():
-                raise SkipTest("needs " + ", ".join(missing))
+                raise SkipTest(
+                    "needs " + ", ".join(missing),
+                    hint="python -m pip install -r requirements.txt")
             skipped.__name__ = fn.__name__
             skipped.__doc__ = fn.__doc__
             return test(skipped)
@@ -2622,10 +2634,29 @@ def wallet_password_prompt_retries_then_gives_up_with_guidance():
       * an explicit --password fails immediately with no prompt, so a scripted or
         CI run cannot hang waiting for input nobody is there to type.
     """
+    import contextlib
+    import io
     import tempfile
     import types
     import arb.wallet as W
     import main as cli
+
+    def call(args):
+        """
+        Run _load_wallet with its stdout captured.
+
+        Capturing is not cosmetic. These paths print retry notices and a long
+        block of recovery guidance, and printing them into the middle of a green
+        test run makes a passing suite look like it is failing - which is exactly
+        what happened the first time this ran on a real machine. Captured, the
+        text becomes something to assert on instead.
+        """
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                return cli._load_wallet(args), buf.getvalue(), None
+            except SystemExit as exc:
+                return None, buf.getvalue(), exc
 
     # main.py binds `fmt` (and the rest of its imports) inside _load_deps(),
     # which main() runs for every command except the offline ones. Importing the
@@ -2651,20 +2682,32 @@ def wallet_password_prompt_retries_then_gives_up_with_guidance():
                 calls["n"] += 1
                 return real_load(path_, password)
             W.load_wallet = counting_load
-            account, used = cli._load_wallet(types.SimpleNamespace(path=path, password=""))
+            (account, used), out, exc = call(types.SimpleNamespace(path=path, password=""))
+            check(exc is None, f"a correct password on the third try still failed: {out}")
             check(account.address == made.address, "a retry did not reach the account")
             check(used == path, "the wallet path was not returned")
             check(calls["n"] == 3, f"expected 3 decrypt attempts, saw {calls['n']}")
+            check(out.count("attempts left") + out.count("attempt left") == 2,
+                  f"three attempts should warn twice, got: {out!r}")
 
             # --- 2. three wrongs -> SystemExit, and the guidance is printed ----
             answers = iter(["a", "b", "c"])
             W.prompt_password = lambda p=None: next(answers)
-            try:
-                cli._load_wallet(types.SimpleNamespace(path=path, password=""))
-            except SystemExit as exc:
-                check(exc.code == 2, f"should exit 2, got {exc.code}")
-            else:
-                raise AssertionError("three wrong passwords were accepted")
+            result, out, exc = call(types.SimpleNamespace(path=path, password=""))
+            check(exc is not None, "three wrong passwords were accepted")
+            check(exc.code == 2, f"should exit 2, got {exc.code}")
+            # The long guidance must appear exactly ONCE, on the final failure -
+            # printing it after every attempt would bury the retry notices.
+            check(out.count("no way to recover") == 1,
+                  f"the guidance should print once, printed "
+                  f"{out.count('no way to recover')} time(s)")
+            # Count a marker that appears exactly once per guidance BLOCK. An
+            # earlier version of this assertion counted "--no-password", which
+            # occurs twice inside a single block (once in the command, once in the
+            # explanation), so it failed while the behaviour was correct.
+            check(out.count("Your options:") == 1,
+                  f"the guidance block should print once, printed "
+                  f"{out.count('Your options:')} time(s)")
             # The prompt must not be asked a fourth time.
             try:
                 next(answers)
@@ -2684,12 +2727,9 @@ def wallet_password_prompt_retries_then_gives_up_with_guidance():
                 attempts["n"] += 1
                 return real_load(path_, password)
             W.load_wallet = one_try
-            try:
-                cli._load_wallet(types.SimpleNamespace(path=path, password="wrong"))
-            except SystemExit as exc:
-                check(exc.code == 2, f"should exit 2, got {exc.code}")
-            else:
-                raise AssertionError("a wrong --password was accepted")
+            result, out, exc = call(types.SimpleNamespace(path=path, password="wrong"))
+            check(exc is not None, "a wrong --password was accepted")
+            check(exc.code == 2, f"should exit 2, got {exc.code}")
             check(prompted["n"] == 0,
                   "an explicit --password must never fall back to prompting - "
                   "that would hang an unattended run")
@@ -2787,9 +2827,9 @@ def run_all(verbose: bool = True) -> int:
         try:
             fn()
         except SkipTest as exc:
-            skips.append((name, str(exc)))
+            skips.append((name, exc.reason, exc.hint))
             if verbose:
-                print(f"  skip  {name}   ({exc})")
+                print(f"  skip  {name}   ({exc.reason})")
         except Exception:  # noqa: BLE001
             FAILURES.append(name)
             if verbose:
@@ -2802,7 +2842,13 @@ def run_all(verbose: bool = True) -> int:
 
     if verbose:
         ran = len(TESTS) - len(skips)
-        line = f"\n{passed}/{ran} passed"
+        # "0/0 passed" is technically true and reads like a broken suite, which is
+        # what it would look like if every remaining test were gated on a package
+        # this machine does not have.
+        if ran == 0:
+            line = "\nno tests could run in this environment"
+        else:
+            line = f"\n{passed}/{ran} passed"
         if skips:
             line += f", {len(skips)} skipped"
         line += "" if FAILURES else " — all good"
@@ -2810,9 +2856,13 @@ def run_all(verbose: bool = True) -> int:
             line += f", {len(FAILURES)} FAILED"
         print(line)
         if skips:
-            reasons = sorted({why for _, why in skips})
+            reasons = sorted({why for _, why, _ in skips})
             print("  skipped because: " + "; ".join(reasons))
-            print("  Install them with:  python -m pip install -r requirements.txt")
+            # Only advise installing something when a skip was actually caused by
+            # a missing package.
+            hints = sorted({h for _, _, h in skips if h})
+            for h in hints:
+                print(f"  To run those:  {h}")
     return len(FAILURES)
 
 

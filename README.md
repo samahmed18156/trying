@@ -204,7 +204,12 @@ Those 11 are not failures and not silent passes. They cover things that genuinel
 cannot exist without the libraries — keystore encryption, transaction signing,
 EIP-55 checksums (keccak-256, which Python's `hashlib` does not ship: it has
 SHA3, and SHA3 and keccak differ in padding), and ABI encoding. Once you install
-the dependencies the same command reports **75/75 passed**, with nothing skipped.
+the dependencies the same command reports **75/75 passed** on Linux and macOS. On
+Windows it reports **74/74 passed, 1 skipped**, because the one skipped test
+repairs a lost execute bit on the cached `solc` binary and Windows has no execute
+bit — file access there is governed by ACLs, so there is nothing for it to check.
+That skip prints no "install something" advice, because installing something
+would not make it run.
 
 A skip is reported separately from a pass on purpose. Counting an unrunnable test
 as a failure would make the documented first step look like a broken project;
