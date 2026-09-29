@@ -19,7 +19,15 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from dotenv import load_dotenv
+# python-dotenv is optional. Without it, .env is simply ignored and settings
+# come from real environment variables and the defaults below. Making this
+# import non-fatal is what allows `main.py selftest` — pure offline maths — to
+# run on a machine with no third-party packages installed at all.
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*_args, **_kwargs) -> bool:
+        return False
 
 load_dotenv()  # reads .env from the current working directory (or any parent)
 

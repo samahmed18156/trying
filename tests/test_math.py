@@ -31,7 +31,7 @@ from arb.signals import estimate_gas, evaluate                     # noqa: E402
 from config import Settings, get_network                           # noqa: E402
 from dex import uniswap_v2_math as v2math                          # noqa: E402
 from dex import uniswap_v3_math as v3                              # noqa: E402
-from dex.fetcher import QuoteSnapshot                              # noqa: E402
+from dex.types import QuoteSnapshot                              # noqa: E402
 from index.base import PricePoint                                  # noqa: E402
 from rpc import MockNode                                           # noqa: E402
 

@@ -16,11 +16,15 @@ import logging
 import time
 from typing import Any, Callable, List, Optional
 
-from web3 import Web3
-from web3.middleware import ExtraDataToPOAMiddleware
-from web3.providers import HTTPProvider
-
 from config import Network
+
+# web3 is imported inside NodeProvider.connect() rather than here.
+#
+# This module also defines MockNode, the offline stand-in the test suite uses to
+# exercise the whole fetch -> compare -> signal pipeline without a node. MockNode
+# needs nothing from web3, and a module-level `from web3 import Web3` would make
+# it unimportable on a bare Python install — which is the one environment
+# `main.py selftest` promises to work in.
 
 log = logging.getLogger("rpc")
 
@@ -39,16 +43,21 @@ class NodeProvider:
     def __init__(self, network: Network, timeout: float = 10.0):
         self.network = network
         self.timeout = timeout
-        self.w3: Optional[Web3] = None
+        self.w3: Optional[Any] = None   # a web3.Web3 once connected()
         self.active_url: Optional[str] = None
         self._chain_id: Optional[int] = None
 
     # -- connection ---------------------------------------------------------
-    def connect(self) -> Web3:
+    def connect(self) -> Any:
+        """Return a connected web3.Web3, failing over across the endpoint list."""
         """Try every configured endpoint until one answers and matches chain_id."""
         errors: List[str] = []
         for url in self.network.rpc_urls:
             try:
+                from web3 import Web3
+                from web3.middleware import ExtraDataToPOAMiddleware
+                from web3.providers import HTTPProvider
+
                 w3 = Web3(HTTPProvider(url, request_kwargs={"timeout": self.timeout}))
                 if w3.middleware_onion is not None and self.network.chain_id in POA_CHAIN_IDS:
                     w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)

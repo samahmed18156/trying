@@ -105,75 +105,12 @@ V3_POOL_ABI = UNISWAP_V3_POOL_ABI + _V3_TICK_BITMAP_ABI + _V3_FEE_GROWTH_ABI
 # --------------------------------------------------------------------------
 # Result types
 # --------------------------------------------------------------------------
-@dataclass
-class QuoteSnapshot:
-    """Version-agnostic view of one DEX price observation."""
-
-    dex: str                    # "uniswap_v2" | "uniswap_v3" | ...
-    network: str
-    pool_address: str
-    fee_tier: Optional[int]     # V3 only
-    base_symbol: str
-    quote_symbol: str
-    base_address: str
-    quote_address: str
-    base_decimals: int
-    quote_decimals: int
-    base_is_token0: bool
-
-    mid_price: float            # quote per 1 base, no fees / no impact
-    trade_size_base: float      # human units of base used for the exec quote
-    amount_in_raw: int          # raw base spent
-    amount_out_raw: int         # raw quote received
-    exec_price: float           # quote per base actually received
-    impact_bps: float           # mid vs exec, in basis points
-
-    liquidity_raw: Optional[int] = None       # V3 active liquidity
-    reserve_base_raw: Optional[int] = None    # V2 only
-    reserve_quote_raw: Optional[int] = None   # V2 only
-    sqrt_price_x96: Optional[int] = None      # V3 only
-    tick: Optional[int] = None                # V3 only
-    ticks_crossed: Optional[int] = None       # V3 only
-    block_number: int = 0
-    fetched_at: float = field(default_factory=time.time)
-    rpc_calls: int = 0
-
-    # -- convenience --------------------------------------------------------
-    @property
-    def tvl_quote(self) -> float:
-        """Pool depth expressed in quote units (rough, V2-style estimate)."""
-        if self.reserve_quote_raw is not None:
-            return 2 * v2math.from_raw(self.reserve_quote_raw, self.quote_decimals)
-        if self.liquidity_raw:
-            # For V3, quote-token balance isn't in `liquidity`; fall back to
-            # mid price * notional of the trade as a very rough proxy is wrong,
-            # so return None-ish 0 and let the caller use `liquidity_raw`.
-            return 0.0
-        return 0.0
-
-    @property
-    def label(self) -> str:
-        fee = f" {fee_to_percent(self.fee_tier):.2f}%" if self.fee_tier else ""
-        return f"{self.dex}{fee} {self.pool_address[:10]}…"
-
-    def as_dict(self) -> dict:
-        d = self.__dict__.copy()
-        d.pop("fetched_at", None)
-        d["fetched_at"] = self.fetched_at
-        return d
+# Defined in dex/types.py so that they can be imported without web3 being
+# installed (see that module's docstring). Re-exported here for backwards
+# compatibility — `from dex.fetcher import QuoteSnapshot` still works.
+from dex.types import DexError, PoolNotFound, QuoteSnapshot  # noqa: E402,F401
 
 
-class DexError(RuntimeError):
-    pass
-
-
-class PoolNotFound(DexError):
-    pass
-
-
-# --------------------------------------------------------------------------
-# Shared helpers
-# --------------------------------------------------------------------------
 class ChainReader:
     """Caching wrapper over a node provider (NodeProvider or MockNode)."""
 

@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from dex.fetcher import QuoteSnapshot
+from dex.types import QuoteSnapshot   # dependency-free; see dex/types.py
 from index.base import PricePoint
 
 log = logging.getLogger("arb")

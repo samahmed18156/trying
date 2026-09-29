@@ -24,12 +24,66 @@ import logging
 import signal
 import sys
 import time
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
-import formatting as fmt
-from config import (NETWORKS, Settings, fee_to_bps, fee_to_percent,
-                    get_network, token_address)
-from dex_price_fetcher import DexPriceFetcher, ScanResult
+import bootstrap
+
+if TYPE_CHECKING:  # annotations only — never imported at runtime
+    from config import Settings
+    from dex_price_fetcher import ScanResult
+
+# ---------------------------------------------------------------------------
+# Deferred imports
+# ---------------------------------------------------------------------------
+# `formatting`, `config` and `dex_price_fetcher` are bound by _load_deps() once
+# the preflight check has confirmed the third-party packages are installed.
+#
+# Why not import them at the top like normal? Because dex_price_fetcher pulls in
+# web3, and a missing web3 would otherwise crash EVERY command with a raw
+# traceback — including `selftest`, which is pure integer maths and needs
+# nothing but the standard library. Deferring the import keeps the one command
+# that always works, always working, and turns every other failure into setup
+# instructions instead of a stack trace.
+fmt = None
+NETWORKS = None
+Settings = None
+fee_to_bps = None
+fee_to_percent = None
+get_network = None
+token_address = None
+DexPriceFetcher = None
+
+_DEPS_LOADED = False
+
+
+def _load_deps() -> None:
+    """Bind the deferred names above. Call after bootstrap.preflight() passes."""
+    global fmt, NETWORKS, Settings, fee_to_bps, fee_to_percent
+    global get_network, token_address, DexPriceFetcher, _DEPS_LOADED
+    if _DEPS_LOADED:
+        return
+
+    import formatting as _fmt
+    from config import (NETWORKS as _NETWORKS, Settings as _Settings,
+                        fee_to_bps as _fee_to_bps, fee_to_percent as _fee_to_percent,
+                        get_network as _get_network, token_address as _token_address)
+    from dex_price_fetcher import DexPriceFetcher as _DexPriceFetcher
+
+    fmt = _fmt
+    NETWORKS = _NETWORKS
+    Settings = _Settings
+    fee_to_bps = _fee_to_bps
+    fee_to_percent = _fee_to_percent
+    get_network = _get_network
+    token_address = _token_address
+    DexPriceFetcher = _DexPriceFetcher
+    _DEPS_LOADED = True
+
+
+# Kept in step with the keys of config.NETWORKS. Duplicated on purpose so that
+# `build_parser()` — and therefore `selftest` and `--help` — works before any
+# third-party package has been imported.
+_NETWORK_CHOICES = ["ethereum", "base"]
 
 STOP = False
 
@@ -195,6 +249,7 @@ def render_compact(result: ScanResult, iteration: int) -> None:
 # commands
 # --------------------------------------------------------------------------
 def cmd_info(args) -> int:
+    from dex_price_fetcher import DexPriceFetcher
     settings = _apply_overrides(args, Settings())
     net = get_network(settings.network)
 
@@ -261,6 +316,7 @@ def cmd_info(args) -> int:
 
 
 def cmd_scan(args) -> int:
+    from dex_price_fetcher import DexPriceFetcher
     settings = _apply_overrides(args, Settings())
     try:
         fetcher = DexPriceFetcher(
@@ -294,6 +350,7 @@ def cmd_scan(args) -> int:
 
 
 def cmd_watch(args) -> int:
+    from dex_price_fetcher import DexPriceFetcher
     settings = _apply_overrides(args, Settings())
     if args.log:
         settings.log_jsonl = args.log
@@ -358,6 +415,7 @@ def _post_webhook(url: str, result: ScanResult) -> None:
 
 
 def cmd_verify(args) -> int:
+    from dex_price_fetcher import DexPriceFetcher
     """
     Validate the local maths against the chain itself.
 
@@ -549,7 +607,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp):
-        sp.add_argument("--network", choices=list(NETWORKS), help="chain to query")
+        sp.add_argument("--network", choices=_NETWORK_CHOICES, help="chain to query")
         sp.add_argument("--base", help="base symbol (default ETH)")
         sp.add_argument("--quote", help="quote symbol (default USDT)")
         sp.add_argument("--size", type=float, help="trade size in base units (default 1.0)")
@@ -597,6 +655,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # Dependency preflight BEFORE importing anything that needs web3/requests.
+    # Offline commands (`selftest`) skip the heavy imports entirely, so they run
+    # on a bare Python install with nothing from requirements.txt present.
+    if not bootstrap.preflight(args.command):
+        return 2
+    if args.command not in bootstrap.OFFLINE_COMMANDS:
+        _load_deps()
+
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",

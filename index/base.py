@@ -36,7 +36,14 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 
-import requests
+# `requests` is imported inside _get_json() rather than here.
+#
+# This module defines PricePoint, the plain dataclass that carries one reference
+# price (with its bid/ask) through the whole pipeline. PricePoint needs nothing
+# but the standard library, but a module-level `import requests` would make it
+# unimportable without that package — and tests/test_math.py constructs
+# PricePoints directly. `main.py selftest` is supposed to run on a bare Python
+# install, so the HTTP dependency stays local to the function that does HTTP.
 
 log = logging.getLogger("index")
 
@@ -97,6 +104,8 @@ class IndexError_(RuntimeError):
 
 def _get_json(url: str, headers: Optional[dict] = None, params: Optional[dict] = None,
               timeout: int = 15) -> dict:
+    import requests  # local import: see the note at the top of this module
+
     resp = requests.get(url, headers=headers or {}, params=params or {}, timeout=timeout)
     resp.raise_for_status()
     return resp.json()

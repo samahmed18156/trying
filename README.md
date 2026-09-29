@@ -78,6 +78,86 @@ Right-click `main.py` → *Modify Run Configuration* and set:
 The **working directory** is the field people miss: `config.py` loads `.env`
 relative to it, and a wrong value silently means "no CMC key found".
 
+### "can't open file …`[cmc-fetcher.py](http://cmc-fetcher.py)`"
+
+If PyCharm reports this, the problem is **not** a missing file — it is a broken
+*Run Configuration*. That string is Markdown link syntax (`[text](url)`) that
+got saved as a script path, so PyCharm is asking Python to open a file literally
+named `[cmc-fetcher.py](http://cmc-fetcher.py)`. Such a file never existed, and
+deleting the real `cmc-fetcher.py` will not change the error, because the bad
+path is stored in `.idea\workspace.xml`, not on disk.
+
+You can confirm it from the error text — the path it quotes contains `[`, `]`,
+`(` and `)`, which no real filename here does.
+
+Fix:
+
+1. **Run** → **Edit Configurations…**
+2. Select the entry named `[cmc-fetcher.py](http://cmc-fetcher.py)` in the left
+   list → click **−** (Remove) → **OK**.
+3. Pick up the shared configurations instead (below), or press **+** →
+   **Python** and set the four fields from the table above.
+
+If the bogus entry keeps coming back, close PyCharm and delete the stale config
+by hand:
+
+```bat
+cd C:\Users\SERVER\PycharmProjects\trying
+rmdir /s /q .idea
+```
+
+PyCharm rebuilds `.idea` on the next open. (`.idea/` is git-ignored, so this
+does not affect the repository.)
+
+### "ModuleNotFoundError: No module named 'web3'"
+
+The packages are not installed **into the interpreter PyCharm is using**. Note
+which Python the traceback names — if it says
+`C:\Users\SERVER\AppData\Local\Programs\Python\Python313\python.exe`, that is
+your *system* Python, not a project venv, so packages you installed into a venv
+are invisible to it (and the reverse also happens).
+
+```bat
+cd C:\Users\SERVER\PycharmProjects\trying
+run.bat
+```
+
+`run.bat` creates `.venv`, installs `requirements.txt` into it, and runs a scan
+— so afterwards, point PyCharm at that interpreter:
+**Settings → Project → Python Interpreter → Add Interpreter → Existing →
+`.venv\Scripts\python.exe`**.
+
+Or install into the system interpreter that PyCharm is already using:
+
+```bat
+C:\Users\SERVER\AppData\Local\Programs\Python\Python313\python.exe -m pip install -r requirements.txt
+```
+
+Either way, `python main.py scan` now prints a plain-language list of what is
+missing and the exact command to fix it, instead of a traceback. And
+`python main.py selftest` needs **no dependencies at all** — it is pure integer
+maths on the standard library, so it works on a completely bare install and is
+the fastest way to confirm your checkout and interpreter are healthy.
+
+### Shared Run Configurations (`.run/`)
+
+This repo ships ready-made PyCharm run configurations in `.run/`. They are
+shared through git (unlike `.idea/workspace.xml`), so they appear in the
+top-right dropdown automatically after a reload:
+
+| Configuration | Runs |
+|---|---|
+| **Selftest** | `main.py selftest` — 36 offline maths tests, no network, no keys. Run this first. |
+| **Info** | `main.py info` — live check of every RPC endpoint and price source |
+| **Scan** | `main.py scan` — one-shot ETH/USDT comparison |
+| **Verify** | `main.py verify` — cross-checks the maths against the live chain |
+| **Watch** | `main.py watch --every 10` — continuous monitoring |
+
+They all target `main.py` with the working directory set to the project root.
+`cmc_fetcher.py` deliberately has **no** run configuration: it is a
+compatibility shim that prints one number and requires `CMC_API_KEY`, while
+`main.py` is the real entry point and needs no key.
+
 ### `cmc_fetcher.py` — note the underscore
 
 The original file was `cmc-fetcher.py` (hyphen). It has been **replaced** by
@@ -298,27 +378,42 @@ the chain automatically. Verify the address on the chain's block explorer first
 ## Project layout
 
 ```
-dex-arb/
+trying/
 ├── main.py                     CLI: info | scan | watch | verify | selftest
+├── bootstrap.py                dependency preflight -> readable setup errors
 ├── config.py                   networks, contract addresses, thresholds, fee units
 ├── rpc.py                      node connection with endpoint failover + chain-id check
+│                               (also MockNode, the offline stand-in used by tests)
 ├── abis.py                     minimal hand-written ABIs (no Etherscan key needed)
 ├── dex_price_fetcher.py        orchestrator — the DexPriceFetcher class
 ├── formatting.py               colours and tables, no dependencies
-├── cmc_fetcher.py              drop-in replacement for the original script
+├── cmc_fetcher.py              compatibility shim for the original script
+├── run.bat                     Windows: creates .venv, installs deps, runs a scan
+├── .run/                       shared PyCharm run configurations (committed)
 ├── dex/
 │   ├── uniswap_v2_math.py      constant-product maths, fees, decimals
 │   ├── uniswap_v3_math.py      port of TickMath/SwapMath/TickBitmap + swap sim
-│   └── fetcher.py              on-chain readers -> QuoteSnapshot
+│   ├── types.py                QuoteSnapshot — dependency-free result type
+│   └── fetcher.py              on-chain readers (needs web3) -> QuoteSnapshot
 ├── index/
 │   ├── base.py                 PricePoint, IndexPriceFeed (multi-source failover)
 │   ├── cmc.py                  CoinMarketCap, with the cross-rate fix
 │   └── fallbacks.py            Coinbase + Kraken order books, no key needed
 ├── arb/
 │   └── signals.py              gas costing and the trade/no-trade decision
+├── examples/
+│   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            36 offline tests
+    └── test_math.py            36 offline tests — no network, no dependencies
 ```
+
+`dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`
+being installed: `dex/fetcher.py` re-exports it, so
+`from dex.fetcher import QuoteSnapshot` keeps working. Same reasoning puts the
+`requests` import inside `index/base.py::_get_json()` and the `web3` imports
+inside `rpc.py::NodeProvider.connect()` — those modules also define pure-Python
+types (`PricePoint`, `MockNode`) that the offline tests construct directly. The
+net effect is that `main.py selftest` runs on a bare Python install.
 
 ---
 
