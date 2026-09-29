@@ -63,19 +63,51 @@ interface IPancakeV2Router {
     ) external returns (uint256[] memory amounts);
 }
 
-interface IPancakeV3Router {
-    struct ExactInputSingleParams {
-        address tokenIn;
-        address tokenOut;
-        uint24 fee;
-        address recipient;
-        uint256 deadline;
-        uint256 amountIn;
-        uint256 amountOutMinimum;
-        uint160 sqrtPriceLimitX96;
-    }
+// ---------------------------------------------------------------------------
+// The two `exactInputSingle` shapes that exist in the wild
+// ---------------------------------------------------------------------------
+// There is no single Uniswap-V3-style router ABI. Whether `deadline` is part of
+// the params struct differs per deployment, and it differs BETWEEN MAINNET AND
+// TESTNET OF THE SAME DEX, so it cannot be hard-coded:
+//
+//   8 fields, WITH deadline   0x414bf389   PancakeSwap V3 on BSC MAINNET
+//                                          Uniswap V3 SwapRouter (v1) on Ethereum
+//   7 fields, NO deadline     0x04e45aaf   PancakeSwap V3 on BSC TESTNET
+//                                          Uniswap V3 SwapRouter02 on Ethereum
+//
+// Verified by fetching each router's runtime bytecode and searching it for the
+// 4-byte selector, which is what its dispatcher compares against. Calling the
+// wrong shape does not fail loudly: the router has no fallback, so the call
+// matches nothing and reverts with EMPTY returndata. On chain that looks like
+// `execution reverted: 0x` and gives no hint that an ABI shape was wrong - it
+// reads like a mystery failure in the pool or the tokens.
+//
+// So both shapes are encoded explicitly and selected by a flag the caller sets.
+bytes4 constant SEL_EXACT_INPUT_SINGLE_WITH_DEADLINE = 0x414bf389;
+bytes4 constant SEL_EXACT_INPUT_SINGLE_NO_DEADLINE = 0x04e45aaf;
 
-    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+/// The 8-field shape. `recipient`, `deadline` and `amountIn` are filled in by
+/// this contract, not trusted from the caller.
+struct V3ParamsWithDeadline {
+    address tokenIn;
+    address tokenOut;
+    uint24 fee;
+    address recipient;
+    uint256 deadline;
+    uint256 amountIn;
+    uint256 amountOutMinimum;
+    uint160 sqrtPriceLimitX96;
+}
+
+/// The 7-field shape: identical, minus `deadline`.
+struct V3ParamsNoDeadline {
+    address tokenIn;
+    address tokenOut;
+    uint24 fee;
+    address recipient;
+    uint256 amountIn;
+    uint256 amountOutMinimum;
+    uint160 sqrtPriceLimitX96;
 }
 
 contract FlashArb {
@@ -125,6 +157,12 @@ contract FlashArb {
     error PathEndpointsMismatch();
     error Unprofitable(int256 profit, uint256 minProfit);
     error ZeroAddress();
+    /// The V3 router call failed and gave no reason. Almost always means the
+    /// router does not implement the selector we used, i.e. v3RouterUsesDeadline
+    /// was set for the wrong shape.
+    error V3RouterCallFailed();
+    /// The V3 router returned success but not a decodable uint256.
+    error V3RouterBadReturn(uint256 length);
 
     constructor() {
         owner = msg.sender;
@@ -158,8 +196,13 @@ contract FlashArb {
         address[] v2Path;
         uint256 v2AmountOutMin;
         address v3Router;
-        IPancakeV3Router.ExactInputSingleParams v3Params;
+        V3ParamsWithDeadline v3Params;
         uint256 minProfit;
+        /// Which `exactInputSingle` shape `v3Router` implements: true for the
+        /// 8-field one that carries `deadline`, false for the 7-field one that
+        /// does not. See the comment above the two structs - this varies per
+        /// deployment and cannot be inferred from the chain.
+        bool v3RouterUsesDeadline;
     }
 
     // -----------------------------------------------------------------------
@@ -237,11 +280,35 @@ contract FlashArb {
         uint256 haveIntermediate = _balanceOf(intermediate, address(this));
         _approve(intermediate, params.v3Router, haveIntermediate);
         {
-            IPancakeV3Router.ExactInputSingleParams memory v3 = params.v3Params;
+            V3ParamsWithDeadline memory v3 = params.v3Params;
             v3.amountIn = haveIntermediate;
             v3.recipient = address(this);
             v3.deadline = block.timestamp;
-            o.leg2Out = IPancakeV3Router(params.v3Router).exactInputSingle(v3);
+
+            bytes memory payload = params.v3RouterUsesDeadline
+                ? abi.encodeWithSelector(SEL_EXACT_INPUT_SINGLE_WITH_DEADLINE, v3)
+                : abi.encodeWithSelector(
+                    SEL_EXACT_INPUT_SINGLE_NO_DEADLINE,
+                    V3ParamsNoDeadline(
+                        v3.tokenIn, v3.tokenOut, v3.fee, v3.recipient,
+                        v3.amountIn, v3.amountOutMinimum, v3.sqrtPriceLimitX96
+                    )
+                );
+
+            (bool ok, bytes memory ret) = params.v3Router.call(payload);
+            if (!ok) {
+                // Bubble the router's own reason up rather than replacing it with
+                // a generic one. INSUFFICIENT_OUTPUT_AMOUNT arriving intact is
+                // what tells the caller their slippage floor was too tight; an
+                // EMPTY returndata is the distinct signature of a selector the
+                // router does not implement, which points at v3RouterUsesDeadline.
+                if (ret.length == 0) revert V3RouterCallFailed();
+                assembly {
+                    revert(add(ret, 32), mload(ret))
+                }
+            }
+            if (ret.length < 32) revert V3RouterBadReturn(ret.length);
+            o.leg2Out = abi.decode(ret, (uint256));
         }
 
         // ---- repay the flash loan -------------------------------------------

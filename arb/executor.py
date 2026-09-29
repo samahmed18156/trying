@@ -60,6 +60,11 @@ class ArbPlan:
     v3_fee: int
     v3_amount_out_min: int
     min_profit: int = 0
+    # Which exactInputSingle shape the V3 router implements: True for the 8-field
+    # one carrying `deadline`. Determined from the router's bytecode by
+    # v3_router_uses_deadline(); never guessed, because a wrong guess reverts with
+    # empty data and no explanation.
+    v3_uses_deadline: bool = True
 
     # Human-readable context, not sent on chain.
     buy_label: str = ""
@@ -110,6 +115,7 @@ class ArbPlan:
             self.v3_router,
             self.v3_params,
             self.min_profit,
+            self.v3_uses_deadline,
         ),)
 
     def describe(self) -> List[str]:
@@ -120,6 +126,7 @@ class ArbPlan:
             f"         path {' -> '.join(self.v2_path)}",
             f"         minimum out {self.v2_amount_out_min:,} wei",
             f"leg 2    V3 {self.sell_label or 'router'}  {self.v3_router}  fee {self.v3_fee}",
+            f"         router ABI {'8-field exactInputSingle (with deadline)' if self.v3_uses_deadline else '7-field exactInputSingle (no deadline)'}",
             f"         {self.v3_token_in} -> {self.v3_token_out}",
             f"         minimum out {self.v3_amount_out_min:,} wei",
             f"repay    borrowed + flash fee (fee estimated at {self.expected_flash_fee:,} wei)",
@@ -145,6 +152,35 @@ def to_wei(human: float, decimals: int = 18) -> int:
     if ctx.prec < 60:
         ctx.prec = 60
     value = Decimal(str(human)) * (Decimal(10) ** decimals)
+    return int(value)
+
+
+def output_floor(expected_out_human: float, bps: float, decimals: int = 18) -> int:
+    """
+    The minimum-output floor for a leg, given what that leg is EXPECTED to output.
+
+    `expected_out_human` must already be expressed in the token the leg pays out,
+    and `decimals` must be that token's. Getting either wrong does not look like a
+    unit error - it looks like the pool refusing the trade:
+
+        PancakeRouter: INSUFFICIENT_OUTPUT_AMOUNT
+
+    which reads as slippage or a stale price, and sends you chasing the pool
+    instead of your own arithmetic. Denominating leg 1's floor in the quote token
+    while the router checks it against the base token made the floor ~12x too
+    large on a WBNB/USDT pair at price 11.94, so every run reverted on the very
+    first leg. Caught by simulating with eth_call before spending any gas.
+    """
+    from decimal import Decimal, getcontext
+
+    ctx = getcontext()
+    if ctx.prec < 60:
+        ctx.prec = 60
+    keep = (Decimal(int(BPS)) - Decimal(str(bps))) / Decimal(int(BPS))
+    value = Decimal(str(expected_out_human)) * keep * (Decimal(10) ** decimals)
+    # int() truncates, so the floor is biased down by at most one wei. That is the
+    # safe direction: a floor one wei too high reverts a trade that would have
+    # worked, and one wei too low costs nothing.
     return int(value)
 
 
@@ -174,6 +210,58 @@ def _slippage_floor(exec_price: float, amount_in: float, bps: float,
     gross = Decimal(str(amount_in)) * Decimal(str(exec_price))
     keep = gross * (Decimal(int(BPS)) - Decimal(str(bps))) / Decimal(int(BPS))
     return int(keep * (Decimal(10) ** decimals))
+
+
+# The two exactInputSingle selectors, without the 0x prefix so they can be
+# searched for directly in a router's runtime bytecode. See contracts/FlashArb.sol
+# for why both exist.
+V3_SEL_WITH_DEADLINE = "414bf389"   # 8-field: PancakeSwap V3 BSC MAINNET, Uniswap V3 v1
+V3_SEL_NO_DEADLINE = "04e45aaf"     # 7-field: PancakeSwap V3 BSC TESTNET, SwapRouter02
+
+_ROUTER_SHAPE_CACHE: Dict[str, bool] = {}
+
+
+def v3_router_uses_deadline(w3, router_address: str) -> bool:
+    """
+    True if `router_address` implements the 8-field `exactInputSingle` (the one
+    carrying `deadline`), False for the 7-field one.
+
+    Determined by fetching the router's runtime bytecode and looking for the
+    4-byte selector its dispatcher compares against. That is the only reliable
+    way to tell: the two shapes are indistinguishable from the address, the chain,
+    or the DEX's name, and they differ BETWEEN MAINNET AND TESTNET OF THE SAME
+    DEX - PancakeSwap V3 is 7-field on BSC testnet and 8-field on BSC mainnet.
+
+    Guessing wrong does not produce a helpful error. The router has no fallback
+    function, so the call matches nothing and reverts with EMPTY returndata, which
+    surfaces as `execution reverted: 0x` and reads like a mystery failure in the
+    pool or the tokens rather than an ABI mismatch.
+
+    Cached per (chain, router): a router's bytecode does not change, and a scan
+    asks this once per venue.
+    """
+    key = f"{w3.eth.chain_id}:{router_address.lower()}"
+    if key in _ROUTER_SHAPE_CACHE:
+        return _ROUTER_SHAPE_CACHE[key]
+
+    code = bytes(w3.eth.get_code(checksum(router_address))).hex()
+    has_with = V3_SEL_WITH_DEADLINE in code
+    has_without = V3_SEL_NO_DEADLINE in code
+
+    if has_with == has_without:
+        # Either both or neither. Both would be ambiguous; neither means this is
+        # not a V3-style swap router at all, and calling it would revert empty.
+        raise PlanError(
+            f"{router_address} does not look like a Uniswap-V3-style swap router: "
+            f"its bytecode contains "
+            f"{'BOTH' if has_with else 'NEITHER'} of the exactInputSingle selectors "
+            f"(0x{V3_SEL_WITH_DEADLINE} with deadline, 0x{V3_SEL_NO_DEADLINE} "
+            f"without). Check the router configured for this venue - a factory, a "
+            f"pool, or a Smart Router would all look like this."
+        )
+
+    _ROUTER_SHAPE_CACHE[key] = has_with
+    return has_with
 
 
 def checksum(addr: str) -> str:
@@ -227,6 +315,8 @@ def plan_arbitrage(
     buy_version: str = "v2",
     sell_version: str = "v3",
     quote_decimals: int = 18,
+    base_decimals: int = 18,
+    v3_uses_deadline: bool = True,
 ) -> ArbPlan:
     """
     Build an ArbPlan from a completed cross scan.
@@ -320,8 +410,16 @@ def plan_arbitrage(
     # Slippage floors come off each leg's OWN executable price, which already
     # includes that leg's fee and impact. Deriving them from the mid instead sets
     # a floor the swap cannot reach, and it reverts for no visible reason.
-    v2_min = _slippage_floor(buy.exec_price, size, slippage_bps, quote_decimals)
-    v3_min = _slippage_floor(sell.exec_price, size, slippage_bps, quote_decimals)
+    #
+    # The two legs pay out in DIFFERENT TOKENS, so each floor must be scaled by
+    # its own output token's decimals and expressed in that token:
+    #   leg 1 buys base with the borrowed quote -> floor is in BASE
+    #   leg 2 sells that base back into quote   -> floor is in QUOTE
+    # The borrow was sized as `size * buy.exec_price` quote, so leg 1 is expected
+    # to hand back almost exactly `size` base; that is the number to floor, not
+    # the quote spent to get it.
+    v2_min = output_floor(size, slippage_bps, base_decimals)
+    v3_min = output_floor(size * sell.exec_price, slippage_bps, quote_decimals)
 
     gross_wei = back_wei - borrow_wei
     gross_bps = gross_wei / borrow_wei * BPS
@@ -376,6 +474,7 @@ def plan_arbitrage(
         v3_fee=sell.fee_pips,
         v3_amount_out_min=v3_min,
         min_profit=min_profit_wei,
+        v3_uses_deadline=v3_uses_deadline,
         buy_label=buy.label,
         sell_label=sell.label,
         buy_exec=buy.exec_price,

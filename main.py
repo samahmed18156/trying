@@ -1273,6 +1273,32 @@ def _load_wallet(args):
     raise SystemExit(2)
 
 
+def _sender(args, need_key: bool):
+    """
+    The address a transaction would come from, plus the signing account only when
+    it is actually needed. Returns (address, account_or_None, keystore_path).
+
+    A DRY RUN needs only the address. `eth_call` and `estimate_gas` take a `from`
+    field and never see a signature, so decrypting the keystore for one is
+    pointless - and worse, it made the safest command in the project (the one that
+    provably sends nothing) fail in any environment without a tty, PyCharm's Run
+    window being the common one. Reading the address needs no password at all:
+    it is stored in the clear in the keystore, which is why `wallet balance` works
+    without one.
+    """
+    from arb.wallet import default_wallet_path, wallet_address
+
+    path = getattr(args, "path", None) or default_wallet_path()
+    if not need_key:
+        addr = wallet_address(path)
+        if addr:
+            return addr, None, path
+        # No readable address - fall through so the user gets the real reason
+        # (missing file, unreadable JSON) rather than a vague failure later.
+    account, path = _load_wallet(args)
+    return account.address, account, path
+
+
 def _connect(settings):
     from config import get_network
     from rpc import NodeProvider
@@ -1361,7 +1387,7 @@ def cmd_arb_deploy(args) -> int:
 
     print()
     print(fmt.green(f"  DEPLOYED  {out['address']}"))
-    print(fmt.dim(f"  tx        {out['transactionHash']}"))
+    print(fmt.dim(f"  tx        {_tx_hash(out['transactionHash'])}"))
     print(fmt.dim(f"  recorded  {dep}"))
     print()
     print(fmt.dim("  The address is only in that file. Keep it, or copy the address"))
@@ -1482,11 +1508,14 @@ def cmd_arb_plan(args) -> int:
         return r.pool_for_fee(base, quote, fee_pips)
 
     quote_decimals = _decimals_on_chain(reader, quote)
+    base_decimals = _decimals_on_chain(reader, base)
+    uses_deadline = _v3_router_shape(provider.w3, res)
     try:
         plan = plan_arbitrage(
             res, base, quote, pool_for_fee,
             slippage_bps=args.slippage, min_profit_wei=args.min_profit,
-            quote_decimals=quote_decimals,
+            quote_decimals=quote_decimals, base_decimals=base_decimals,
+            v3_uses_deadline=uses_deadline,
         )
     except PlanError as exc:
         print(fmt.red(f"\n  {exc}"))
@@ -1522,6 +1551,18 @@ def _v3_reader_for(reader, venue):
     return UniswapV3Reader(reader, venue=venue)
 
 
+def _tx_hash(value) -> str:
+    """
+    A transaction hash, normalised for display.
+
+    Records written before the prefix fix hold an unprefixed hash, which no
+    explorer will find. Normalising on the way out repairs those on display
+    without asking anyone to hand-edit a JSON file.
+    """
+    from arb.deployer import to_hex
+    return to_hex(value) if value else "?"
+
+
 def _contract_address(args, dep) -> str:
     """
     Resolve the contract to act on, checksummed.
@@ -1543,6 +1584,27 @@ def _contract_address(args, dep) -> str:
         raise SystemExit(fmt.red(
             f"{raw!r} is not a valid address ({exc}). It must be 0x followed by "
             f"40 hex characters - copy it again from your deployment output."))
+
+
+def _v3_router_shape(w3, res) -> bool:
+    """
+    Which `exactInputSingle` shape the sell leg's router implements.
+
+    Read from the router's bytecode rather than assumed, because it differs
+    between mainnet and testnet of the SAME DEX: PancakeSwap V3 is the 7-field
+    shape on BSC testnet and the 8-field one on BSC mainnet. Assuming either way
+    makes the router call match no function and revert with empty data, which
+    looks like a mystery pool failure rather than an ABI mismatch.
+    """
+    from arb.executor import v3_router_uses_deadline
+
+    router = next((q.router_address for q in res.usable
+                   if q.version == "v3" and q.router_address), "")
+    if not router:
+        # Nothing to probe; fall back to the more common mainnet shape and let the
+        # planner's own "no usable V3 leg" error surface if that is the real issue.
+        return True
+    return v3_router_uses_deadline(w3, router)
 
 
 def _decimals_on_chain(reader, token_address_: str) -> int:
@@ -1602,10 +1664,13 @@ def cmd_arb_run(args) -> int:
         return _v3_reader_for(reader, v3_venue).pool_for_fee(base, quote, fee_pips)
 
     quote_decimals = _decimals_on_chain(reader, quote)
+    base_decimals = _decimals_on_chain(reader, base)
+    uses_deadline = _v3_router_shape(provider.w3, res)
     try:
         plan = plan_arbitrage(res, base, quote, pool_for_fee,
                               slippage_bps=args.slippage, min_profit_wei=args.min_profit,
-                              quote_decimals=quote_decimals)
+                              quote_decimals=quote_decimals, base_decimals=base_decimals,
+                              v3_uses_deadline=uses_deadline)
     except PlanError as exc:
         print(fmt.red(f"  {exc}"))
         return 4
@@ -1616,12 +1681,13 @@ def cmd_arb_run(args) -> int:
     for n in plan.notes:
         _wrap_note(n, indent="    note: ")
 
-    account, wpath = _load_wallet(args)
+    # Only --execute needs the private key; a dry run just needs the address.
+    sender, account, wpath = _sender(args, need_key=bool(args.execute))
     compiled = load_build(args.contract)
     flash = contract_factory(provider.w3, contract_address, compiled.abi)
 
     print(f"\n  contract  {contract_address}")
-    print(f"  wallet    {account.address}")
+    print(f"  wallet    {sender}")
 
     data = flash.encode_abi(abi_element_identifier="arbitrage", args=plan.call_args) \
         if hasattr(flash, "encode_abi") else None
@@ -1631,21 +1697,26 @@ def cmd_arb_run(args) -> int:
     if isinstance(data, str):
         data = bytes.fromhex(data[2:])
 
-    tx = {"from": account.address, "to": contract_address, "data": data, "value": 0,
+    tx = {"from": sender, "to": contract_address, "data": data, "value": 0,
           "chainId": net.chain_id}
-    cost = estimate_cost(provider.w3, account.address, tx, native_symbol=net.native_symbol)
+    cost = estimate_cost(provider.w3, sender, tx, native_symbol=net.native_symbol)
     print(f"  gas       {cost.human}")
     if not cost.affordable:
         print(fmt.red("  insufficient balance for this call — fund the wallet first"))
         return 3
 
-    tx = build_tx(provider.w3, account.address, data, to=contract_address,
+    tx = build_tx(provider.w3, sender, data, to=contract_address,
                   gas=cost.gas_units, gas_price=cost.gas_price_wei)
 
     if not args.execute:
         print(fmt.yellow("\n  dry run only — nothing was signed or sent."))
         print("  add --execute to broadcast it.")
         return 0
+
+    # Past this point the key is genuinely required. It is None only if the dry
+    # run path resolved the address without decrypting.
+    if account is None:
+        account, wpath = _load_wallet(args)
 
     print(fmt.cyan("\n  sending…"))
     try:
@@ -1664,7 +1735,7 @@ def cmd_arb_run(args) -> int:
         print(fmt.red(f"  {exc}"))
         return 3
 
-    print(fmt.green(f"  MINED     {receipt['transactionHash']}"))
+    print(fmt.green(f"  MINED     {_tx_hash(receipt['transactionHash'])}"))
     print(fmt.dim(f"  block     {receipt['blockNumber']}   gas used "
                   f"{int(receipt['gasUsed']):,}"))
 
@@ -1703,7 +1774,7 @@ def cmd_arb_status(args) -> int:
 
     print(fmt.banner(f"ARB  ·  {args.contract} on {net.name}"))
     print(f"  address   {address}")
-    print(fmt.dim(f"  tx        {dep.get('transactionHash', '?')}"))
+    print(fmt.dim(f"  tx        {_tx_hash(dep.get('transactionHash'))}"))
     print(fmt.dim(f"  block     {dep.get('blockNumber', '?')}   deploy gas "
                   f"{int(dep.get('gasUsed', 0)):,}"))
 
@@ -1811,7 +1882,7 @@ def cmd_arb_withdraw(args) -> int:
     except (RevertedTx, DeployError) as exc:
         print(fmt.red(f"  {exc}"))
         return 5
-    print(fmt.green(f"  sent      {receipt['transactionHash']}"))
+    print(fmt.green(f"  sent      {_tx_hash(receipt['transactionHash'])}"))
     print(fmt.dim(f"  gas used  {int(receipt['gasUsed']):,}"))
     return 0
 

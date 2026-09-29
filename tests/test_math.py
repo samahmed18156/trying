@@ -2392,7 +2392,8 @@ def plan_calldata_encoding_survives_a_roundtrip():
 
     res = _scan_with(*_TESTNET_SPECS)
     plan = plan_arbitrage(res, _A_BASE, _A_QUOTE,
-                          lambda fee: _A_POOL, quote_decimals=18)
+                          lambda fee: _A_POOL, quote_decimals=18, base_decimals=18,
+                          v3_uses_deadline=False)
 
     obj = contract_factory(Web3(), _addr(0x11), compiled.abi)
     # call_args is a one-element tuple holding the struct, so it has to be
@@ -2401,14 +2402,14 @@ def plan_calldata_encoding_survives_a_roundtrip():
 
     expected = "0x" + __import__("eth_utils").keccak(
         text="arbitrage((address,address,uint256,address,address[],uint256,address,"
-             "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256))"
+             "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256,bool))"
     )[:4].hex()
     check(data[:10] == expected, f"selector {data[:10]} != {expected}")
 
     sig = ("(address,address,uint256,address,address[],uint256,address,"
-           "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256)")
+           "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256,bool)")
     (decoded,) = abi_decode([sig], bytes.fromhex(data[10:]))
-    pool, borrow, amount, v2r, path, v2min, v3r, v3p, minprofit = decoded
+    pool, borrow, amount, v2r, path, v2min, v3r, v3p, minprofit, uses_deadline = decoded
     eq = lambda a, b: str(a).lower() == str(b).lower()
     check(eq(pool, plan.pool), "pool did not survive encoding")
     check(eq(borrow, plan.borrow_token), "borrowToken did not survive encoding")
@@ -2423,6 +2424,13 @@ def plan_calldata_encoding_survives_a_roundtrip():
     check(v3p[6] == plan.v3_amount_out_min, "v3 amountOutMinimum did not survive")
     check(v3p[7] == 0, "sqrtPriceLimitX96 must be 0 (no limit)")
     check(minprofit == plan.min_profit, "minProfit did not survive")
+    # The router-shape flag picks which exactInputSingle selector the contract
+    # uses, so it must survive encoding intact: a bool that arrives wrong selects
+    # the other shape and the router call reverts with empty data and no reason.
+    check(uses_deadline == plan.v3_uses_deadline,
+          f"v3RouterUsesDeadline encoded as {uses_deadline}, plan says "
+          f"{plan.v3_uses_deadline}")
+    check(isinstance(uses_deadline, bool), "the flag must arrive as a bool")
     # The contract overwrites these three, so they must be harmless placeholders.
     check(int(v3p[3], 16) == 0 and v3p[4] == 0 and v3p[5] == 0,
           "recipient/deadline/amountIn must be zeroed placeholders the contract overwrites")
@@ -2943,6 +2951,229 @@ def an_empty_wallet_is_reported_as_unfunded_not_as_a_broken_transaction():
           f"{legacy.gas_price_wei}")
     check(gas_price_wei(StubWeb3(StubEth(balance=0, gas_price=7_000_000_000)))
           == 7_000_000_000, "the legacy fallback is broken")
+
+
+@test
+def transaction_hashes_are_printed_and_stored_with_the_0x_prefix():
+    """
+    hexbytes changed `.hex()` across major versions - 0.x returned "0x0c8b…",
+    1.x and 2.x return "0c8b…" with no prefix - and `str(HexBytes)` is the bytes
+    repr "b'\x0c\x8b…'". The old conversion was
+    `tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)`, which on a
+    current install produced an unprefixed hash.
+
+    That is not cosmetic. `eth_getTransactionReceipt` rejects an unprefixed hash,
+    and no explorer will find it, so the one string you most want after a
+    deployment is the one you cannot paste anywhere. It was also written into
+    state/deployment.<network>.json, so the broken value persisted.
+
+    Dependency-free: the hexbytes behaviours are simulated, so this pins the
+    helper against every version's shape rather than just the installed one.
+    """
+    from arb.deployer import to_hex
+
+    class NoPrefix:
+        """hexbytes 1.x / 2.x: .hex() has no 0x."""
+        def __init__(self, raw): self._raw = raw
+        def hex(self): return self._raw.hex()
+        def __str__(self): return repr(self._raw)
+
+    class Prefixed:
+        """hexbytes 0.x: .hex() already carries the 0x."""
+        def hex(self): return "0x0c8beb37"
+
+    class Modern:
+        """hexbytes 2.x also offers the explicit, unambiguous API."""
+        def hex(self): return "0c8beb37"
+        def to_0x_hex(self): return "0x0c8beb37"
+
+    raw = bytes.fromhex("0c8beb37")
+    for label, value in (("hexbytes 1.x/2.x shape", NoPrefix(raw)),
+                         ("hexbytes 0.x shape", Prefixed()),
+                         ("modern to_0x_hex", Modern()),
+                         ("plain bytes", raw),
+                         ("prefixed str", "0x0c8beb37"),
+                         ("bare str", "0c8beb37")):
+        got = to_hex(value)
+        check(got == "0x0c8beb37", f"{label} -> {got!r}, expected '0x0c8beb37'")
+        check(not got.startswith("0x0x"), f"{label} double-prefixed: {got!r}")
+
+    check(to_hex(None) == "", "None should become an empty string, not 'None'")
+    check(to_hex(bytearray(raw)) == "0x0c8beb37", "bytearray was not handled")
+
+    # The bytes repr must never leak into output - that was the `str()` fallback.
+    check("b'" not in to_hex(NoPrefix(raw)), "the bytes repr leaked into the hash")
+
+    # And against the real library when it is installed, since that is what
+    # actually runs on a user's machine.
+    try:
+        import hexbytes
+    except ImportError:
+        pass
+    else:
+        real = hexbytes.HexBytes(raw)
+        check(to_hex(real) == "0x0c8beb37",
+              f"real hexbytes {getattr(hexbytes, '__version__', '?')} gave "
+              f"{to_hex(real)!r}")
+
+
+@test
+def the_v3_router_shape_is_read_from_bytecode_not_assumed():
+    """
+    `exactInputSingle` comes in two shapes and they differ BETWEEN MAINNET AND
+    TESTNET OF THE SAME DEX:
+
+        PancakeSwap V3, BSC testnet   7 fields, no deadline   0x04e45aaf
+        PancakeSwap V3, BSC mainnet   8 fields, with deadline 0x414bf389
+        Uniswap V3 SwapRouter02       7 fields                0x04e45aaf
+        Uniswap V3 SwapRouter (v1)    8 fields                0x414bf389
+
+    Verified against each router's live runtime bytecode. Calling the wrong shape
+    does not fail loudly: these routers have no fallback, so the call matches no
+    function and reverts with EMPTY returndata. On chain that is
+    `execution reverted: 0x` - which reads like a mystery pool or token failure,
+    not an ABI mismatch. It cost a deployment to find, because nothing about the
+    address, chain, or DEX name gives it away.
+
+    Dependency-free: the node is stubbed, so this pins the decision logic itself.
+    """
+    from arb.executor import (PlanError, V3_SEL_NO_DEADLINE, V3_SEL_WITH_DEADLINE,
+                              v3_router_uses_deadline)
+
+    class StubEth:
+        def __init__(self, code, chain_id=97):
+            self._code = code
+            self.chain_id = chain_id
+            self.code_calls = 0
+        def get_code(self, address):
+            self.code_calls += 1
+            return self._code
+
+    class StubWeb3:
+        def __init__(self, code, chain_id=97):
+            self.eth = StubEth(code, chain_id)
+
+    # A dispatcher compares calldataload(0) against each selector, so the raw
+    # 4-byte values appear in the runtime bytecode. Pad them like real code.
+    def code_with(*selectors):
+        return bytes.fromhex("63" + "63".join(selectors) + "00" * 8)
+
+    eight = StubWeb3(code_with(V3_SEL_WITH_DEADLINE))
+    check(v3_router_uses_deadline(eight, _addr(0x1B81)) is True,
+          "an 8-field router must be detected as using deadline")
+
+    seven = StubWeb3(code_with(V3_SEL_NO_DEADLINE))
+    check(v3_router_uses_deadline(seven, _addr(0x9A48)) is False,
+          "a 7-field router must be detected as NOT using deadline")
+
+    # Cached: a router's bytecode does not change, and a scan asks per venue.
+    before = seven.eth.code_calls
+    check(v3_router_uses_deadline(seven, _addr(0x9A48)) is False, "cache changed the answer")
+    check(seven.eth.code_calls == before,
+          f"the lookup was not cached: {before} -> {seven.eth.code_calls} code calls")
+
+    # A different chain must not reuse the other chain's answer: the same router
+    # address could in principle be a different contract there.
+    other = StubWeb3(code_with(V3_SEL_WITH_DEADLINE), chain_id=56)
+    check(v3_router_uses_deadline(other, _addr(0x9A48)) is True,
+          "the cache key must include the chain id")
+
+    # Neither selector: not a V3-style swap router at all. This is the shape of a
+    # factory, a pool, or a Smart Router pasted in by mistake.
+    for label, code in (("no selectors", code_with("12345678")),
+                        ("empty (no code at that address)", b"")):
+        try:
+            v3_router_uses_deadline(StubWeb3(code), _addr(0xDEAD))
+        except PlanError as exc:
+            check("does not look like" in str(exc), f"unhelpful {label} message: {exc}")
+            check("NEITHER" in str(exc), f"{label} should report NEITHER selector: {exc}")
+            check("Smart Router" in str(exc),
+                  f"{label} message should name the likely mistake: {exc}")
+        else:
+            raise AssertionError(f"{label} was accepted as a V3 router")
+
+    # Both selectors is ambiguous and must be refused rather than coin-flipped.
+    try:
+        v3_router_uses_deadline(StubWeb3(code_with(V3_SEL_WITH_DEADLINE,
+                                                  V3_SEL_NO_DEADLINE)), _addr(0xBEEF))
+    except PlanError as exc:
+        check("BOTH" in str(exc), f"an ambiguous router should say BOTH: {exc}")
+    else:
+        raise AssertionError("a router with both selectors was silently assigned a shape")
+
+
+@test
+def each_legs_slippage_floor_is_denominated_in_the_token_that_leg_pays_out():
+    """
+    Leg 1 buys BASE with the borrowed QUOTE, so its `amountOutMin` is in BASE.
+    Leg 2 sells that BASE back into QUOTE, so its floor is in QUOTE.
+
+    Both were being computed as `size * exec_price` - a QUOTE amount - and leg 1's
+    was then handed to the V2 router as if it were BASE. On WBNB/USDT at 11.94
+    that made leg 1's floor ~12x larger than what the leg could possibly return,
+    so every run died on the first swap:
+
+        PancakeRouter: INSUFFICIENT_OUTPUT_AMOUNT
+
+    which reads as slippage or a stale price and points at the pool, not at the
+    arithmetic that built the floor. Found by simulating with eth_call before
+    spending gas; the plan had looked perfectly reasonable on screen.
+
+    Asymmetric decimals make a unit mix-up impossible to hide: if the two legs
+    were swapped or a price applied twice, the numbers would be off by 1e12.
+    """
+    from arb.executor import output_floor, plan_arbitrage
+
+    # Deliberately asymmetric: BASE 18 decimals, QUOTE 6 (USDT on Ethereum).
+    res = _scan_with(*_TESTNET_SPECS)
+    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, lambda fee: _A_POOL,
+                          slippage_bps=100.0, quote_decimals=6, base_decimals=18)
+
+    size = res.trade_size_base
+    buy, sell = plan.buy_exec, plan.sell_exec
+
+    # Leg 1 pays out BASE: the floor is a haircut on `size`, NOT on size*price.
+    expected_leg1 = output_floor(size, 100.0, 18)
+    check(plan.v2_amount_out_min == expected_leg1,
+          f"leg 1 floor {plan.v2_amount_out_min:,} != {expected_leg1:,} wei of BASE")
+    # It must be BELOW what the leg actually returns, or the router rejects it.
+    actual_leg1 = int(size * 10 ** 18)
+    check(plan.v2_amount_out_min < actual_leg1,
+          f"leg 1 floor {plan.v2_amount_out_min:,} exceeds the ~{actual_leg1:,} wei "
+          f"the leg returns - the trade could never succeed")
+    # And the old bug was exactly this: a QUOTE-denominated number in BASE units.
+    wrong = output_floor(size * buy, 100.0, 18)
+    check(plan.v2_amount_out_min != wrong,
+          "leg 1 is still denominated in the quote token")
+    check(wrong > actual_leg1,
+          "sanity: the wrong denomination really is larger than what leg 1 returns")
+
+    # Leg 2 pays out QUOTE: floor = size * sell_price, scaled by QUOTE decimals.
+    expected_leg2 = output_floor(size * sell, 100.0, 6)
+    check(plan.v3_amount_out_min == expected_leg2,
+          f"leg 2 floor {plan.v3_amount_out_min:,} != {expected_leg2:,} wei of QUOTE")
+    check(plan.v3_amount_out_min < int(size * sell * 10 ** 6),
+          "leg 2 floor exceeds what the leg returns")
+
+    # output_floor itself: a 100 bps haircut, truncated so it never overshoots.
+    check(output_floor(1.0, 0.0, 18) == 10 ** 18, "a 0 bps tolerance must not reduce it")
+    check(output_floor(1.0, 10_000.0, 18) == 0, "a 100% tolerance must remove the floor")
+    check(output_floor(1.0, 100.0, 18) == 99 * 10 ** 16,
+          f"100 bps off 1 token gave {output_floor(1.0, 100.0, 18)}")
+    check(output_floor(100.0, 100.0, 6) == 99_000_000, "6-decimal scaling is wrong")
+    # The reference value has to be Decimal too. At 1.2e21 wei a float's ULP is
+    # ~131,072 wei, so comparing a wei-exact floor against a float "exact" value
+    # measures float noise, not the function - an earlier version of this loop
+    # failed on a floor that was in fact correct to the last wei.
+    from decimal import Decimal
+    for bps in (0.0, 1.0, 50.0, 100.0, 999.9):
+        f = output_floor(1234.5678, bps, 18)
+        exact = (Decimal("1234.5678") * (Decimal(10_000) - Decimal(str(bps)))
+                 / Decimal(10_000) * Decimal(10) ** 18)
+        check(Decimal(f) <= exact,
+              f"a floor of {f} overshot the exact {exact} at {bps} bps")
+        check(exact - Decimal(f) < 1,
+              f"a floor of {f} lost more than one wei at {bps} bps (exact {exact})")
 
 
 def run_all(verbose: bool = True) -> int:

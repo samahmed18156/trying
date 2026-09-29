@@ -65,7 +65,7 @@ cd C:\Users\SERVER\PycharmProjects\trying
 run.bat                 REM creates .venv, installs deps, runs a scan
 run.bat scan --both     REM any main.py subcommand works
 run.bat verify          REM cross-checks the maths against the live chain
-run.bat selftest        REM 76 offline tests, no network needed
+run.bat selftest        REM 79 offline tests, no network needed
 ```
 
 `run.bat` must be run **from the project root** (it `cd`s there itself) — the
@@ -80,7 +80,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # optional — it runs with no keys at all
-python main.py selftest     # 76 offline maths tests, no network needed
+python main.py selftest     # 79 offline maths tests, no network needed
 python main.py info         # config + live check of every RPC and price source
 python main.py scan         # one-shot ETH/USDT comparison
 ```
@@ -195,7 +195,7 @@ way to confirm your checkout and interpreter are healthy. Run it first.
 On a bare install it reports something like:
 
 ```
-65/65 passed, 11 skipped — all good
+68/68 passed, 11 skipped — all good
   skipped because: needs eth_account; needs eth_utils; needs web3; …
   Install them with:  python -m pip install -r requirements.txt
 ```
@@ -204,8 +204,8 @@ Those 11 are not failures and not silent passes. They cover things that genuinel
 cannot exist without the libraries — keystore encryption, transaction signing,
 EIP-55 checksums (keccak-256, which Python's `hashlib` does not ship: it has
 SHA3, and SHA3 and keccak differ in padding), and ABI encoding. Once you install
-the dependencies the same command reports **76/76 passed** on Linux and macOS. On
-Windows it reports **75/75 passed, 1 skipped**, because the one skipped test
+the dependencies the same command reports **79/79 passed** on Linux and macOS. On
+Windows it reports **78/78 passed, 1 skipped**, because the one skipped test
 repairs a lost execute bit on the cached `solc` binary and Windows has no execute
 bit — file access there is governed by ACLs, so there is nothing for it to check.
 That skip prints no "install something" advice, because installing something
@@ -223,7 +223,7 @@ top-right dropdown automatically after a reload:
 
 | Configuration | Runs |
 |---|---|
-| **Selftest** | `main.py selftest` — 76 offline maths tests, no network, no keys. Run this first. |
+| **Selftest** | `main.py selftest` — 79 offline maths tests, no network, no keys. Run this first. |
 | **Info** | `main.py info` — live check of every RPC endpoint and price source |
 | **Scan** | `main.py scan` — one-shot ETH/USDT comparison |
 | **Verify** | `main.py verify` — cross-checks the maths against the live chain |
@@ -416,7 +416,7 @@ The official `QuoterV2` cross-check is attempted as a bonus, but it only answers
 through *revert data*, and most free RPC providers strip that. It is not relied
 on. An Infura or Alchemy key will usually return it.
 
-`python main.py selftest` runs 76 offline tests covering TickMath constants
+`python main.py selftest` runs 79 offline tests covering TickMath constants
 (re-derived from first principles to 200 decimal places, which is how two
 single-digit transcription typos were caught), the tick bitmap walk, swap-step
 rounding, V2 closed forms, the arb decision logic, flash-loan plan construction, and the venue registry itself
@@ -801,7 +801,8 @@ Withdraw is owner-only and dry-runs by default; `--execute` sends it.
 | You see | What it means | What to do |
 | --- | --- | --- |
 | `Unprofitable` | The round trip ended with less than it started. **No tokens moved** — only gas was spent | Normal on testnet. Check the `note:` lines from `arb plan` first |
-| `INSUFFICIENT_OUTPUT_AMOUNT` | A leg's slippage floor was not met: the pool moved between the scan and your transaction | Raise `--slippage` (default 100 bps), or use a smaller `--size` |
+| `INSUFFICIENT_OUTPUT_AMOUNT` | A leg's slippage floor was not met. First suspect a **unit** error, not the pool: each floor must be in the token that leg pays out (leg 1 pays BASE, leg 2 pays QUOTE). Only if the units are right did the pool actually move | `arb plan` prints both floors — compare them against the size you are trading. Then raise `--slippage` (default 100 bps) or use a smaller `--size` |
+| `execution reverted: 0x` (empty) | The router has **no function matching the selector** we called. These routers have no fallback, so the call matches nothing and reverts with no data at all | Almost always the V3 router ABI shape. `arb plan` prints which one it detected; see "The two `exactInputSingle` shapes" below |
 | `could not decrypt …: wrong password` | The password does not match the one the keystore was created with. **It cannot be recovered or reset** — that is what encrypting means | Try again (there is no attempt limit, and the prompt now allows three tries per command). Check Caps Lock and keyboard layout. If it will not come back, see "Lost the wallet password" below |
 | `insufficient balance for this call` | Your wallet cannot cover the gas | `python main.py wallet faucet --network bsc_testnet` |
 | `holds 0 BNB, so it cannot pay gas` or `insufficient funds for transfer` | The wallet is unfunded. The node refuses while simulating, **before it looks at the bytecode**, so this is never a contract problem | Claim a drip for the address `wallet faucet` prints, confirm with `wallet balance`, then re-run |
@@ -836,6 +837,35 @@ that deploys `FlashArb` becomes its `owner`, and only the owner can call
 tokens sitting in the old contract become permanently unreachable. If you ever
 need to move to a new wallet after deploying, withdraw everything first, then
 deploy afresh from the new wallet.
+
+### The two `exactInputSingle` shapes
+
+There is no single Uniswap-V3-style router ABI. Whether `deadline` is part of the
+parameter struct differs per deployment — **and it differs between mainnet and
+testnet of the same DEX**, so it cannot be inferred from the chain or the name:
+
+| Router | Shape | Selector |
+| --- | --- | --- |
+| PancakeSwap V3, BNB Chain **testnet** | 7 fields, no `deadline` | `0x04e45aaf` |
+| PancakeSwap V3, BNB Chain **mainnet** | 8 fields, with `deadline` | `0x414bf389` |
+| Uniswap V3 `SwapRouter02`, Ethereum | 7 fields | `0x04e45aaf` |
+| Uniswap V3 `SwapRouter` (v1), Ethereum | 8 fields | `0x414bf389` |
+
+Each was verified by fetching the router's live runtime bytecode and searching it
+for the selector its dispatcher compares against.
+
+`FlashArb.sol` encodes **both** shapes and picks one from `v3RouterUsesDeadline`
+in `ArbParams`. The Python side sets that flag by probing the router's bytecode
+(`arb/executor.py::v3_router_uses_deadline`, cached per chain and address), and
+`arb plan` prints which shape it chose so you can see the decision.
+
+Getting it wrong is worth understanding, because the failure is so unhelpful:
+these routers have no fallback function, so a call with an unknown selector
+matches nothing and reverts with **empty** returndata. On chain that is
+`execution reverted: 0x` — no reason, no custom error, nothing pointing at an ABI
+mismatch. It reads like a mystery failure in the pool or the tokens. This cost a
+deployment to find, and it was found by simulating with `eth_call` before spending
+gas on the real thing.
 
 ### Two real constraints worth knowing
 
@@ -1010,7 +1040,7 @@ trying/
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            76 offline tests — no network, no dependencies
+    └── test_math.py            79 offline tests — no network, no dependencies
 ```
 
 `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`

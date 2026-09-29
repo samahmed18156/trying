@@ -217,7 +217,7 @@ def decode_revert(data: bytes, abi: Optional[list] = None) -> str:
                 "exist at that address, a require with no message, or an "
                 "out-of-gas. Check the address and the selector.")
 
-    hexed = "0x" + data.hex() if isinstance(data, (bytes, bytearray)) else str(data)
+    hexed = to_hex(data)
     if not hexed.startswith("0x"):
         hexed = "0x" + hexed
 
@@ -318,6 +318,43 @@ def build_tx(w3, account_address: str, data: bytes, to: Optional[str] = None,
     return tx
 
 
+def to_hex(value) -> str:
+    """
+    Any hash, address or bytes value as a 0x-prefixed hex string.
+
+    This exists because hexbytes changed behaviour across major versions and the
+    difference is invisible until something downstream rejects the value:
+
+      * hexbytes 0.x  -> `.hex()` returned "0x0c8b…"
+      * hexbytes 1.x/2.x -> `.hex()` returns "0c8b…", no prefix
+      * `str(HexBytes)` -> "b'\x0c\x8b…'", the bytes repr, useless everywhere
+
+    So `tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)` produced a
+    transaction hash with no `0x`. That is not just ugly: `eth_getTransactionReceipt`
+    refuses an unprefixed hash, and neither BscScan nor Etherscan will find it, so
+    the one thing you most want to look up after a deployment is the one string
+    you cannot paste anywhere. It was also written into
+    state/deployment.<network>.json, persisting the broken value.
+
+    Prefers hexbytes' own `to_0x_hex()` when it exists and normalises everything
+    else, so it is correct on 0.x, 1.x and 2.x alike.
+    """
+    if value is None:
+        return ""
+    prefixed = getattr(value, "to_0x_hex", None)
+    if callable(prefixed):
+        return prefixed()
+    if isinstance(value, str):
+        return value if value.startswith("0x") else "0x" + value
+    if isinstance(value, (bytes, bytearray)):
+        return "0x" + bytes(value).hex()
+    hexer = getattr(value, "hex", None)
+    if callable(hexer):
+        out = hexer()
+        return out if out.startswith("0x") else "0x" + out
+    return str(value)
+
+
 def send_and_wait(w3, account, tx: Dict[str, Any], timeout: int = 240,
                   abi: Optional[list] = None) -> Dict[str, Any]:
     """
@@ -327,7 +364,7 @@ def send_and_wait(w3, account, tx: Dict[str, Any], timeout: int = 240,
     signed = account.sign_transaction(tx)
     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
     tx_hash = w3.eth.send_raw_transaction(raw)
-    hexed = tx_hash.hex() if hasattr(tx_hash, "hex") else str(tx_hash)
+    hexed = to_hex(tx_hash)
 
     try:
         receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
