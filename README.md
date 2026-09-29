@@ -65,7 +65,7 @@ cd C:\Users\SERVER\PycharmProjects\trying
 run.bat                 REM creates .venv, installs deps, runs a scan
 run.bat scan --both     REM any main.py subcommand works
 run.bat verify          REM cross-checks the maths against the live chain
-run.bat selftest        REM 79 offline tests, no network needed
+run.bat selftest        REM 84 offline tests, no network needed
 ```
 
 `run.bat` must be run **from the project root** (it `cd`s there itself) — the
@@ -80,7 +80,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # optional — it runs with no keys at all
-python main.py selftest     # 79 offline maths tests, no network needed
+python main.py selftest     # 84 offline maths tests, no network needed
 python main.py info         # config + live check of every RPC and price source
 python main.py scan         # one-shot ETH/USDT comparison
 ```
@@ -195,7 +195,7 @@ way to confirm your checkout and interpreter are healthy. Run it first.
 On a bare install it reports something like:
 
 ```
-68/68 passed, 11 skipped — all good
+73/73 passed, 11 skipped — all good
   skipped because: needs eth_account; needs eth_utils; needs web3; …
   Install them with:  python -m pip install -r requirements.txt
 ```
@@ -204,8 +204,8 @@ Those 11 are not failures and not silent passes. They cover things that genuinel
 cannot exist without the libraries — keystore encryption, transaction signing,
 EIP-55 checksums (keccak-256, which Python's `hashlib` does not ship: it has
 SHA3, and SHA3 and keccak differ in padding), and ABI encoding. Once you install
-the dependencies the same command reports **79/79 passed** on Linux and macOS. On
-Windows it reports **78/78 passed, 1 skipped**, because the one skipped test
+the dependencies the same command reports **84/84 passed** on Linux and macOS. On
+Windows it reports **83/83 passed, 1 skipped**, because the one skipped test
 repairs a lost execute bit on the cached `solc` binary and Windows has no execute
 bit — file access there is governed by ACLs, so there is nothing for it to check.
 That skip prints no "install something" advice, because installing something
@@ -223,7 +223,7 @@ top-right dropdown automatically after a reload:
 
 | Configuration | Runs |
 |---|---|
-| **Selftest** | `main.py selftest` — 79 offline maths tests, no network, no keys. Run this first. |
+| **Selftest** | `main.py selftest` — 84 offline maths tests, no network, no keys. Run this first. |
 | **Info** | `main.py info` — live check of every RPC endpoint and price source |
 | **Scan** | `main.py scan` — one-shot ETH/USDT comparison |
 | **Verify** | `main.py verify` — cross-checks the maths against the live chain |
@@ -416,7 +416,7 @@ The official `QuoterV2` cross-check is attempted as a bonus, but it only answers
 through *revert data*, and most free RPC providers strip that. It is not relied
 on. An Infura or Alchemy key will usually return it.
 
-`python main.py selftest` runs 79 offline tests covering TickMath constants
+`python main.py selftest` runs 84 offline tests covering TickMath constants
 (re-derived from first principles to 200 decimal places, which is how two
 single-digit transcription typos were caught), the tick bitmap walk, swap-step
 rounding, V2 closed forms, the arb decision logic, flash-loan plan construction, and the venue registry itself
@@ -802,6 +802,8 @@ Withdraw is owner-only and dry-runs by default; `--execute` sends it.
 | --- | --- | --- |
 | `Unprofitable` | The round trip ended with less than it started. **No tokens moved** — only gas was spent | Normal on testnet. Check the `note:` lines from `arb plan` first |
 | `INSUFFICIENT_OUTPUT_AMOUNT` | A leg's slippage floor was not met. First suspect a **unit** error, not the pool: each floor must be in the token that leg pays out (leg 1 pays BASE, leg 2 pays QUOTE). Only if the units are right did the pool actually move | `arb plan` prints both floors — compare them against the size you are trading. Then raise `--slippage` (default 100 bps) or use a smaller `--size` |
+| `execution reverted: LOK` | The flash loan was borrowed from the **same pool a leg swaps through**. A V3 pool's `flash()` holds its reentrancy lock across the whole callback, so routing a swap back into it always reverts here | Fixed in the planner: it now borrows from a different tier. `arb plan` prints both pools and says why they differ |
+| `execution reverted: transfer failed` | This contract's own `_safeTransfer` — and inside `arbitrage` the only call to it is the **flash repay**. The two legs did not bring back enough of the borrow token to cover the loan plus its fee, i.e. the round trip was unprofitable. Both swaps executed; the transaction then unwound | Nothing is broken and no tokens moved. It means this pair has no edge right now. Newer builds report it precisely as `CannotRepay(held, owed)` |
 | `execution reverted: 0x` (empty) | The router has **no function matching the selector** we called. These routers have no fallback, so the call matches nothing and reverts with no data at all | Almost always the V3 router ABI shape. `arb plan` prints which one it detected; see "The two `exactInputSingle` shapes" below |
 | `could not decrypt …: wrong password` | The password does not match the one the keystore was created with. **It cannot be recovered or reset** — that is what encrypting means | Try again (there is no attempt limit, and the prompt now allows three tries per command). Check Caps Lock and keyboard layout. If it will not come back, see "Lost the wallet password" below |
 | `insufficient balance for this call` | Your wallet cannot cover the gas | `python main.py wallet faucet --network bsc_testnet` |
@@ -866,6 +868,55 @@ matches nothing and reverts with **empty** returndata. On chain that is
 mismatch. It reads like a mystery failure in the pool or the tokens. This cost a
 deployment to find, and it was found by simulating with `eth_call` before spending
 gas on the real thing.
+
+### Why the flash loan cannot come from the pool leg 2 swaps through
+
+A V3 pool's `flash()` takes the pool's reentrancy lock and holds it for the entire
+callback:
+
+```solidity
+modifier lock() { require(!locked, 'LOK'); locked = true; _; locked = false; }
+```
+
+The whole arbitrage runs inside that callback. So if leg 2's swap routes back into
+the pool that lent the money, the router calls `swap()` on a pool that is still
+locked, and it reverts with the three-character reason `LOK`. No ordering, sizing
+or slippage setting avoids it — the two are mutually exclusive by construction.
+
+The obvious design looks better and is impossible: borrow from the pool you also
+sell into, so the capital and the sale net against each other in one place and the
+round trip needs no starting inventory. That netting can never happen, because the
+sale cannot execute at all. This cost a deployment to find, since the plan looked
+entirely reasonable on screen.
+
+So the planner borrows from a **different tier of the same pair**. It still needs
+no starting inventory, and because tiers carry different fees it is usually a
+*cheaper* loan: `choose_flash_pool` walks the tiers from cheapest to dearest, skips
+the one leg 2 uses, skips any that hold less of the borrow token than the loan, and
+takes the first that survives. On testnet that moved the loan from the 0.05% pool to
+the 0.01% pool and cut the flash fee five-fold.
+
+PancakeSwap V3 charges the flash fee at the **lending pool's own swap tier**, which
+is why the tier choice is a direct cost and why the fee estimate can no longer be
+read off the sell leg.
+
+### Reading a revert that has already happened
+
+Two messages in this system name a mechanism rather than a cause, and both cost
+real time to identify:
+
+- The pool's own transfer helper reverts with **`TF`**. This contract's reverts
+  with **`transfer failed`**. They look alike and mean different things — an
+  oversized flash is rejected by the pool with `TF`, while a failing repay says
+  `transfer failed`.
+- Inside `arbitrage`, `_safeTransfer` is reached at exactly one place: the repay.
+  So `transfer failed` there proves leg 1 and leg 2 **both executed**, and that the
+  only thing missing was enough of the borrow token to close the loan.
+
+`arb run` and `arb deploy` translate these into a stated cause instead of echoing
+the hex. A failed gas estimate is also reported rather than raised — the node
+simulated the call and refused it, so nothing was signed, sent or spent, and a
+Python traceback only buries the explanation.
 
 ### Two real constraints worth knowing
 
@@ -1040,7 +1091,7 @@ trying/
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            79 offline tests — no network, no dependencies
+    └── test_math.py            84 offline tests — no network, no dependencies
 ```
 
 `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`

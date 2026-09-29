@@ -25,6 +25,7 @@ fail badly if you get them wrong:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -112,6 +113,60 @@ _FUNDING_MARKERS = (
 )
 
 
+# Revert reasons that look opaque but have exactly one likely cause in this
+# system. Each of these cost real debugging time to identify, and none of them
+# say what is wrong in their own words: "LOK" is three characters, "transfer
+# failed" names a token helper rather than a cause, and an empty 0x carries no
+# information at all. Matched against the lowercase reason text. The substrings
+# are chosen so they cannot occur inside a hex blob -- hex is 0-9a-f, and every
+# key below contains a character outside that set.
+# "reverted: 0x" with nothing hex after it == the call returned no data at all.
+_EMPTY_REVERT = re.compile(r"reverted:\s*0x(?![0-9a-fA-F])")
+
+_REVERT_HINTS = (
+    ("lok",
+     "the pool's reentrancy lock. flash() holds the lending pool locked for the "
+     "whole callback, so a swap routed back into THAT pool always reverts here. "
+     "The flash loan must come from a different pool than the one a leg swaps "
+     "through -- arb plan now picks one automatically and says which."),
+    ("transfer failed",
+     "the token transfer did not go through. In this contract the usual cause is "
+     "that the two legs did not bring back enough of the borrow token to repay "
+     "the flash loan plus its fee -- i.e. the arbitrage was unprofitable. The "
+     "transaction reverts atomically, so no tokens move and only gas is spent. "
+     "Newer builds report this precisely as CannotRepay(held, owed)."),
+    ("stf",
+     "safe-transfer-from failed: the router could not pull tokens from this "
+     "contract. Either the approval is missing or the balance is short. This "
+     "contract approves each router immediately before calling it, so a short "
+     "balance here usually means the previous leg returned nothing."),
+    ("f0", "the flash loan repay on the pool's token0 came up short."),
+    ("f1", "the flash loan repay on the pool's token1 came up short."),
+    ("insufficient liquidity",
+     "the pool does not hold enough of a token to complete a leg. Try a smaller "
+     "--size, or a deeper venue."),
+    ("insufficient_output_amount",
+     "a leg's slippage floor was not met. Check first that each floor is in the "
+     "token that leg pays out (leg 1 pays BASE, leg 2 pays QUOTE); only if the "
+     "units are right did the pool genuinely move. Then raise --slippage."),
+    ("unprofitable",
+     "the profit check did its job: the round trip did not clear min_profit, so "
+     "the whole transaction reverted and only gas was spent. This is the "
+     "expected outcome on a testnet pair with no real edge."),
+    ("badcallback",
+     "something other than the pool we asked tried to drive the callback, or it "
+     "arrived outside a flash() we initiated. The reentrancy guard refused it."),
+)
+
+
+def _explain_revert(raw_lower: str) -> Optional[str]:
+    """Plain-English cause for a known revert reason, or None if unrecognised."""
+    for marker, explanation in _REVERT_HINTS:
+        if marker in raw_lower:
+            return explanation
+    return None
+
+
 def estimation_failure_message(exc: BaseException, balance_wei: int,
                               native_symbol: str = "BNB") -> str:
     """
@@ -142,6 +197,33 @@ def estimation_failure_message(exc: BaseException, balance_wei: int,
             f"node stopped before looking at it.\n"
             f"  Fund the wallet, then re-run this command:\n"
             f"      python main.py wallet faucet"
+        )
+    hint = _explain_revert(raw.lower())
+    if hint is not None:
+        return (
+            f"gas estimation failed, so this transaction would almost certainly "
+            f"revert.\n"
+            f"    {raw}\n"
+            f"  What that reason means: {hint}\n"
+            f"  Nothing was sent and no tokens moved."
+        )
+    # An EMPTY revert is its own signature: these routers have no fallback, so a
+    # call whose selector they do not implement matches nothing and reverts with
+    # no data at all. It reads like a mystery failure in the pool or the tokens.
+    # The negative lookahead matters -- a revert that DOES carry data also starts
+    # "reverted: 0x", and calling that empty would send the reader off to debug
+    # an ABI shape when the reason string was there all along.
+    if _EMPTY_REVERT.search(raw):
+        return (
+            f"gas estimation failed and the revert carried NO data.\n"
+            f"    {raw}\n"
+            f"  An empty revert almost always means the target contract has no "
+            f"function matching the selector we called - these DEX routers have "
+            f"no fallback, so the call matches nothing and reverts silently.\n"
+            f"  For leg 2 that points at the V3 router ABI shape. arb plan prints "
+            f"which shape it detected from the router's bytecode; compare it with "
+            f"the router you are actually calling.\n"
+            f"  Nothing was sent and no tokens moved."
         )
     return (
         f"gas estimation failed, so this transaction would almost certainly "

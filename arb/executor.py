@@ -25,7 +25,7 @@ PancakeSwap V3, which is also the only pairing there with liquidity in both.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from dex.cross import CrossScanResult, VenueQuote
 
@@ -78,6 +78,11 @@ class ArbPlan:
     sell_exec: float = 0.0
     expected_gross_bps: float = 0.0
     expected_flash_fee: int = 0
+    # The fee tier of `pool`. PancakeSwap V3 charges its flash fee at the pool's
+    # own swap tier, so this number IS the price of the loan -- and it is not
+    # necessarily sell.fee_pips, because the pool leg 2 swaps through can never be
+    # the pool that lends (see choose_flash_pool).
+    flash_fee_pips: int = 0
     notes: List[str] = field(default_factory=list)
 
     @property
@@ -122,6 +127,8 @@ class ArbPlan:
         """Lines for the CLI, in the order the transaction will do things."""
         out = [
             f"borrow   {self.flash_amount:,} wei of the quote token from {self.pool}",
+            f"         a V3 pool at fee tier {self.flash_fee_pips}, deliberately NOT the "
+            f"pool leg 2 swaps through (that one is locked for the whole flash)",
             f"leg 1    V2 {self.buy_label or 'router'}  {self.v2_router}",
             f"         path {' -> '.join(self.v2_path)}",
             f"         minimum out {self.v2_amount_out_min:,} wei",
@@ -304,6 +311,88 @@ def best_leg(res: CrossScanResult, version: str, side: str) -> Optional[VenueQuo
     raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
 
+# Every tier PancakeSwap V3 deploys. Cheapest first is what matters: the flash
+# fee is the pool's own tier, so a 0.01% pool lends 5x more cheaply than a 0.05%
+# one for exactly the same capital.
+DEFAULT_FLASH_FEE_TIERS: Tuple[int, ...] = (100, 500, 2500, 10000)
+
+
+def choose_flash_pool(
+    locked_pools: Sequence[str],
+    v3_pool_for_fee: Callable[[int], Optional[str]],
+    borrow_wei: int,
+    quote_balance_of: Optional[Callable[[str], int]] = None,
+    fee_tiers: Sequence[int] = DEFAULT_FLASH_FEE_TIERS,
+    preferred_fee_pips: Optional[int] = None,
+) -> Tuple[str, int, Optional[int]]:
+    """
+    Pick the V3 pool to borrow the flash loan from.
+
+    Returns (pool_address, fee_pips, quote_balance_or_None).
+
+    WHY THIS IS NOT SIMPLY "THE POOL LEG 2 SELLS INTO"
+    --------------------------------------------------
+    A V3 pool's flash() takes the pool's reentrancy lock and holds it across the
+    entire callback:
+
+        modifier lock() { require(!locked, 'LOK'); locked = true; _; locked = false; }
+
+    Our whole arbitrage runs inside that callback. So if leg 2's swap routes back
+    into the lending pool, the router calls swap() on a pool that is still locked
+    and it reverts with the three-character reason 'LOK'. There is no ordering,
+    sizing or slippage setting that avoids it -- the two things are mutually
+    exclusive by construction.
+
+    That makes the obvious design (one pool supplies the capital and receives the
+    sale, so the round trip nets in one place) impossible. Borrowing from a
+    DIFFERENT tier of the same pair is the fix: it still needs no starting
+    inventory, and because the tiers carry different fees it is usually a cheaper
+    loan too.
+
+    `locked_pools` are the addresses leg 2 could route through -- the one the
+    router will resolve for the sell tier, plus whatever the scan recorded. Both
+    are disqualified. `quote_balance_of`, when given, also rules out pools that
+    exist but hold less of the borrow token than we are asking for, which would
+    otherwise fail later on chain with a transfer error instead of here.
+    """
+    locked = {a.lower() for a in locked_pools if a}
+    tiers = sorted({int(x) for x in fee_tiers})
+    if preferred_fee_pips is not None:
+        # Honour an explicit preference first, but still fall through: a
+        # requested tier that is the locked one or too thin is not usable, and
+        # failing the whole plan over a preference would be worse than borrowing
+        # slightly more expensively.
+        tiers = [int(preferred_fee_pips)] + [x for x in tiers if x != int(preferred_fee_pips)]
+
+    rejected: List[str] = []
+    for tier in tiers:
+        addr = v3_pool_for_fee(tier)
+        if not addr or int(addr, 16) == 0:
+            rejected.append(f"tier {tier}: no pool deployed")
+            continue
+        if addr.lower() in locked:
+            rejected.append(
+                f"tier {tier}: {addr} is the pool leg 2 swaps through, so it is "
+                f"locked during the callback (would revert 'LOK')"
+            )
+            continue
+        bal = quote_balance_of(addr) if quote_balance_of is not None else None
+        if bal is not None and bal < borrow_wei:
+            rejected.append(
+                f"tier {tier}: {addr} holds {bal:,} wei of the borrow token, "
+                f"short of the {borrow_wei:,} wei needed"
+            )
+            continue
+        return addr, tier, bal
+
+    raise PlanError(
+        "no V3 pool can lend this flash loan. Every candidate was ruled out:\n    "
+        + "\n    ".join(rejected)
+        + "\nThe pool leg 2 swaps through can never lend it, so at least one OTHER "
+          "tier of this pair must be deployed and funded with the quote token."
+    )
+
+
 def plan_arbitrage(
     res: CrossScanResult,
     base_address: str,
@@ -317,6 +406,8 @@ def plan_arbitrage(
     quote_decimals: int = 18,
     base_decimals: int = 18,
     v3_uses_deadline: bool = True,
+    flash_fee_tiers: Sequence[int] = DEFAULT_FLASH_FEE_TIERS,
+    flash_pool_quote_balance: Optional[Callable[[str], int]] = None,
 ) -> ArbPlan:
     """
     Build an ArbPlan from a completed cross scan.
@@ -400,12 +491,26 @@ def plan_arbitrage(
             f"to 0 wei. The size is too small to exist on chain — raise --size."
         )
 
+    # Which pool lends the loan must be settled BEFORE the fee is known, because
+    # PancakeSwap V3 charges the flash fee at the LENDING pool's own swap tier.
+    # Taking that tier from the sell leg assumes the lending pool and leg 2's pool
+    # are the same pool, and they cannot be: leg 2 swaps inside flash()'s
+    # callback, while the lending pool is holding its reentrancy lock.
+    leg2_pool = v3_pool_for_fee(sell.fee_pips) or ""
+    pool, flash_tier, flash_bal = choose_flash_pool(
+        [leg2_pool, sell.pool_address or ""],
+        v3_pool_for_fee,
+        borrow_wei,
+        flash_pool_quote_balance,
+        flash_fee_tiers,
+        flash_fee_pips,
+    )
+
     # The flash fee is charged on the borrowed amount, in the borrowed token, as
     # ceil(amount * poolFee / 1e6). Computed with ints and rounded UP, matching
     # the pool's FullMath.mulDivRoundingUp — rounding down here would understate
     # the cost and let a marginal plan look profitable.
-    fee_pips = flash_fee_pips if flash_fee_pips is not None else sell.fee_pips
-    flash_fee = -(-borrow_wei * int(fee_pips) // 1_000_000)
+    flash_fee = -(-borrow_wei * int(flash_tier) // 1_000_000)
 
     # Slippage floors come off each leg's OWN executable price, which already
     # includes that leg's fee and impact. Deriving them from the mid instead sets
@@ -431,21 +536,18 @@ def plan_arbitrage(
             f"because it reverts, no tokens move and only gas is spent."
         )
 
-    pool = v3_pool_for_fee(sell.fee_pips)
-    if not pool or int(pool, 16) == 0:
-        raise PlanError(
-            f"no V3 pool exists for this pair at fee {sell.fee_pips}, so the flash "
-            f"loan has nowhere to come from. Choose a sell venue whose tier is "
-            f"actually deployed and funded."
-        )
-    # The flash loan comes from the SAME pool leg 2 sells into. That is the point
-    # of the design: one pool supplies the capital and receives the output, so the
-    # sale and the repay net against each other and the round trip needs no
-    # starting inventory whatsoever.
-    if sell.pool_address and pool.lower() != sell.pool_address.lower():
+    if leg2_pool and pool.lower() != leg2_pool.lower():
         notes.append(
-            f"the flash pool ({pool}) is not the sell leg's pool ({sell.pool_address}); "
-            f"both are still used, but the capital and the sale no longer net in one place"
+            f"the flash loan comes from a different pool ({pool}, tier {flash_tier}) "
+            f"than the one leg 2 swaps through ({leg2_pool}, tier {sell.fee_pips}). "
+            f"That is required, not a compromise: flash() holds the lending pool's "
+            f"reentrancy lock across the whole callback, so a swap routed back into "
+            f"it reverts with 'LOK' before either leg can settle."
+        )
+    if flash_bal is not None:
+        notes.append(
+            f"the lending pool holds {flash_bal:,} wei of the borrow token against "
+            f"this {borrow_wei:,} wei loan"
         )
 
     v2_router = buy.router_address or ""
@@ -465,6 +567,7 @@ def plan_arbitrage(
         intermediate_token=base_address,
         pool=checksum(pool),
         flash_amount=borrow_wei,
+        flash_fee_pips=int(flash_tier),
         v2_router=checksum(v2_router),
         v2_path=[quote_address, base_address],
         v2_amount_out_min=v2_min,

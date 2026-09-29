@@ -156,6 +156,12 @@ contract FlashArb {
     error EmptyPath();
     error PathEndpointsMismatch();
     error Unprofitable(int256 profit, uint256 minProfit);
+    /// The round trip did not bring back enough of the borrow token to repay the
+    /// flash loan. `held` is what this contract has after leg 2; `owed` is the
+    /// borrowed amount plus the pool's flash fee. Distinct from Unprofitable on
+    /// purpose: this means the trade cannot even CLOSE, whereas Unprofitable
+    /// means it closed but did not clear the owner's threshold.
+    error CannotRepay(uint256 held, uint256 owed);
     error ZeroAddress();
     /// The V3 router call failed and gave no reason. Almost always means the
     /// router does not implement the selector we used, i.e. v3RouterUsesDeadline
@@ -319,6 +325,28 @@ contract FlashArb {
         // way round.
         o.flashFee = IPancakeV3PoolFlash(params.pool).token0() == params.borrowToken ? fee0 : fee1;
         o.repaid = params.flashAmount + o.flashFee;
+
+        // Confirm the repay can be funded BEFORE handing the transfer to the
+        // token. Without this the failure surfaces as the bare string "transfer
+        // failed" from _safeTransfer below -- wording this contract shares with
+        // PancakeSwap's own TransferHelper, so it reads like a broken token or a
+        // broken approval and points at neither.
+        //
+        // How the source was pinned down, since the two messages look alike: the
+        // POOL's helper reverts with "TF", this contract's with "transfer failed".
+        // Asking a pool to flash more than it holds returns "TF"; the failing run
+        // returned "transfer failed", which is this line, at the repay.
+        //
+        // The cause is that the two legs did not bring back enough of the borrow
+        // token to cover the loan plus its fee -- the arbitrage was unprofitable.
+        // Naming it here makes that visible in the revert itself.
+        //
+        // Safety is unchanged either way: this reverts the whole transaction, so
+        // both swaps unwind and the pool is never left short. The difference is
+        // only whether the reason is legible.
+        uint256 held = _balanceOf(params.borrowToken, address(this));
+        if (held < o.repaid) revert CannotRepay(held, o.repaid);
+
         _safeTransfer(params.borrowToken, params.pool, o.repaid);
 
         // ---- the profit check ------------------------------------------------

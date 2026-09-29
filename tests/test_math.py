@@ -2099,6 +2099,30 @@ _A_POOL = _addr(0x2D44)
 _A_V2_ROUTER = _addr(0xD99D)
 _A_V3_ROUTER = _addr(0x9A48)
 
+# The pool leg 2 swaps through, and a DIFFERENT tier of the same pair that lends
+# the flash loan. They must never be the same address: flash() holds the lending
+# pool's reentrancy lock across the whole callback, so a swap routed back into it
+# reverts 'LOK'. The fixture used to map every fee tier to _A_POOL, which is not
+# what a factory does and which quietly licensed exactly that mistake.
+_A_LEG2_POOL = _A_POOL
+_A_FLASH_POOL = _addr(0x29A3)
+
+
+def _pools_for(res):
+    """A v3_pool_for_fee resolver giving each fee tier its own pool, as a real
+    factory does. The tier leg 2 will swap through maps to _A_LEG2_POOL; every
+    other tier maps to _A_FLASH_POOL, so the loan necessarily comes from
+    somewhere else."""
+    from arb.executor import best_leg
+
+    sell = best_leg(res, "v3", "sell")
+    leg2_fee = int(sell.fee_pips) if sell is not None else -1
+
+    def resolve(fee: int) -> str:
+        return _A_LEG2_POOL if int(fee) == leg2_fee else _A_FLASH_POOL
+
+    return resolve
+
 
 def _scan_with(*specs):
     """Build a CrossScanResult from (key, name, version, pips, mid, exec, impact)."""
@@ -2218,7 +2242,7 @@ def plan_picks_one_leg_per_protocol_generation():
     check(approx(sell.exec_price, 11.7709, 1e-9),
           f"the sell leg should be the dearest V3, got {sell.exec_price}")
 
-    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, lambda fee: _A_POOL,
+    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, _pools_for(res),
                           quote_decimals=18)
     check(plan.buy_label.startswith("PancakeSwap V2"), f"leg 1 is {plan.buy_label}")
     check("1.00%" in plan.sell_label, f"leg 2 is {plan.sell_label}")
@@ -2261,12 +2285,12 @@ def plan_checksums_addresses_so_the_encoder_cannot_reject_them():
     from arb.executor import plan_arbitrage
 
     res = _scan_with(*_TESTNET_SPECS)
-    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, lambda fee: _A_POOL,
+    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, _pools_for(res),
                           quote_decimals=18)
 
     # The fixtures are deliberately lowercase, so this proves the upgrade.
-    check(_A_POOL == _A_POOL.lower(), "the fixture should start lowercase")
-    check(plan.pool != _A_POOL, "the planner left the address lowercase")
+    check(_A_FLASH_POOL == _A_FLASH_POOL.lower(), "the fixture should start lowercase")
+    check(plan.pool != _A_FLASH_POOL, "the planner left the address lowercase")
 
     for label, value in (("pool", plan.pool), ("borrowToken", plan.borrow_token),
                          ("intermediateToken", plan.intermediate_token),
@@ -2282,13 +2306,14 @@ def plan_checksums_addresses_so_the_encoder_cannot_reject_them():
 def plan_predicts_its_own_revert_when_the_edge_cannot_cover_the_fee():
     """
     On testnet the round trip is a LOSS, and the plan must say so before anyone
-    spends gas. The flash fee is ceil(borrowed * poolFee / 1e6) — the 1.00% tier
-    charges 10,000 pips, i.e. 1% of what is borrowed.
+    spends gas. The flash fee is ceil(borrowed * poolFee / 1e6), where poolFee is
+    the LENDING pool's tier -- not the sell leg's, since the two pools can never
+    be the same one.
     """
     from arb.executor import plan_arbitrage
 
     res = _scan_with(*_TESTNET_SPECS)
-    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, lambda fee: _A_POOL,
+    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, _pools_for(res),
                           quote_decimals=18)
 
     check(plan.expected_gross_bps < 0,
@@ -2298,12 +2323,14 @@ def plan_predicts_its_own_revert_when_the_edge_cannot_cover_the_fee():
     # number: the exact wei depends on float rounding of 0.001 * 11.9417, so a
     # literal here breaks whenever that last wei moves. What matters is the rule,
     # and that it rounds UP the way the pool's mulDivRoundingUp does.
-    expected_fee = -(-plan.flash_amount * 10_000 // 1_000_000)
+    tier = plan.flash_fee_pips
+    expected_fee = -(-plan.flash_amount * tier // 1_000_000)
     check(plan.expected_flash_fee == expected_fee,
-          f"flash fee is {plan.expected_flash_fee}, expected ceil(borrow*1%) = {expected_fee}")
-    check(plan.expected_flash_fee * 1_000_000 >= plan.flash_amount * 10_000,
+          f"flash fee is {plan.expected_flash_fee}, expected "
+          f"ceil(borrow*{tier}/1e6) = {expected_fee}")
+    check(plan.expected_flash_fee * 1_000_000 >= plan.flash_amount * tier,
           "the flash fee must not round down below what the pool charges")
-    check(plan.expected_flash_fee * 1_000_000 < plan.flash_amount * 10_000 + 1_000_000,
+    check(plan.expected_flash_fee * 1_000_000 < plan.flash_amount * tier + 1_000_000,
           "the flash fee rounded up by more than one unit")
     check(any("EXPECTED TO REVERT" in n for n in plan.notes),
           f"the plan did not warn that it will revert: {plan.notes}")
@@ -2392,7 +2419,7 @@ def plan_calldata_encoding_survives_a_roundtrip():
 
     res = _scan_with(*_TESTNET_SPECS)
     plan = plan_arbitrage(res, _A_BASE, _A_QUOTE,
-                          lambda fee: _A_POOL, quote_decimals=18, base_decimals=18,
+                          _pools_for(res), quote_decimals=18, base_decimals=18,
                           v3_uses_deadline=False)
 
     obj = contract_factory(Web3(), _addr(0x11), compiled.abi)
@@ -3126,7 +3153,7 @@ def each_legs_slippage_floor_is_denominated_in_the_token_that_leg_pays_out():
 
     # Deliberately asymmetric: BASE 18 decimals, QUOTE 6 (USDT on Ethereum).
     res = _scan_with(*_TESTNET_SPECS)
-    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, lambda fee: _A_POOL,
+    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, _pools_for(res),
                           slippage_bps=100.0, quote_decimals=6, base_decimals=18)
 
     size = res.trade_size_base
@@ -3174,6 +3201,191 @@ def each_legs_slippage_floor_is_denominated_in_the_token_that_leg_pays_out():
               f"a floor of {f} overshot the exact {exact} at {bps} bps")
         check(exact - Decimal(f) < 1,
               f"a floor of {f} lost more than one wei at {bps} bps (exact {exact})")
+
+
+# --------------------------------------------------------------------------
+# Flash-loan pool selection — the 'LOK' reentrancy constraint
+# --------------------------------------------------------------------------
+@test
+def the_flash_loan_never_comes_from_the_pool_leg_two_swaps_through():
+    """
+    A V3 pool's flash() takes its reentrancy lock and holds it across the whole
+    callback:
+
+        modifier lock() { require(!locked, 'LOK'); locked = true; _; locked = false; }
+
+    The entire arbitrage runs inside that callback, so if leg 2's swap routes back
+    into the lending pool the router calls swap() on a pool that is still locked
+    and it reverts with the three-character reason 'LOK'. No ordering, sizing or
+    slippage setting avoids it — the two are mutually exclusive by construction.
+
+    This is exactly what the first live --execute run did. It cost a deployment to
+    find, because the plan looked entirely reasonable on screen: it even carried a
+    note explaining that borrowing from the sell pool was the POINT of the design,
+    since "the capital and the sale net against each other". That netting can
+    never happen, because the sale cannot execute at all.
+    """
+    from arb.executor import PlanError, choose_flash_pool, plan_arbitrage
+
+    res = _scan_with(*_TESTNET_SPECS)
+    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, _pools_for(res), quote_decimals=18)
+
+    leg2_pool = _pools_for(res)(plan.v3_fee)
+    check(_same_addr(plan.pool, _A_FLASH_POOL),
+          f"the loan should come from the alternate tier, got {plan.pool}")
+    check(not _same_addr(plan.pool, leg2_pool),
+          f"the lending pool {plan.pool} IS leg 2's pool {leg2_pool} — that reverts 'LOK'")
+    check(any("LOK" in n for n in plan.notes),
+          "the plan should explain why the two pools have to differ")
+
+    # The chooser on its own, offered only the locked pool.
+    try:
+        choose_flash_pool([_A_POOL], lambda fee: _A_POOL, 1, fee_tiers=(500,))
+    except PlanError as exc:
+        check("LOK" in str(exc), f"the refusal should name the revert: {exc}")
+    else:
+        raise AssertionError("the locked pool was offered as the lender")
+
+
+@test
+def the_cheapest_pool_that_can_lend_wins_and_thin_pools_are_skipped():
+    """
+    PancakeSwap V3 charges the flash fee at the LENDING pool's own swap tier, so
+    the tier is a direct cost: 0.01% lends five times more cheaply than 0.05% for
+    identical capital. But a cheap pool that does not hold the token is worse than
+    an expensive one — it is chosen, then fails on chain with an opaque transfer
+    error instead of being ruled out here where the reason can be stated.
+    """
+    from arb.executor import choose_flash_pool
+
+    tiers = {100: _addr(0x29A3), 500: _addr(0x2DBB),
+             2500: _addr(0x270E), 10000: _addr(0x4025)}
+
+    def resolve(fee):
+        return tiers.get(int(fee), "")
+
+    addr, tier, _ = choose_flash_pool([tiers[500]], resolve, 10 ** 15)
+    check(tier == 100 and addr == tiers[100],
+          f"the cheapest eligible tier should lend, got {tier}")
+
+    addr, tier, _ = choose_flash_pool([tiers[100]], resolve, 10 ** 15)
+    check(tier == 500 and addr == tiers[500],
+          f"with the cheapest locked the next one should lend, got {tier}")
+
+    # Cost order, not the order the tiers happened to be listed in.
+    _, tier, _ = choose_flash_pool([], resolve, 10 ** 15,
+                                   fee_tiers=(10000, 2500, 500, 100))
+    check(tier == 100, f"listing order must not beat cost order, got {tier}")
+
+    holdings = {tiers[100]: 10 ** 12, tiers[500]: 10 ** 18}
+    _, tier, bal = choose_flash_pool([], resolve, 10 ** 15,
+                                     quote_balance_of=lambda a: holdings.get(a, 0))
+    check(tier == 500, f"the thin 0.01% pool should be passed over, got {tier}")
+    check(bal == 10 ** 18, "the reported balance should be the chosen pool's")
+
+    # An explicit preference wins when eligible, falls through when not — failing
+    # the whole plan over a preference would be worse than borrowing dearer.
+    _, tier, _ = choose_flash_pool([], resolve, 10 ** 15, preferred_fee_pips=2500)
+    check(tier == 2500, f"an eligible preference should win, got {tier}")
+    _, tier, _ = choose_flash_pool([tiers[2500]], resolve, 10 ** 15,
+                                   preferred_fee_pips=2500)
+    check(tier == 100, f"a locked preference should fall through, got {tier}")
+
+
+@test
+def when_no_pool_can_lend_the_refusal_states_every_reason():
+    """
+    A refusal that only says "failed" sends the reader hunting. This one has to
+    list each candidate and why it was ruled out, because the fix differs per
+    reason: a locked pool means pick another tier, a thin pool means fund it or
+    trade smaller, a missing pool means that tier was never deployed.
+    """
+    from arb.executor import PlanError, choose_flash_pool
+
+    tiers = {100: _addr(0x29A3), 500: _addr(0x2DBB)}
+    holdings = {tiers[100]: 5}
+    try:
+        choose_flash_pool([tiers[500]], lambda f: tiers.get(int(f), ""), 10 ** 15,
+                          quote_balance_of=lambda a: holdings.get(a, 0),
+                          fee_tiers=(100, 500, 2500))
+    except PlanError as exc:
+        msg = str(exc)
+        check("LOK" in msg, f"the locked pool's reason is missing: {msg}")
+        check("short of" in msg, f"the thin pool's reason is missing: {msg}")
+        check("2500" in msg, f"the undeployed tier's reason is missing: {msg}")
+    else:
+        raise AssertionError("an impossible loan was accepted")
+
+
+@test
+def the_repay_is_checked_before_the_transfer_so_the_reason_is_legible():
+    """
+    Without an explicit check, an unprofitable round trip fails inside the token
+    transfer and surfaces as PancakeSwap's generic 'transfer failed', which names
+    a helper library rather than a cause. Checking held >= owed first reverts with
+    CannotRepay(held, owed) instead.
+
+    Safety is identical either way — the whole transaction unwinds, both swaps are
+    discarded and only gas is spent — so this is purely about the reason being
+    legible. Asserted on the source rather than on a deployment, because changing
+    the deployed bytecode costs a redeploy and this improvement does not justify
+    one on its own.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "contracts" / "FlashArb.sol").read_text()
+    check("error CannotRepay(uint256 held, uint256 owed);" in src,
+          "the contract should declare CannotRepay carrying both numbers")
+
+    guard = src.find("revert CannotRepay(")
+    transfer = src.find("_safeTransfer(params.borrowToken, params.pool, o.repaid)")
+    check(guard != -1, "the repay guard is missing")
+    check(transfer != -1, "the repay transfer is missing")
+    check(guard < transfer, "the guard must come BEFORE the transfer it protects")
+
+
+@test
+def known_revert_reasons_are_translated_into_a_cause():
+    """
+    These pools and routers revert with reasons that name a mechanism, not a
+    cause: 'LOK' is three characters, 'transfer failed' blames a token helper, and
+    an empty 0x carries nothing at all. Each cost real debugging time to identify,
+    so the CLI states what the reason means rather than echoing it back.
+
+    The empty case needs a negative lookahead. A revert that DOES carry data also
+    begins 'reverted: 0x', and reporting that as empty would send the reader off
+    to debug an ABI shape when the reason string was present all along.
+    """
+    from arb.deployer import estimation_failure_message
+
+    class ContractLogicError(Exception):
+        pass
+
+    def explain(reason):
+        return estimation_failure_message(ContractLogicError(reason), 10 ** 18)
+
+    lok = explain("execution reverted: LOK: 0x08c379a0")
+    check("reentrancy lock" in lok, f"'LOK' was not explained: {lok}")
+
+    tf = explain("execution reverted: transfer failed: 0x08c379a0")
+    check("repay" in tf.lower(), f"'transfer failed' was not tied to the repay: {tf}")
+
+    ioa = explain("execution reverted: INSUFFICIENT_OUTPUT_AMOUNT")
+    check("slippage floor" in ioa, f"the slippage reason was not explained: {ioa}")
+
+    empty = explain("execution reverted: 0x")
+    check("NO data" in empty, f"an empty revert was not recognised: {empty}")
+    check("selector" in empty, f"an empty revert should point at the selector: {empty}")
+
+    padded = ("execution reverted: 0x08c379a000000000000000000000000000000000"
+              "0000000000000000000000000000000000000000000000000000000000000020")
+    withdata = explain(padded)
+    check("NO data" not in withdata,
+          f"a revert carrying data was misreported as empty: {withdata}")
+
+    unknown = explain("execution reverted: SOMETHING_NOVEL")
+    check("SOMETHING_NOVEL" in unknown, f"an unknown reason was hidden: {unknown}")
 
 
 def run_all(verbose: bool = True) -> int:

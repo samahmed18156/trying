@@ -25,7 +25,7 @@ import pathlib
 import signal
 import sys
 import time
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import bootstrap
 
@@ -1510,12 +1510,14 @@ def cmd_arb_plan(args) -> int:
     quote_decimals = _decimals_on_chain(reader, quote)
     base_decimals = _decimals_on_chain(reader, base)
     uses_deadline = _v3_router_shape(provider.w3, res)
+    quote_bal = _pool_quote_balance_fn(provider.w3, quote)
     try:
         plan = plan_arbitrage(
             res, base, quote, pool_for_fee,
             slippage_bps=args.slippage, min_profit_wei=args.min_profit,
             quote_decimals=quote_decimals, base_decimals=base_decimals,
             v3_uses_deadline=uses_deadline,
+            flash_pool_quote_balance=quote_bal,
         )
     except PlanError as exc:
         print(fmt.red(f"\n  {exc}"))
@@ -1584,6 +1586,31 @@ def _contract_address(args, dep) -> str:
         raise SystemExit(fmt.red(
             f"{raw!r} is not a valid address ({exc}). It must be 0x followed by "
             f"40 hex characters - copy it again from your deployment output."))
+
+
+def _pool_quote_balance_fn(w3, quote_address: str):
+    """
+    A callable giving the quote-token balance held by any pool address.
+
+    choose_flash_pool uses this to rule out pools that exist but are too thin to
+    lend what we are asking for. Without it, a thin pool is chosen and the
+    transaction fails on chain with an opaque transfer error; with it, the plan
+    says here which pool was skipped and why. Results are cached per address so
+    walking four fee tiers costs four RPC calls at most, not four per attempt.
+    """
+    from abis import ERC20_ABI
+    from dex.fetcher import contract_factory
+
+    token = contract_factory(w3, quote_address, ERC20_ABI)
+    cache: Dict[str, int] = {}
+
+    def balance_of(pool_address: str) -> int:
+        key = pool_address.lower()
+        if key not in cache:
+            cache[key] = int(token.functions.balanceOf(pool_address).call())
+        return cache[key]
+
+    return balance_of
 
 
 def _v3_router_shape(w3, res) -> bool:
@@ -1666,11 +1693,13 @@ def cmd_arb_run(args) -> int:
     quote_decimals = _decimals_on_chain(reader, quote)
     base_decimals = _decimals_on_chain(reader, base)
     uses_deadline = _v3_router_shape(provider.w3, res)
+    quote_bal = _pool_quote_balance_fn(provider.w3, quote)
     try:
         plan = plan_arbitrage(res, base, quote, pool_for_fee,
                               slippage_bps=args.slippage, min_profit_wei=args.min_profit,
                               quote_decimals=quote_decimals, base_decimals=base_decimals,
-                              v3_uses_deadline=uses_deadline)
+                              v3_uses_deadline=uses_deadline,
+                              flash_pool_quote_balance=quote_bal)
     except PlanError as exc:
         print(fmt.red(f"  {exc}"))
         return 4
@@ -1699,7 +1728,18 @@ def cmd_arb_run(args) -> int:
 
     tx = {"from": sender, "to": contract_address, "data": data, "value": 0,
           "chainId": net.chain_id}
-    cost = estimate_cost(provider.w3, sender, tx, native_symbol=net.native_symbol)
+    try:
+        cost = estimate_cost(provider.w3, sender, tx, native_symbol=net.native_symbol)
+    except DeployError as exc:
+        # The node simulated the call and refused it, so nothing was signed, sent
+        # or spent. estimate_cost already turned the raw revert into an explained
+        # message -- raising it instead buries that explanation under a traceback,
+        # which is exactly what happened the first time this path was hit.
+        print(fmt.red("\n  the transaction was NOT sent — the node refused to estimate gas for it."))
+        for i, line in enumerate(str(exc).split("\n")):
+            print((fmt.red if i == 0 else fmt.dim)("  " + line))
+        print(fmt.dim("\n  No gas was spent and no tokens moved."))
+        return 5
     print(f"  gas       {cost.human}")
     if not cost.affordable:
         print(fmt.red("  insufficient balance for this call — fund the wallet first"))
