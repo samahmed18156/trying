@@ -141,6 +141,13 @@ class Settings:
     # Index (reference) price source: "cmc" | "coinbase" | "kraken" | "auto"
     index_source: str = os.getenv("INDEX_SOURCE", "auto")
 
+    # Registration/failover order for the index feed. The FIRST source that
+    # answers wins, so this decides what a plain `scan` reports. Venues that
+    # publish a real order book rank above CoinMarketCap's aggregated index,
+    # because only a book gives an executable price — see build_default_feed().
+    # Set to "cmc,kraken,coinbase" to restore CoinMarketCap-first.
+    index_source_order: str = os.getenv("INDEX_SOURCE_ORDER", "kraken,coinbase,cmc")
+
     # DEX version preference: "v3" | "v2" | "auto"  (auto = v3 first, fall back to v2)
     dex_version: str = os.getenv("DEX_VERSION", "auto")
     # If a specific V3 fee tier is desired, set it (e.g. 3000). None = auto-pick deepest.

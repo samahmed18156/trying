@@ -128,8 +128,9 @@ def detect_command(argv: list) -> str | None:
     Find the subcommand in argv without argparse.
 
     bootstrap runs before the heavy imports, so it cannot use main.py's parser.
-    Anything that is not a known command (or a flag) is treated as unknown and
-    checked as though it needed the network — the safe default.
+    Returns None when there is no subcommand at all (bare invocation, or
+    top-level flags such as --help), which the caller must hand to argparse
+    rather than treat as a dependency failure.
     """
     known = NETWORK_COMMANDS | OFFLINE_COMMANDS
     for token in argv[1:]:
@@ -138,3 +139,31 @@ def detect_command(argv: list) -> str | None:
         if not token.startswith("-"):
             return token
     return None
+
+
+HELP_FLAGS = frozenset({"-h", "--help"})
+
+
+def is_runnable_command(command: str | None, argv: list | None = None) -> bool:
+    """
+    True only when there is a real subcommand whose dependencies should be
+    checked now.
+
+    Three cases must be handed to argparse instead, because argparse produces a
+    better message than the dependency checker and may not need any dependency
+    at all:
+
+      * no subcommand          -> argparse prints usage and exits 2
+      * a help flag anywhere   -> argparse prints help and exits 0
+      * an unknown subcommand  -> argparse lists the valid choices and exits 2
+
+    Without this, `--help` on a machine with no packages installed printed
+    "Missing Python packages" instead of the help text.
+    """
+    if command is None or command not in (NETWORK_COMMANDS | OFFLINE_COMMANDS):
+        return False
+    if argv:
+        for token in argv[1:]:
+            if token in HELP_FLAGS:
+                return False
+    return True

@@ -109,6 +109,38 @@ rmdir /s /q .idea
 PyCharm rebuilds `.idea` on the next open. (`.idea/` is git-ignored, so this
 does not affect the repository.)
 
+### "can't find '__main__' module in 'C:\…\trying'"
+
+PyCharm handed Python the **project folder** instead of a file:
+
+```
+python.exe  C:\Users\SERVER\PycharmProjects\trying
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ a directory, not a .py file
+```
+
+Python then looks inside it for `__main__.py`. This repo now ships one, so that
+command works and runs the CLI — but the Run Configuration still should name the
+file explicitly:
+
+| Field | Value |
+|---|---|
+| Script path | `C:\Users\SERVER\PycharmProjects\trying\main.py` |
+| Parameters | `scan` |
+| Working directory | `C:\Users\SERVER\PycharmProjects\trying` |
+
+The cause is an empty or folder-valued **Script path**, usually left over from
+deleting a previous configuration. Set it, then **Apply**.
+
+All of these are equivalent and all work:
+
+```bat
+python main.py scan
+python __main__.py scan
+python C:\Users\SERVER\PycharmProjects\trying scan
+python -m trying scan        (from the parent directory)
+run.bat scan
+```
+
 ### "ModuleNotFoundError: No module named 'web3'"
 
 The packages are not installed **into the interpreter PyCharm is using**. Note
@@ -352,6 +384,37 @@ on chain via `factory.getPair()` / `factory.getPool()` and cached, and decimals
 are read from each token. That is deliberate: a hard-coded pool address goes
 stale silently and then produces confidently wrong prices.
 
+### Index source order
+
+`INDEX_SOURCE` picks one source explicitly. `INDEX_SOURCE_ORDER` sets the
+failover order used when `INDEX_SOURCE=auto` (the default), and the first source
+that answers is the one reported.
+
+The default is `kraken,coinbase,cmc`. That ordering is by **executability**, not
+authority:
+
+| Source | What it publishes | Index exec leg |
+|---|---|---|
+| `kraken` | real order book, often <1 bps on ETH/USDT | the actual bid |
+| `coinbase` | real order book, a few bps | the actual bid |
+| `cmc` | volume-weighted index across many venues | **none — mid is assumed** |
+
+An aggregated index is the right thing to *measure* a market against and the
+wrong thing to *trade* against. With CMC winning, the tool cannot price an
+executable leg, so it assumes you can trade at the mid and prints:
+
+```
+index exec      2,692.31  mid only — optimistic
+! index source 'cmc' publishes a mid/index only … real capture will be lower
+```
+
+The original brief specified CoinMarketCap, so it remains registered and
+`--source cmc` still selects it — it just no longer wins by default. Restore the
+brief's priority with `INDEX_SOURCE_ORDER=cmc,kraken,coinbase`.
+
+A typo in the order string degrades to the default rather than dropping a
+source, and `cmc` is omitted entirely when no key is configured.
+
 ### Adding a network
 
 ```python
@@ -380,6 +443,7 @@ the chain automatically. Verify the address on the chain's block explorer first
 ```
 trying/
 ├── main.py                     CLI: info | scan | watch | verify | selftest
+├── __main__.py                 makes the project FOLDER itself runnable
 ├── bootstrap.py                dependency preflight -> readable setup errors
 ├── config.py                   networks, contract addresses, thresholds, fee units
 ├── rpc.py                      node connection with endpoint failover + chain-id check

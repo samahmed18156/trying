@@ -167,20 +167,74 @@ class IndexPriceFeed:
         )
 
 
-def build_default_feed(settings, cmc_key: Optional[str] = None) -> IndexPriceFeed:
-    """Wire up all sources; CMC first when a key exists (matches the brief)."""
+# Registration order for build_default_feed(). See its docstring for why an
+# aggregated index ranks below the venues that publish a real order book.
+DEFAULT_SOURCE_ORDER = "kraken,coinbase,cmc"
+
+
+def build_default_feed(settings, cmc_key: Optional[str] = None,
+                       order: Optional[str] = None) -> IndexPriceFeed:
+    """
+    Wire up every available price source, best for trading first.
+
+    Order matters because IndexPriceFeed returns the FIRST source that answers,
+    so whatever is registered first is what a scan reports by default.
+
+    The default order is `kraken,coinbase,cmc` — chosen by how *executable* each
+    source is, not by how authoritative it looks:
+
+      kraken    real order book, typically <1 bps spread on ETH/USDT
+      coinbase  real order book, a few bps
+      cmc       a volume-weighted index across many venues. No bid, no ask, so
+                the tool cannot price an executable leg and has to assume you can
+                trade at the mid. That assumption inflates every signal, which is
+                why arb/signals.py emits an explicit warning when CMC wins.
+
+    An aggregated index is the right thing to *measure* a market against and the
+    wrong thing to *trade* against. The original brief asked for CoinMarketCap,
+    so it stays registered and `--source cmc` still selects it explicitly; it
+    just no longer wins by default.
+
+    Override with INDEX_SOURCE_ORDER in .env — e.g. `cmc,kraken,coinbase`
+    restores the brief's original priority.
+    """
     from index.cmc import CoinMarketCapSource
     from index.fallbacks import CoinbaseSource, KrakenSource
 
     feed = IndexPriceFeed(cache_seconds=max(5.0, settings.poll_seconds * 2),
                           timeout=settings.request_timeout)
 
+    # Every value is a zero-arg factory returning the resolver callable, so the
+    # registration loop below can treat all sources identically. (Assigning
+    # `cmc.get` directly instead of `lambda: cmc.get` registers the *result* of
+    # calling it, which fails with missing symbol/quote arguments.)
+    builders = {
+        "kraken": lambda: KrakenSource(timeout=settings.request_timeout).get,
+        "coinbase": lambda: CoinbaseSource(timeout=settings.request_timeout).get,
+    }
+
     cmc = CoinMarketCapSource(api_key=cmc_key, timeout=settings.request_timeout)
     if cmc.enabled:
-        feed.register("cmc", cmc.get)
+        builders["cmc"] = lambda: cmc.get
     else:
-        log.warning("CMC_API_KEY not set — CoinMarketCap source disabled.")
+        # info, not warning: the tool is fully functional without a CMC key, and
+        # a WARNING on every run trains you to ignore the ones that matter.
+        log.info("CMC_API_KEY not set - CoinMarketCap source disabled "
+                 "(kraken/coinbase need no key).")
 
-    feed.register("coinbase", CoinbaseSource(timeout=settings.request_timeout).get)
-    feed.register("kraken", KrakenSource(timeout=settings.request_timeout).get)
+    wanted = [n.strip().lower()
+              for n in (order or DEFAULT_SOURCE_ORDER).split(",") if n.strip()]
+    # A valid source the order string forgot still gets registered, last, so a
+    # typo in INDEX_SOURCE_ORDER degrades to the default instead of silently
+    # dropping a source.
+    for name in DEFAULT_SOURCE_ORDER.split(","):
+        if name not in wanted and name in builders:
+            wanted.append(name)
+
+    registered = []
+    for name in wanted:
+        if name in builders:
+            feed.register(name, builders[name]())
+            registered.append(name)
+    log.debug("index source order: %s", " -> ".join(registered))
     return feed

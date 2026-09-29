@@ -659,6 +659,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Dependency preflight BEFORE importing anything that needs web3/requests.
     # Offline commands (`selftest`) skip the heavy imports entirely, so they run
     # on a bare Python install with nothing from requirements.txt present.
+    #
+    # build_parser() uses a hard-coded --network choice list precisely so that
+    # getting this far never required config.py.
     if not bootstrap.preflight(args.command):
         return 2
     if args.command not in bootstrap.OFFLINE_COMMANDS:

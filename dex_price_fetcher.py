@@ -107,7 +107,7 @@ class DexPriceFetcher:
             self.provider.connect()
 
         self.reader = ChainReader(self.provider, self.net)
-        self.feed = feed or build_default_feed(self.settings)
+        self.feed = feed or build_default_feed(self.settings, order=self.settings.index_source_order)
 
         self._v3: Optional[UniswapV3Reader] = None
         self._v2: Optional[UniswapV2Reader] = None
