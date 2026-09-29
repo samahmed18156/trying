@@ -98,15 +98,76 @@ def gas_price_wei(w3) -> int:
     return int(w3.eth.gas_price)
 
 
+# Substrings that mean "you cannot pay for this", as opposed to "this transaction
+# is broken". Deliberately text-based and deliberately NOT matching the numeric
+# code: -32000 is geth's generic server-error bucket and covers execution
+# reverts too, so matching it would mislabel a genuine contract revert as a
+# funding problem - the opposite mistake, and a worse one.
+_FUNDING_MARKERS = (
+    "insufficient funds",
+    "insufficient balance",
+    "not enough balance",
+    "balance too low",
+    "doesn't have enough funds",
+)
+
+
+def estimation_failure_message(exc: BaseException, balance_wei: int,
+                              native_symbol: str = "BNB") -> str:
+    """
+    Explain a failed `estimate_gas` call.
+
+    Two very different problems produce the same exception, and telling them
+    apart is the whole job here:
+
+      * the wallet cannot pay for gas - a funding problem, fixed by claiming a
+        faucet drip, with nothing wrong with the contract;
+      * the transaction would revert - a real problem with the call, the
+        contract, or its arguments.
+
+    An empty wallet hits the FIRST one, because the node checks the balance while
+    simulating and refuses before it ever looks at the code. Reporting that as
+    "this would almost certainly revert" sends the user off to debug bytecode
+    that was never rejected.
+    """
+    raw = f"{type(exc).__name__}: {exc}"
+    if any(marker in raw.lower() for marker in _FUNDING_MARKERS):
+        return (
+            f"the node refused to estimate gas because this wallet cannot pay for "
+            f"it.\n"
+            f"    {raw}\n"
+            f"  Balance: {balance_wei / 10 ** 18:.8f} {native_symbol}. A deployment "
+            f"needs roughly 0.001-0.002 {native_symbol} on this chain.\n"
+            f"  This is NOT a contract bug - the bytecode was never rejected, the "
+            f"node stopped before looking at it.\n"
+            f"  Fund the wallet, then re-run this command:\n"
+            f"      python main.py wallet faucet"
+        )
+    return (
+        f"gas estimation failed, so this transaction would almost certainly "
+        f"revert: {raw}"
+    )
+
+
 def estimate_cost(w3, account_address: str, tx: Dict[str, Any],
                   native_symbol: str = "BNB", gas_margin: float = 1.35) -> TxCost:
     """Estimate gas, apply a margin, and price it against the balance."""
+    # Read the balance FIRST. It is one cheap call, and an empty wallet makes
+    # estimate_gas fail in a way that looks like a broken transaction.
+    balance = int(w3.eth.get_balance(account_address))
+    if balance == 0:
+        raise DeployError(
+            f"the wallet {account_address} holds 0 {native_symbol}, so it cannot "
+            f"pay gas for anything.\n"
+            f"  Claim a free drip for that address, then re-run this command:\n"
+            f"      python main.py wallet faucet"
+        )
+
     try:
         estimated = int(w3.eth.estimate_gas(tx))
     except Exception as exc:  # noqa: BLE001
         raise DeployError(
-            f"gas estimation failed, so this transaction would almost certainly "
-            f"revert: {type(exc).__name__}: {exc}"
+            estimation_failure_message(exc, balance, native_symbol)
         ) from exc
 
     # The margin covers state moving between estimation and inclusion. 1.35 is
@@ -117,7 +178,7 @@ def estimate_cost(w3, account_address: str, tx: Dict[str, Any],
         gas_units=units,
         gas_price_wei=price,
         max_cost_wei=units * price,
-        balance_wei=int(w3.eth.get_balance(account_address)),
+        balance_wei=balance,
         native_symbol=native_symbol,
     )
 

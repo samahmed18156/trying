@@ -65,7 +65,7 @@ cd C:\Users\SERVER\PycharmProjects\trying
 run.bat                 REM creates .venv, installs deps, runs a scan
 run.bat scan --both     REM any main.py subcommand works
 run.bat verify          REM cross-checks the maths against the live chain
-run.bat selftest        REM 75 offline tests, no network needed
+run.bat selftest        REM 76 offline tests, no network needed
 ```
 
 `run.bat` must be run **from the project root** (it `cd`s there itself) — the
@@ -80,7 +80,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # optional — it runs with no keys at all
-python main.py selftest     # 75 offline maths tests, no network needed
+python main.py selftest     # 76 offline maths tests, no network needed
 python main.py info         # config + live check of every RPC and price source
 python main.py scan         # one-shot ETH/USDT comparison
 ```
@@ -195,7 +195,7 @@ way to confirm your checkout and interpreter are healthy. Run it first.
 On a bare install it reports something like:
 
 ```
-64/64 passed, 11 skipped — all good
+65/65 passed, 11 skipped — all good
   skipped because: needs eth_account; needs eth_utils; needs web3; …
   Install them with:  python -m pip install -r requirements.txt
 ```
@@ -204,8 +204,8 @@ Those 11 are not failures and not silent passes. They cover things that genuinel
 cannot exist without the libraries — keystore encryption, transaction signing,
 EIP-55 checksums (keccak-256, which Python's `hashlib` does not ship: it has
 SHA3, and SHA3 and keccak differ in padding), and ABI encoding. Once you install
-the dependencies the same command reports **75/75 passed** on Linux and macOS. On
-Windows it reports **74/74 passed, 1 skipped**, because the one skipped test
+the dependencies the same command reports **76/76 passed** on Linux and macOS. On
+Windows it reports **75/75 passed, 1 skipped**, because the one skipped test
 repairs a lost execute bit on the cached `solc` binary and Windows has no execute
 bit — file access there is governed by ACLs, so there is nothing for it to check.
 That skip prints no "install something" advice, because installing something
@@ -223,7 +223,7 @@ top-right dropdown automatically after a reload:
 
 | Configuration | Runs |
 |---|---|
-| **Selftest** | `main.py selftest` — 75 offline maths tests, no network, no keys. Run this first. |
+| **Selftest** | `main.py selftest` — 76 offline maths tests, no network, no keys. Run this first. |
 | **Info** | `main.py info` — live check of every RPC endpoint and price source |
 | **Scan** | `main.py scan` — one-shot ETH/USDT comparison |
 | **Verify** | `main.py verify` — cross-checks the maths against the live chain |
@@ -416,7 +416,7 @@ The official `QuoterV2` cross-check is attempted as a bonus, but it only answers
 through *revert data*, and most free RPC providers strip that. It is not relied
 on. An Infura or Alchemy key will usually return it.
 
-`python main.py selftest` runs 75 offline tests covering TickMath constants
+`python main.py selftest` runs 76 offline tests covering TickMath constants
 (re-derived from first principles to 200 decimal places, which is how two
 single-digit transcription typos were caught), the tick bitmap walk, swap-step
 rounding, V2 closed forms, the arb decision logic, flash-loan plan construction, and the venue registry itself
@@ -804,6 +804,7 @@ Withdraw is owner-only and dry-runs by default; `--execute` sends it.
 | `INSUFFICIENT_OUTPUT_AMOUNT` | A leg's slippage floor was not met: the pool moved between the scan and your transaction | Raise `--slippage` (default 100 bps), or use a smaller `--size` |
 | `could not decrypt …: wrong password` | The password does not match the one the keystore was created with. **It cannot be recovered or reset** — that is what encrypting means | Try again (there is no attempt limit, and the prompt now allows three tries per command). Check Caps Lock and keyboard layout. If it will not come back, see "Lost the wallet password" below |
 | `insufficient balance for this call` | Your wallet cannot cover the gas | `python main.py wallet faucet --network bsc_testnet` |
+| `holds 0 BNB, so it cannot pay gas` or `insufficient funds for transfer` | The wallet is unfunded. The node refuses while simulating, **before it looks at the bytecode**, so this is never a contract problem | Claim a drip for the address `wallet faucet` prints, confirm with `wallet balance`, then re-run |
 | `no recorded deployment of FlashArb` | Nothing deployed yet, or `state/` was deleted | `python main.py arb deploy`, or pass `--address 0x…` |
 | `no usable V2/V3 leg` | The scan rejected every leg, usually on depth | Smaller `--size`, or higher `--max-impact` |
 | `Stack too deep` while compiling | The contract grew past the legacy compiler's 16-slot limit | Pack locals into a struct and scope leg blocks with `{ }`; do not reach for `--via-ir` |
@@ -1009,7 +1010,7 @@ trying/
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            75 offline tests — no network, no dependencies
+    └── test_math.py            76 offline tests — no network, no dependencies
 ```
 
 `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`

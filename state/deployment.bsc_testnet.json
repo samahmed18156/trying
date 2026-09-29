@@ -1,0 +1,13 @@
+{
+  "FlashArb": {
+    "address": "0x55a235ec4009d078aa4EeFd5dC34E73f32FcEaA7",
+    "transactionHash": "0c8beb37c657bbe531d7361195c4cbe02de4da20d6c0251baf0fb9a0ccf59096",
+    "blockNumber": 133854038,
+    "gasUsed": 1503358,
+    "costWei": 3006716000000000,
+    "costNative": 0.003006716,
+    "network": "bsc_testnet",
+    "chain_id": 97,
+    "deployer": "0xD4D84Da106A27ef5394F76b00F9bA0268E03935E"
+  }
+}

@@ -2818,6 +2818,133 @@ def a_cached_solc_binary_that_lost_its_execute_bit_is_repaired():
               "repairing an already-executable binary should be a no-op")
 
 
+@test
+def an_empty_wallet_is_reported_as_unfunded_not_as_a_broken_transaction():
+    """
+    Two very different problems arrive as the same failed `estimate_gas`, and
+    telling them apart is the whole job.
+
+    An EMPTY WALLET makes the node refuse during simulation - it checks the
+    balance before it ever looks at the code - and geth reports that as
+    `-32000 insufficient funds for transfer`. The previous wording turned that
+    into "gas estimation failed, so this transaction would almost certainly
+    revert", which sends someone off debugging bytecode that was never rejected.
+    On a real machine, deploying with an unfunded wallet, that is exactly what
+    happened.
+
+    The opposite mistake would be worse, so it is pinned here too: -32000 is
+    geth's generic server-error bucket and ALSO carries execution reverts, so
+    matching the numeric code instead of the message text would mislabel a
+    genuine contract revert as a funding problem.
+    """
+    from arb.deployer import (DeployError, TxCost, estimate_cost,
+                              estimation_failure_message, gas_price_wei)
+
+    # ---- the pure classifier -------------------------------------------------
+    funding = type("E", (Exception,), {})(
+        "Web3RPCError: {'code': -32000, 'message': 'insufficient funds for transfer'}")
+    text = estimation_failure_message(funding, 0)
+    check("cannot pay" in text, f"a funding failure was not identified: {text}")
+    check("NOT a contract bug" in text,
+          "the message must say the bytecode was never rejected")
+    check("wallet faucet" in text, "the message must give the command that fixes it")
+
+    revert = type("E", (Exception,), {})(
+        "Web3RPCError: {'code': 3, 'message': 'execution reverted: Unprofitable'}")
+    text = estimation_failure_message(revert, 10 ** 16)
+    check("would almost certainly revert" in text,
+          f"a genuine revert lost its meaning: {text}")
+    check("NOT a contract bug" not in text,
+          "a genuine revert must not be excused as a funding problem")
+
+    # The trap: same numeric code, opposite meaning.
+    trap = type("E", (Exception,), {})(
+        "Web3RPCError: {'code': -32000, 'message': 'execution reverted'}")
+    text = estimation_failure_message(trap, 10 ** 16)
+    check("would almost certainly revert" in text,
+          "a -32000 revert was mislabelled as a funding problem - the numeric "
+          "code must not be what decides this")
+
+    # ---- estimate_cost, against a stub node ---------------------------------
+    class StubEth:
+        def __init__(self, balance, gas_price=3_000_000_000, estimate=1_500_000,
+                     estimate_error=None, base_fee=None):
+            self.balance = balance
+            self._gas_price = gas_price
+            self._estimate = estimate
+            self.estimate_error = estimate_error
+            self.base_fee = base_fee
+            self.estimate_calls = 0
+
+        def get_balance(self, address):
+            return self.balance
+
+        def estimate_gas(self, tx):
+            self.estimate_calls += 1
+            if self.estimate_error is not None:
+                raise self.estimate_error
+            return self._estimate
+
+        def get_block(self, tag):
+            if self.base_fee is None:
+                raise RuntimeError("stub has no blocks")
+            return type("B", (), {"baseFeePerGas": self.base_fee})()
+
+        @property
+        def gas_price(self):
+            return self._gas_price
+
+    class StubWeb3:
+        def __init__(self, eth):
+            self.eth = eth
+
+    tx = {"data": "0x60806040", "from": "0x" + "11" * 20}
+
+    # Zero balance must be caught BEFORE estimate_gas is even called.
+    eth = StubEth(balance=0)
+    try:
+        estimate_cost(StubWeb3(eth), "0x" + "11" * 20, tx)
+    except DeployError as exc:
+        check("holds 0 BNB" in str(exc), f"unhelpful empty-wallet message: {exc}")
+        check("wallet faucet" in str(exc), "it must say how to fund the wallet")
+    else:
+        raise AssertionError("a zero balance was allowed through")
+    check(eth.estimate_calls == 0,
+          f"estimate_gas ran {eth.estimate_calls} time(s) on an empty wallet; the "
+          f"balance check must short-circuit it")
+
+    # A non-empty wallet that still cannot cover it, failing inside estimate_gas.
+    eth = StubEth(balance=10 ** 15, estimate_error=funding)
+    try:
+        estimate_cost(StubWeb3(eth), "0x" + "11" * 20, tx)
+    except DeployError as exc:
+        check("cannot pay" in str(exc), f"not classified as funding: {exc}")
+        check("0.00100000 BNB" in str(exc),
+              f"the message should state the real balance: {exc}")
+    else:
+        raise AssertionError("an unaffordable estimate was allowed through")
+
+    # The normal path: margin applied, 1559 and legacy pricing both handled.
+    cost = estimate_cost(StubWeb3(StubEth(balance=10 ** 18, estimate=1_500_000,
+                                          base_fee=1_000_000_000)),
+                         "0x" + "11" * 20, tx)
+    check(isinstance(cost, TxCost), "estimate_cost did not return a TxCost")
+    check(cost.gas_units == int(1_500_000 * 1.35),
+          f"the 1.35 margin was not applied: {cost.gas_units}")
+    check(cost.gas_price_wei == 1_000_000_000 + 2_000_000_000,
+          f"EIP-1559 pricing should be base + 2 gwei tip, got {cost.gas_price_wei}")
+    check(cost.affordable is True, "1 BNB should cover this")
+
+    legacy = estimate_cost(StubWeb3(StubEth(balance=10 ** 18, estimate=1_000_000,
+                                            gas_price=5_000_000_000)),
+                           "0x" + "11" * 20, tx)
+    check(legacy.gas_price_wei == 5_000_000_000,
+          f"a chain with no base fee should fall back to gas_price, got "
+          f"{legacy.gas_price_wei}")
+    check(gas_price_wei(StubWeb3(StubEth(balance=0, gas_price=7_000_000_000)))
+          == 7_000_000_000, "the legacy fallback is broken")
+
+
 def run_all(verbose: bool = True) -> int:
     passed = 0
     skips: List[tuple] = []
