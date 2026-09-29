@@ -22,6 +22,7 @@ from typing import Dict, List, Optional, Tuple
 from web3 import Web3
 
 from abis import (
+    PANCACAKE_V3_POOL_ABI_BASE,
     ERC20_ABI,
     UNISWAP_V2_FACTORY_ABI,
     UNISWAP_V2_PAIR_ABI,
@@ -30,7 +31,8 @@ from abis import (
     UNISWAP_V3_POOL_ABI,
     UNISWAP_V3_QUOTER_ABI,
 )
-from config import V3_FEE_TIER_PREFERENCE, V3_FEE_TIERS, Network, fee_to_percent
+from config import (V3_FEE_TIER_PREFERENCE, V3_FEE_TIERS, Network, Venue,
+                    fee_to_percent)
 from dex import uniswap_v2_math as v2math
 from dex import uniswap_v3_math as v3math
 
@@ -101,6 +103,26 @@ _V3_FEE_GROWTH_ABI = [
 ]
 V3_POOL_ABI = UNISWAP_V3_POOL_ABI + _V3_TICK_BITMAP_ABI + _V3_FEE_GROWTH_ABI
 
+# PancakeSwap V3 is a Uniswap V3 fork whose slot0().feeProtocol is uint32 rather
+# than uint8. Same selector, different decode width - see abis.py for why that
+# raises BadFunctionCallOutput instead of returning wrong numbers. Built from the
+# same pieces so the two ABIs cannot drift apart.
+PANCACAKE_V3_POOL_ABI = (PANCACAKE_V3_POOL_ABI_BASE + _V3_TICK_BITMAP_ABI
+                         + _V3_FEE_GROWTH_ABI)
+
+
+def v3_pool_abi_for(slot0_fee_protocol_type: str) -> list:
+    """
+    Pick the V3 pool ABI matching a venue's slot0 layout.
+
+    Driven by `Venue.slot0_fee_protocol_type` so the decision lives in config
+    next to the factory address it belongs to, rather than as a special case
+    buried in the reader.
+    """
+    if slot0_fee_protocol_type == "uint32":
+        return PANCACAKE_V3_POOL_ABI
+    return V3_POOL_ABI
+
 
 # --------------------------------------------------------------------------
 # Result types
@@ -118,8 +140,11 @@ class ChainReader:
         self.provider = provider
         self.network = network
         self._decimals: Dict[str, int] = {}
-        self._v2_pairs: Dict[Tuple[str, str], str] = {}
-        self._v3_pools: Dict[Tuple[str, str, int], str] = {}
+        # Keys include the factory/router address: several venues on one chain
+        # are queried through a single ChainReader, and two venues can offer the
+        # same fee tier for the same token pair with different pool addresses.
+        self._v2_pairs: Dict[Tuple[str, str, str], str] = {}
+        self._v3_pools: Dict[Tuple[str, str, str, int], str] = {}
         self._token0: Dict[str, str] = {}
         self.rpc_calls = 0
 
@@ -157,10 +182,23 @@ class UniswapV2Reader:
     """
 
     def __init__(self, reader: ChainReader, factory_address: Optional[str] = None,
-                 router_address: Optional[str] = None):
+                 router_address: Optional[str] = None, venue: Optional["Venue"] = None):
+        """
+        `venue` makes this reader venue-aware: it supplies the factory/router
+        addresses, the swap-fee constants and the display name. Passing
+        factory/router positionally still works, which is how DexPriceFetcher
+        constructed these before venues existed.
+        """
         self.reader = reader
-        self.router_address = router_address
-        self._factory_address = factory_address
+        self.venue = venue
+        self.router_address = router_address or (venue.router if venue else None)
+        self._factory_address = factory_address or (venue.factory if venue else None)
+        # PancakeSwap V2 charges 0.25% (9975/10000); Uniswap V2 charges 0.30%
+        # (997/1000). Getting this wrong shifts every quote by 5 bps, which is
+        # the same order of magnitude as the edges being looked for.
+        self.fee_num = venue.v2_fee_num if venue else v2math.V2_FEE_NUMERATOR
+        self.fee_den = venue.v2_fee_den if venue else v2math.V2_FEE_DENOMINATOR
+        self.dex_name = venue.key if venue else "uniswap_v2"
 
     @property
     def factory_address(self) -> str:
@@ -175,7 +213,11 @@ class UniswapV2Reader:
         return self._factory_address
 
     def pair_address(self, token_a: str, token_b: str) -> str:
-        key = (token_a.lower(), token_b.lower())
+        # Keyed with the factory for the same reason as pool_for_fee: Uniswap V2
+        # and PancakeSwap V2 on one chain have different pairs for one token
+        # pair, and a shared cache would return the wrong address.
+        factory = (self._factory_address or self.router_address or "").lower()
+        key = (factory, token_a.lower(), token_b.lower())
         if key in self.reader._v2_pairs:
             return self.reader._v2_pairs[key]
         factory = self.reader._contract(self.factory_address, UNISWAP_V2_FACTORY_ABI)
@@ -187,7 +229,8 @@ class UniswapV2Reader:
         )
         if not pair or pair == ZERO_ADDRESS:
             raise PoolNotFound(
-                f"No Uniswap V2 pair for {token_a}/{token_b} on {self.reader.network.name}"
+                f"No {self.dex_name} pair for {token_a}/{token_b} on "
+                f"{self.reader.network.name}"
             )
         self.reader._v2_pairs[key] = pair
         return pair
@@ -214,9 +257,13 @@ class UniswapV2Reader:
         base_symbol: str,
         quote_symbol: str,
         trade_size_base: float,
-        fee_num: int = v2math.V2_FEE_NUMERATOR,
-        fee_den: int = v2math.V2_FEE_DENOMINATOR,
+        fee_num: Optional[int] = None,
+        fee_den: Optional[int] = None,
     ) -> QuoteSnapshot:
+        # None means "use this venue's fee", so an explicit override is still
+        # possible but the default is no longer hard-wired to Uniswap's 0.30%.
+        fee_num = self.fee_num if fee_num is None else fee_num
+        fee_den = self.fee_den if fee_den is None else fee_den
         before = self.reader.rpc_calls
         pair = self.pair_address(base, quote)
         reserves = self.get_reserves(pair)
@@ -238,7 +285,7 @@ class UniswapV2Reader:
         exec_price = v2math.from_raw(amount_out_raw, quote_dec) / trade_size_base
 
         snap = QuoteSnapshot(
-            dex="uniswap_v2",
+            dex=self.dex_name,
             network=self.reader.network.key,
             pool_address=pair,
             fee_tier=int(round((1 - fee_num / fee_den) * 1_000_000)),
@@ -277,15 +324,38 @@ class UniswapV3Reader:
         which is what an arbitrageur cares about.
     """
 
-    def __init__(self, reader: ChainReader, factory_address: str, quoter_address: Optional[str] = None):
+    def __init__(self, reader: ChainReader, factory_address: Optional[str] = None,
+                 quoter_address: Optional[str] = None, venue: Optional["Venue"] = None):
+        """
+        `venue` supplies the factory/quoter addresses, the fee tiers this
+        factory accepts, and the slot0 ABI variant.
+
+        The ABI point is the one that bites: PancakeSwap V3 widened
+        slot0().feeProtocol from uint8 to uint32. The selector is unchanged, so
+        the call succeeds and the decode fails - reading a PancakeSwap pool with
+        the Uniswap ABI raises BadFunctionCallOutput.
+        """
         self.reader = reader
-        self.factory_address = factory_address
-        self.quoter_address = quoter_address
+        self.venue = venue
+        self.factory_address = factory_address or (venue.factory if venue else None)
+        self.quoter_address = quoter_address or (venue.quoter if venue else None)
+        if not self.factory_address:
+            raise DexError("V3: no factory address (pass one, or a venue that has one)")
+        self.fee_tiers = tuple(venue.fee_tiers) if venue else tuple(V3_FEE_TIERS)
+        self.fee_tier_preference = (tuple(venue.fee_tier_preference) if venue
+                                    else tuple(V3_FEE_TIER_PREFERENCE))
+        self.pool_abi = v3_pool_abi_for(venue.slot0_fee_protocol_type) if venue else V3_POOL_ABI
+        self.dex_name = venue.key if venue else "uniswap_v3"
         self._pool_cache: Dict[str, object] = {}
 
     # -- discovery -----------------------------------------------------------
     def pool_for_fee(self, token_a: str, token_b: str, fee: int) -> Optional[str]:
-        key = (token_a.lower(), token_b.lower(), fee)
+        # The cache lives on ChainReader and is shared by every venue so that
+        # decimals and token0 lookups are not repeated. The key therefore HAS to
+        # include the factory: Uniswap V3 and PancakeSwap V3 both offer a 500
+        # tier, and without the factory in the key whichever venue is asked
+        # first silently supplies its pool address to the other.
+        key = (self.factory_address.lower(), token_a.lower(), token_b.lower(), fee)
         if key in self.reader._v3_pools:
             return self.reader._v3_pools[key]
         factory = self.reader._contract(self.factory_address, UNISWAP_V3_FACTORY_ABI)
@@ -302,23 +372,28 @@ class UniswapV3Reader:
 
     def pool(self, address: str):
         if address not in self._pool_cache:
-            self._pool_cache[address] = self.reader._contract(address, V3_POOL_ABI)
+            self._pool_cache[address] = self.reader._contract(address, self.pool_abi)
         return self._pool_cache[address]
 
     def pick_best_pool(self, token_a: str, token_b: str, fee_tier: Optional[int] = None
                        ) -> Tuple[str, int]:
         """Return (pool_address, fee). Chooses the deepest pool across fee tiers."""
         candidates: List[Tuple[int, str]] = []
-        order = [fee_tier] if fee_tier else V3_FEE_TIER_PREFERENCE
+        order = [fee_tier] if fee_tier else self.fee_tier_preference
         for fee in order:
-            if fee not in V3_FEE_TIERS and not fee_tier:
+            # Skip tiers this factory does not use. PancakeSwap V3 has no 3000
+            # tier, so probing it returns the zero address and would be reported
+            # as "pool missing" rather than "tier not offered".
+            if fee not in self.fee_tiers and not fee_tier:
                 continue
             addr = self.pool_for_fee(token_a, token_b, fee)
             if addr:
                 candidates.append((fee, addr))
         if not candidates:
             raise PoolNotFound(
-                f"No Uniswap V3 pool for {token_a}/{token_b} on {self.reader.network.name}"
+                f"No {self.dex_name} pool for {token_a}/{token_b} on "
+                f"{self.reader.network.name} (tried fee tiers "
+                f"{', '.join(str(f) for f in self.fee_tiers)})"
             )
         if fee_tier:
             return candidates[0][1], candidates[0][0]
@@ -420,7 +495,7 @@ class UniswapV3Reader:
         exec_price = v2math.from_raw(q.amount_out, quote_dec) / trade_size_base
 
         return QuoteSnapshot(
-            dex="uniswap_v3",
+            dex=self.dex_name,
             network=self.reader.network.key,
             pool_address=pool_address,
             fee_tier=state["fee"],
@@ -492,3 +567,14 @@ def _extract_revert_uint256(message: str) -> Optional[int]:
         except ValueError:
             continue
     return None
+
+
+# --------------------------------------------------------------------------
+# Aliases
+# --------------------------------------------------------------------------
+# The readers above are named after Uniswap because that is the protocol whose
+# source they were ported from, but they are parameterised by Venue and read
+# PancakeSwap (a fork) equally well. These aliases let new call sites say what
+# they mean without implying a Uniswap contract is involved.
+V2Reader = UniswapV2Reader
+V3Reader = UniswapV3Reader

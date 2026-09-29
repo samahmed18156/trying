@@ -20,10 +20,10 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from arb.signals import ArbitrageSignal, GasEstimate, estimate_gas, evaluate
-from config import SETTINGS, Settings, get_network, token_address
+from config import SETTINGS, Settings, get_network, get_venue, token_address
 from dex.fetcher import (
     ChainReader,
     DexError,
@@ -94,11 +94,19 @@ class DexPriceFetcher:
         fee_tier: Optional[int] = None,
         offline: bool = False,
         feed: Optional[IndexPriceFeed] = None,
+        venue: Optional[str] = None,
     ):
         self.settings = settings or SETTINGS
         self.net = get_network(network or self.settings.network)
         self.dex_version = (dex_version or self.settings.dex_version or "auto").lower()
         self.fee_tier = fee_tier if fee_tier is not None else self.settings.v3_fee_tier
+
+        # Which DEX to read. None keeps the historical behaviour of using the
+        # network's Uniswap addresses; naming a venue (e.g. "pancakeswap_v3")
+        # routes the readers through the venue registry instead.
+        self.venue_key = venue
+        self._venue = get_venue(self.net.key, venue) if venue else None
+        self._venue_readers: Dict[str, object] = {}
 
         if offline:
             self.provider = MockNode(self.net)
@@ -132,6 +140,27 @@ class DexPriceFetcher:
                                        self.net.uniswap_v2_router)
         return self._v2
 
+    def reader_for(self, venue_key: str):
+        """
+        Build (and cache) the right reader for any configured venue.
+
+        This is what makes Uniswap and PancakeSwap peers: the reader classes are
+        parameterised by Venue, so the only per-DEX knowledge lives in the
+        registry in config.py - factory address, fee tiers, V2 fee constants and
+        the slot0 ABI variant.
+        """
+        if venue_key in self._venue_readers:
+            return self._venue_readers[venue_key]
+        venue = get_venue(self.net.key, venue_key)
+        if venue.version == "v3":
+            r = UniswapV3Reader(self.reader, venue=venue)
+        elif venue.version == "v2":
+            r = UniswapV2Reader(self.reader, venue=venue)
+        else:
+            raise DexError(f"Unsupported venue version '{venue.version}' for {venue_key}")
+        self._venue_readers[venue_key] = r
+        return r
+
     # -- public API ----------------------------------------------------------
     def dex_price(
         self,
@@ -148,6 +177,19 @@ class DexPriceFetcher:
         quote = token_address(self.net, quote_symbol)
 
         attempts: List[str] = []
+
+        if self._venue is not None:
+            # An explicit venue bypasses the v3/v2 preference logic: the caller
+            # said which DEX and which protocol generation to read.
+            try:
+                r = self.reader_for(self._venue.key)
+                if self._venue.version == "v3":
+                    return r.quote(base, quote, base_symbol, quote_symbol, size,
+                                   fee_tier=self.fee_tier)
+                return r.quote(base, quote, base_symbol, quote_symbol, size)
+            except PoolNotFound as exc:
+                raise DexError(f"{self._venue.name}: {exc}") from exc
+
         order = self._version_order()
 
         for version in order:
@@ -182,9 +224,26 @@ class DexPriceFetcher:
         quote_symbol: Optional[str] = None,
         source: Optional[str] = None,
     ) -> PricePoint:
+        from config import index_symbol
+
         base_symbol = (base_symbol or self.settings.base_symbol).upper()
         quote_symbol = (quote_symbol or self.settings.quote_symbol).upper()
-        return self.feed.get(base_symbol, quote_symbol, source or self.settings.index_source)
+        source = source or self.settings.index_source
+
+        # Try the real symbol first, then its exchange-listed alias. Asking for
+        # WBNB directly costs nothing when it works and saves the run when it
+        # does not, so the order here is a preference, not a workaround.
+        alias = index_symbol(base_symbol)
+        try:
+            return self.feed.get(base_symbol, quote_symbol, source)
+        except Exception:  # noqa: BLE001
+            if alias == base_symbol:
+                raise
+            point = self.feed.get(alias, quote_symbol, source)
+            # Say which symbol was actually priced, or the output claims to be a
+            # WBNB reference that was really fetched as BNB.
+            point.source = f"{point.source} ({alias}, alias of {base_symbol})"
+            return point
 
     def scan(
         self,

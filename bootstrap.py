@@ -17,6 +17,15 @@ import sys
 NETWORK_COMMANDS = frozenset({"scan", "watch", "verify", "info"})
 
 # Commands that are pure offline maths and must never require a dependency.
+# Commands that must work on a bare Python install with nothing from
+# requirements.txt present. Only "selftest" qualifies: it is pure maths.
+#
+# "wallet" was added here once and broke immediately. Two reasons it does not
+# belong: it needs eth_account (a web3 dependency), and main.py binds `fmt` -
+# along with the rest of its imports - inside _load_deps(), which main() skips
+# for offline commands. So every wallet handler hit `AttributeError: 'NoneType'
+# object has no attribute 'banner'` instead of running. A command that needs the
+# dependencies must not be listed as not needing them.
 OFFLINE_COMMANDS = frozenset({"selftest"})
 
 REQUIRED = ("web3", "requests")

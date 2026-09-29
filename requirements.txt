@@ -1,3 +1,6 @@
 web3>=7.0,<9.0
 requests>=2.31
 python-dotenv>=1.0
+# Phase 2: compiles the Solidity arb contract from Python. Downloads the solc
+# binary on first use - no Node.js, no npm, no Foundry.
+py-solc-x>=2.0

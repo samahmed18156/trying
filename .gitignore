@@ -3,6 +3,21 @@
 *.env
 !.env.example
 
+# Wallet files. `main.py wallet new` refuses to write to a path that is not
+# ignored, so this list is a safety net rather than the only defence.
+wallet.json
+*.wallet.json
+wallets/
+*.keystore
+keystore/
+*.pk
+*.key
+
+# Deployment records are deliberately NOT ignored: state/ holds the contract
+# address you paid gas to deploy. It contains no secrets (addresses are public on
+# the explorer), and losing it means every command needs --address again.
+!state/
+
 # Runtime output
 logs/
 *.jsonl

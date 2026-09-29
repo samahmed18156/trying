@@ -1,11 +1,32 @@
-# DEX Price Fetcher & Arbitrage Monitor
+# DEX Price Fetcher, Arbitrage Monitor & Flash-Loan Executor
 
-Compares a **reference ("index") price** from CoinMarketCap / a CEX with the
-**actual on-chain price** from a Uniswap pool, and tells you whether the gap is
-real money or an illusion created by fees, slippage, gas and stale data.
+Three layers, each one usable on its own:
 
-Works on Ethereum mainnet and Base out of the box, against **Uniswap V2 and V3**,
-with no paid API key required.
+**1. Measure.** Compare a **reference ("index") price** from CoinMarketCap / a
+CEX with the **actual on-chain price** from a Uniswap or PancakeSwap pool, and
+decide whether the gap is real money or an illusion created by fees, slippage,
+gas and stale data.
+
+**2. Search.** `python main.py cross --network bsc` compares **every DEX venue
+and fee tier on a chain** against each other and reports the best executable
+route — which is where a cross-DEX arbitrage would have to come from.
+
+**3. Execute.** `contracts/FlashArb.sol` borrows the capital from a pool, swaps
+it across two venues and repays the loan **inside one transaction**, reverting
+the whole thing unless it ends in profit. `python main.py arb …` compiles it,
+deploys it and drives it. See **Phase 2** below.
+
+Works on **Ethereum mainnet, Base, BNB Chain and BNB Chain testnet** out of the
+box, against **Uniswap V2/V3 and PancakeSwap V2/V3**, with no paid API key
+required. The Solidity toolchain is pure Python — no Node.js, no Foundry.
+
+> **Read this before you run anything with `--execute`.** Every trading command
+> is a dry run unless you pass `--execute`, and the contract refuses a losing
+> trade, so the downside is gas. But on BNB Chain **testnet** the pools are
+> unaudited and nobody arbitrages them, so your first real run will most likely
+> revert with `Unprofitable` — which is the safety check working, not a bug. The
+> honest state of the cross-DEX edge on major pairs is measured in
+> "What this does NOT do" below: it does not currently clear its own fees.
 
 ```
   INDEX PRICE (reference)
@@ -44,7 +65,7 @@ cd C:\Users\SERVER\PycharmProjects\trying
 run.bat                 REM creates .venv, installs deps, runs a scan
 run.bat scan --both     REM any main.py subcommand works
 run.bat verify          REM cross-checks the maths against the live chain
-run.bat selftest        REM 36 offline tests, no network needed
+run.bat selftest        REM 71 offline tests, no network needed
 ```
 
 `run.bat` must be run **from the project root** (it `cd`s there itself) — the
@@ -59,7 +80,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # optional — it runs with no keys at all
-python main.py selftest     # 36 offline maths tests, no network needed
+python main.py selftest     # 71 offline maths tests, no network needed
 python main.py info         # config + live check of every RPC and price source
 python main.py scan         # one-shot ETH/USDT comparison
 ```
@@ -179,13 +200,31 @@ top-right dropdown automatically after a reload:
 
 | Configuration | Runs |
 |---|---|
-| **Selftest** | `main.py selftest` — 36 offline maths tests, no network, no keys. Run this first. |
+| **Selftest** | `main.py selftest` — 71 offline maths tests, no network, no keys. Run this first. |
 | **Info** | `main.py info` — live check of every RPC endpoint and price source |
 | **Scan** | `main.py scan` — one-shot ETH/USDT comparison |
 | **Verify** | `main.py verify` — cross-checks the maths against the live chain |
+| **Verify PancakeSwap** | `main.py verify --network bsc --venue pancakeswap_v2` — same check, PancakeSwap's 0.25% fee |
+| **Cross** | `main.py cross --network bsc` — every DEX venue on BNB Chain, compared |
 | **Watch** | `main.py watch --every 10` — continuous monitoring |
+| **ArbCompile** | `main.py arb compile` — compiles the Solidity contract; first run downloads solc |
+| **ArbPlan** | `main.py arb plan --network bsc_testnet …` — prints the exact trade, sends nothing |
+| **ArbRun** | `main.py arb run --network bsc_testnet …` — dry run: plan plus gas estimate |
+| **ArbStatus** | `main.py arb status --network bsc_testnet` — is it deployed, what does it hold |
+| **ArbDeploy** | `main.py arb deploy --network bsc_testnet` — deploys, spends testnet gas |
 
 They all target `main.py` with the working directory set to the project root.
+
+**No configuration ships with `--execute`.** That flag is what turns a dry run
+into a broadcast transaction, and a Run button that spends money is one
+accidental click away. Typing `--execute` yourself is the point — it should be
+deliberate.
+
+`ArbRun` and `ArbDeploy` have **Emulate terminal in output console** switched on,
+because they ask for your keystore password and PyCharm's ordinary Run window has
+no tty to read it from. If you still see `could not prompt for the password`,
+either run the same command in PyCharm's Terminal pane, or create the wallet with
+`--no-password` (still encrypted at rest, weaker protection, fine for testnet).
 `cmc_fetcher.py` deliberately has **no** run configuration: it is a
 compatibility shim that prints one number and requires `CMC_API_KEY`, while
 `main.py` is the real entry point and needs no key.
@@ -313,21 +352,55 @@ locally, so you can price **any** trade size without paying for a Quoter call.
 ```
 
 * **Check 1 is exact to the wei** — `getAmountsOut` is a real `view` function,
-  so this is on-chain ground truth, not an approximation.
+  so this is on-chain ground truth, not an approximation. Every read in that
+  check is pinned to one block number; without that, the reserves are read in one
+  `eth_call` and the router asked in a later one, and on a 3-second chain the two
+  can land on different blocks. The symptom is easy to misdiagnose as a maths
+  bug: **small sizes match while large sizes drift**, because a large `amountIn`
+  amplifies any change in `reserveIn`. Measured on BSC before pinning — 0.1 and
+  1 WBNB agreed to −0.008 bps while 10 and 100 were off by +0.40 bps. After
+  pinning, all four match to the wei.
 * **Check 3** is the strongest V3 evidence: as the trade shrinks the simulated
   price converges on *mid minus exactly the pool fee*, which is what it must do.
 * Additionally, ETH priced against **USDT, USDC and DAI** on **both V2 and V3**
   (six pools, with ETH as `token0` in some and `token1` in others) agrees to
   within ~4 bps. That is what rules out a token-order or decimals bug.
 
+**The same checks pass against PancakeSwap**, which is what makes the venue
+abstraction worth trusting rather than just assuming:
+
+```bash
+python main.py verify --network bsc --base WBNB --quote USDT --venue pancakeswap_v2
+#   0.1 / 1 / 10 / 100 WBNB  ->  +0.0000 bps at every size
+#   local maths used this venue's fee factor 9975/10000 = 25 bps
+
+python main.py verify --network bsc --base WBNB --quote USDT --venue pancakeswap_v3
+#   0.01% / 0.05% / 0.25% / 1.00%  ->  tick round-trip ok on all four
+#   smallest trades converge on +1.00 bps = that pool's own fee floor
+```
+
+Check 3 against PancakeSwap V3 is the meaningful one: the Uniswap V3 maths port
+(TickMath / SwapMath / TickBitmap) drives a *PancakeSwap* pool and lands on
+exactly that pool's fee, which is what a faithful fork should do. Check 2 also
+needs the right ABI — PancakeSwap returns `slot0`'s `feeProtocol` as `uint32`
+where Uniswap uses `uint8`.
+
+Checks that do not apply to the selected venue are reported as **skipped**, not
+as failures: verifying `pancakeswap_v2` skips the three V3 checks. An
+inapplicable check must never be scored, or a correct build looks broken.
+
 The official `QuoterV2` cross-check is attempted as a bonus, but it only answers
 through *revert data*, and most free RPC providers strip that. It is not relied
 on. An Infura or Alchemy key will usually return it.
 
-`python main.py selftest` runs 36 offline tests covering TickMath constants
+`python main.py selftest` runs 71 offline tests covering TickMath constants
 (re-derived from first principles to 200 decimal places, which is how two
 single-digit transcription typos were caught), the tick bitmap walk, swap-step
-rounding, V2 closed forms, and the arb decision logic.
+rounding, V2 closed forms, the arb decision logic, and the venue registry itself
+— fee constants per protocol, PancakeSwap's missing 3000 tier, the `slot0` ABI
+difference (including a proof that the two share a selector, which is why the
+failure is a decode error and not a silent zero), the depth gate, and the
+requirement that routes be ranked on executable prices rather than mids.
 
 ---
 
@@ -343,12 +416,28 @@ python main.py scan --json                           # machine-readable
 python main.py watch --every 5                       # poll and print one line per scan
 python main.py watch --only-actionable --log logs/signals.jsonl
 python main.py watch --alert-webhook https://hooks.example/…
+python main.py cross --network bsc                   # EVERY DEX venue on a chain, compared
+python main.py wallet new                            # encrypted testnet wallet (key never printed)
+python main.py wallet balance --network bsc_testnet
+python main.py arb compile                           # compile the Solidity contract (pure Python)
+python main.py arb deploy --network bsc_testnet      # deploy it, record the address
+python main.py arb plan  --network bsc_testnet       # show the exact trade, send nothing
+python main.py arb run   --network bsc_testnet       # dry run: plan + gas estimate
+python main.py arb run   --network bsc_testnet --execute   # actually broadcast
+python main.py arb status --network bsc_testnet      # is it deployed, what does it hold
+python main.py arb withdraw --network bsc_testnet --token USDT --all --execute
 python main.py verify                                # cross-check maths against the chain
+python main.py verify --network bsc --venue pancakeswap_v2
 python main.py selftest                              # offline test suite
 ```
 
 Useful flags: `--min-edge`, `--max-slippage`, `--gas-units`, `--no-gas`,
 `--source cmc|coinbase|kraken|auto`, `-v` for debug logging.
+
+`--venue` names one DEX for any command, e.g. `--venue pancakeswap_v3`.
+`--network bsc` and `--network bsc_testnet` are both supported. On testnet use
+`--base WBNB --quote USDT` — its BUSD pools exist but hold zero liquidity, and
+prices there are meaningless (see `NOTES-testnet.md`).
 
 ## Using it as a library
 
@@ -375,6 +464,340 @@ from a V2 pair or a V3 pool, so downstream code never branches on DEX version.
 
 ---
 
+## Every DEX at once — `cross`
+
+`scan` answers "what does this DEX say?" `cross` answers "which DEX says it
+cheapest, and by how much can I actually trade?" It quotes every venue and every
+fee tier configured for a chain, at your trade size, and ranks them.
+
+```bash
+python main.py cross --network bsc --base WBNB --quote USDT
+python main.py cross --network bsc --base WBNB --quote USDT --size 10
+python main.py cross --network ethereum --base ETH --quote USDT --venues uniswap_v3,pancakeswap_v3
+python main.py cross --network bsc --json            # machine-readable
+```
+
+Output, real numbers from BNB Chain (1 WBNB, ~$766):
+
+```
+    PancakeSwap V3 0.01%    768.64  768.55     -1.1        1.1b  usable
+    PancakeSwap V3 0.05%    768.55  768.16     -5.1        5.0b  usable
+    Uniswap V3 0.30%        767.03  764.11    -38.1       30.0b  usable    buy base here
+    Uniswap V3 1.00%        761.60  752.84   -115.0      100.0b  rejected  impact 115.0 bps exceeds the 50 bps cap
+
+  BEST ROUTE
+    buy   Uniswap V3 0.30%             exec 762.86 (mid 765.78, impact 38.0 bps)
+    sell  PancakeSwap V3 0.01%         exec 765.88 (mid 765.96, impact 1.1 bps)
+
+    you pay             -762.8636 USDT   1 WBNB at 762.86 on Uniswap V3 0.30%
+    you receive         +765.8802 USDT   1 WBNB at 765.88 on PancakeSwap V3 0.01%
+    GROSS EDGE          +39.5 bps  =  +3.0166 USDT
+      per leg, against that pool's own mid (fee + impact included):
+        buy     +38.0 bps   you paid below mid
+        sell     +1.1 bps   you received below mid
+      these two are NOT additive with the edge above: each is measured against a
+      different mid, and the edge is measured against the capital deployed.
+```
+
+The pay/receive rows are in quote units on purpose. Basis points in this report
+have **three different denominators** — `mid_spread_bps` divides by the buy
+leg's mid, each leg's `impact_bps` by that leg's own mid, and `gross_edge_bps`
+by the buy leg's *exec*, which is the capital you actually deploy. Dividing the
+edge by exec is the right convention for a trade return, but it means
+
+```
+gross_edge  !=  mid_spread + buy.impact - sell.impact
+```
+
+On the live route above the left side is 43.520 bps and the right side 43.355 —
+0.165 bps apart purely from the denominator mismatch. Money sums exactly, so
+that is what gets printed, and the per-leg bps are labelled as diagnostics.
+
+Three things in there are load-bearing and were each wrong at some point:
+
+**The mid price is not the price.** A pool's mid (from V3 `sqrtPriceX96`, or
+V2 reserves) is a *quote*. The `exec` column is what you would actually receive
+for your size, after fee and after pushing the price. Routes are chosen on
+`exec`, never on mid — comparing one venue's mid against another's exec invents
+roughly half a spread as phantom edge.
+
+**The depth gate.** `--max-impact` (default 50 bps, or `MAX_IMPACT_BPS` in
+`.env`) rejects a leg *before* any edge is computed. Without it, a pool holding
+0.0179 BTCB and 1,499 USDC prices a 1 BTCB trade at 1,472 USDT against a mid of
+83,776 — arithmetically valid, economically meaningless — and reports a
+**+560,239 bps** edge. That is the single most dangerous number this tool can
+produce, so the gate is on by default and the rejection reason is printed.
+
+**A wide mid spread usually means a stale pool.** If a venue's mid sits 20 bps
+away from the rest of the market, the likelier explanation is that nobody has
+traded it in hours, not that it is offering free money. Check the depth column:
+for V3 it is the impact of a probe trade 1e-6 your size, so a healthy pool sits
+at its own fee tier (0.01% → ~1 bps, 0.30% → ~30 bps) and a thin one blows out.
+For V2 it is the quote-token reserves the pool actually holds.
+
+`GROSS EDGE` is before gas, before any flash-loan fee, and before MEV. It is a
+starting point for investigation, not a profit figure.
+
+**The depth gate cannot see staleness.** It rejects a pool that cannot absorb
+your trade; it says nothing about whether that pool's price is *current*. A pool
+with ample liquidity and an hours-old mid passes cleanly. So `cross` also
+reports the widest mid gap among the **usable** legs and warns above 1,000 bps:
+
+```
+    !! STALE-POOL WARNING: the usable legs price 1 WBNB anywhere between 9.8093 and 12.0885 USDT.
+       They disagree by 2,324 bps. Pools for the SAME pair should sit within a few bps;
+```
+
+That is BNB Chain **testnet**, where five pools for one pair genuinely sit 2,324
+bps apart because nobody arbitrages there. Thresholds are calibrated on
+measurements: live BSC mainnet WBNB/USDT spans 90 bps across 7 usable legs and
+stays silent, while Ethereum's abandoned PancakeSwap V3 tiers span 3,515 bps.
+Rejected legs are excluded — they cannot be traded, so their staleness is
+irrelevant and including it would mute a real warning. See `NOTES-testnet.md`.
+
+## The testnet wallet
+
+Phase 2 deploys a contract, which needs an account that can sign and pay gas.
+
+```bash
+python main.py wallet new                     # prompts for a keystore password
+python main.py wallet new --no-password       # same, non-interactive
+python main.py wallet show                    # address + whether it is gitignored
+python main.py wallet balance --network bsc_testnet
+```
+
+`wallet new` generates an account from the operating system's CSPRNG and writes
+an **encrypted v3 keystore** (scrypt, AES-128-CTR) to `wallets/testnet.json`.
+
+* **The private key is never printed, and is never on disk in plaintext.** There
+  is no flag anywhere in this project that reveals it. You do not need it — a
+  faucet only wants the address, and the code decrypts the keystore in memory
+  when it needs to sign.
+* **It refuses to write anywhere `.gitignore` does not already cover.** This is
+  the guard that matters: the CoinMarketCap key in this project's history was
+  exposed by being committed. Try `--path ./config.py` and it refuses, naming the
+  path and the patterns it would accept.
+* **It refuses to overwrite** an existing wallet unless you pass `--force`.
+* The file is written `0600` and via a temp-file rename, so a crash mid-write
+  cannot leave a keystore that looks valid but cannot be decrypted.
+
+If you would rather use MetaMask or another wallet, that is fine — put the key in
+`.env` as `ARB_PRIVATE_KEY` and never commit `.env`. But an encrypted file that
+the code can use directly is harder to leak than a key pasted out of a wallet UI.
+
+**This is for testnet.** Testnet BNB has no value and a leaked testnet key costs
+nothing. Do not reuse this wallet or this pattern for mainnet funds without a
+hardware wallet or an audited secret manager.
+
+### Getting testnet BNB without spending real money
+
+```bash
+python main.py wallet faucet --network bsc_testnet
+```
+
+That prints your address, your live balance, and the faucets that currently work —
+**free ones first**. The ordering matters: as of 2026 most "official" faucets gate
+claims behind a small *mainnet* balance as an anti-bot check. The official BNB
+Chain faucet rejects an address holding under 0.002 BNB on mainnet (~$1.50) with
+
+```
+This address has less than 0.002 BNB on BSC Mainnet. Add BNB to the same address, then try again.
+```
+
+i.e. it wants you to spend real money to collect free test tokens. These were
+verified live on 2026-09-29 and need no mainnet balance at all:
+
+| faucet | gives | limit | notes |
+|---|---|---|---|
+| `ghostchain.io/faucet/bnb-testnet/` | 0.01 tBNB | 24h | no KYC, no geo-block, no balance check; address box + Cloudflare tick. Its Telegram bot gives 10× (0.1 tBNB) |
+| `faucet.quicknode.com/binance-smart-chain/bnb-testnet` | shown after entry | 12h | base drip free, no account, no mainnet minimum. Has a **Wallet Address** box, so you need not connect MetaMask |
+| `faucet.zalalena.com/bsc` | small | 60 min, 10×/day | no login, no balance; CAPTCHA |
+
+You need far less than you might think: a deployment plus several test swaps is a
+few million gas at 1–5 gwei, comfortably **under 0.01 tBNB**. The small free
+drips are enough, so the gated 0.3 tBNB is not worth paying for.
+
+Faucets move, add CAPTCHAs and run dry. The command prints the date its list was
+checked and tells you to search if one has gone. If a page ever asks for a private
+key or seed phrase, close it — no legitimate faucet needs more than your address,
+and this project cannot show you the key anyway.
+
+## Phase 2 — the flash-loan arbitrage contract
+
+This is the part that actually trades. It borrows the capital it needs from a
+pool, swaps it through two venues and repays the loan, **all inside one
+transaction**. If the round trip does not end with more than it started with, the
+whole transaction reverts: nothing moves, and you lose only the gas.
+
+That is the property that makes this safe to point at a live chain. You are not
+trusting a Python script's arithmetic to be right — the contract refuses to
+complete a losing trade, whatever the script believed.
+
+### What it is made of
+
+| Piece | File | What it does |
+| --- | --- | --- |
+| The contract | `contracts/FlashArb.sol` | Solidity. Calls `flash()` on a PancakeSwap V3 pool, and inside the callback buys on a V2-style router, sells on a V3-style router, repays, and checks profit |
+| The compiler | `arb/compiler.py` | Compiles that file from Python via `py-solc-x`, which downloads the pinned `solc` on first use. No Node.js, no npm, no Foundry, no Rust |
+| The deployer | `arb/deployer.py` | Estimates gas, checks you can afford it *before* sending, signs, waits, and decodes a revert into a sentence |
+| The planner | `arb/executor.py` | Turns a `cross` scan into one exact calldata payload, with slippage floors and the minimum profit the contract will accept |
+| The commands | `main.py arb …` | Ties it together |
+
+The flash loan comes from **the same pool that leg 2 sells into**. One pool
+supplies the capital and receives the output, so the sale and the repayment net
+against each other and the round trip needs no starting inventory at all. That is
+why you can run this with 0.01 tBNB and nothing else.
+
+### Before you start
+
+Three things, in order. Each one is a single command.
+
+**1. Install the compiler dependency** (the others you already have):
+
+```
+pip install -r requirements.txt
+```
+
+**2. Make sure your wallet is funded.** The deploy costs about 0.0007 tBNB and
+each test costs about 0.0001 tBNB, so a total of well under 0.01 tBNB covers
+everything on this page several times over:
+
+```
+python main.py wallet balance --network bsc_testnet
+```
+
+If that shows 0, run `python main.py wallet faucet --network bsc_testnet` and use
+one of the free faucets it lists.
+
+**3. Compile the contract.** First run downloads `solc 0.8.26`, which takes
+about a minute:
+
+```
+python main.py arb compile
+```
+
+You should see `creation 6,786 bytes`, `runtime 6,719 bytes` and
+`warnings none`. The 24,576-byte EIP-170 limit is nowhere near.
+
+### Deploying
+
+```
+python main.py arb deploy --network bsc_testnet
+```
+
+It asks for your keystore password (typed, never shown), checks your balance can
+cover the gas **before** sending, then prints the address and writes it to
+`state/deployment.bsc_testnet.json`. Every later command reads that file, so you
+never have to paste the address again — but copy it somewhere anyway, because it
+is the only record of what you deployed.
+
+Then confirm it landed:
+
+```
+python main.py arb status --network bsc_testnet
+```
+
+That reports the bytecode size, that `owner()` is your wallet, and what the
+contract currently holds. `owner` matters: only the owner can withdraw, so if
+that is not your address the funds in it are unreachable.
+
+### Looking at a trade without sending one
+
+```
+python main.py arb plan --network bsc_testnet --base WBNB --quote USDT --size 0.001 --max-impact 2000
+```
+
+This scans every venue on the chain, picks the route, and prints the exact
+transaction: what it borrows, both legs with their routers and minimum outputs,
+the flash fee, and the profit the contract will demand. **Nothing is sent.**
+
+Read the `note:` lines. They explain every compromise the planner made, including
+when it had to use a worse leg than an unconstrained scan would have picked.
+
+### Running it
+
+```
+python main.py arb run --network bsc_testnet --base WBNB --quote USDT --size 0.001 --max-impact 2000
+```
+
+Dry run: it plans, loads your wallet, estimates the gas and shows you the cost.
+Still nothing sent. Add `--execute` to actually broadcast:
+
+```
+python main.py arb run --network bsc_testnet --base WBNB --quote USDT --size 0.001 --max-impact 2000 --execute
+```
+
+After it mines, the command decodes the `ArbitrageExecuted` event and prints what
+really happened on chain: the borrowed amount, each leg's output in wei, what was
+repaid, and the profit. That is ground truth from the receipt, not from the
+script's prediction.
+
+### What you should expect on testnet, honestly
+
+**Your first `--execute` will most likely revert with `Unprofitable`, and that is
+the correct result.**
+
+The plan command will tell you so before you spend anything — you will see
+something like:
+
+```
+note: the gross edge (-139.8 bps = -166,908,371,933,436 wei) does not cover the
+      flash fee (119,378,126,439,389 wei), so this run is EXPECTED TO REVERT
+      with Unprofitable. That is the profit check working, not a bug — and
+      because it reverts, no tokens move and only gas is spent.
+```
+
+BNB Chain testnet has no real arbitrageurs, so its pools drift apart and none of
+the combinations produce a genuine edge after fees. What this run *does* prove is
+the entire mechanism: the flash loan executes, both swaps route correctly, the
+repayment is calculated right, and the safety check catches a losing trade and
+reverts it atomically. A revert here costs you roughly 0.0001 tBNB.
+
+To see the **success** path, force a trade the contract will accept by setting
+the minimum profit to a huge number and confirming it refuses, then to zero with
+a size whose edge happens to be positive:
+
+```
+python main.py arb run --network bsc_testnet --base WBNB --quote USDT --size 0.001 --max-impact 2000 --min-profit 1000000000000000000 --execute
+```
+
+That must revert with `Unprofitable` — the profit gate doing its job. If it
+succeeded, the gate would be broken.
+
+When a run does succeed, pull the profit out:
+
+```
+python main.py arb status --network bsc_testnet
+python main.py arb withdraw --network bsc_testnet --token USDT --all --execute
+```
+
+Withdraw is owner-only and dry-runs by default; `--execute` sends it.
+
+### If something goes wrong
+
+| You see | What it means | What to do |
+| --- | --- | --- |
+| `Unprofitable` | The round trip ended with less than it started. **No tokens moved** — only gas was spent | Normal on testnet. Check the `note:` lines from `arb plan` first |
+| `INSUFFICIENT_OUTPUT_AMOUNT` | A leg's slippage floor was not met: the pool moved between the scan and your transaction | Raise `--slippage` (default 100 bps), or use a smaller `--size` |
+| `insufficient balance for this call` | Your wallet cannot cover the gas | `python main.py wallet faucet --network bsc_testnet` |
+| `no recorded deployment of FlashArb` | Nothing deployed yet, or `state/` was deleted | `python main.py arb deploy`, or pass `--address 0x…` |
+| `no usable V2/V3 leg` | The scan rejected every leg, usually on depth | Smaller `--size`, or higher `--max-impact` |
+| `Stack too deep` while compiling | The contract grew past the legacy compiler's 16-slot limit | Pack locals into a struct and scope leg blocks with `{ }`; do not reach for `--via-ir` |
+
+### Two real constraints worth knowing
+
+**Leg 1 must be a V2-style router and leg 2 a V3-style one.** That is what the
+contract calls, so the planner picks the best venue *of each generation* rather
+than the best venue overall. On testnet the cheapest buy was PancakeSwap V3
+0.25%, but the contract cannot buy there — and the planner says so in a note
+instead of quietly giving you a worse trade or refusing to plan at all.
+
+**On BSC testnet both legs are PancakeSwap**, because Uniswap V3 is not deployed
+there. So a testnet run proves the flash mechanism, not a cross-DEX edge. The
+contract itself is venue-agnostic — it takes routers as arguments — so on BNB
+Chain mainnet the same code runs PancakeSwap V2 against Uniswap V3, which is the
+pairing the brief asked for.
+
 ## Configuration
 
 Everything lives in `config.py` (addresses, networks, thresholds) and `.env`
@@ -383,6 +806,59 @@ factories, routers, WETH and major stables. Pair and pool addresses are resolved
 on chain via `factory.getPair()` / `factory.getPool()` and cached, and decimals
 are read from each token. That is deliberate: a hard-coded pool address goes
 stale silently and then produces confidently wrong prices.
+
+### Venues
+
+A *venue* is one DEX protocol generation on one chain: `uniswap_v3` on Ethereum,
+`pancakeswap_v2` on BNB Chain, and so on. They are registered in `config.py`
+under `VENUES`, and `DEFAULT_VENUE_ORDER` says which ones `cross` scans and in
+what order.
+
+`DEX_VENUE` in `.env` (or `--venue` on any command) pins one. Left blank, each
+network uses its own default — Uniswap on Ethereum and Base, **PancakeSwap V2 on
+BNB Chain**, because Uniswap has no V2 deployment there.
+
+| venue | dex | version | notes |
+|---|---|---|---|
+| `uniswap_v2` | Uniswap | v2 | 0.30% fee, factor 997/1000 |
+| `uniswap_v3` | Uniswap | v3 | tiers 100/500/**3000**/10000, `slot0` `feeProtocol` is `uint8` |
+| `pancakeswap_v2` | PancakeSwap | v2 | **0.25%** fee, factor 9975/10000 |
+| `pancakeswap_v3` | PancakeSwap | v3 | tiers 100/500/**2500**/10000, `feeProtocol` is `uint32` |
+
+Two PancakeSwap traps are encoded in the config, and both were hit during
+development:
+
+* The V2 venue uses the **V2 router**, not the Smart Router
+  (`0x13f4EA83D0bd40E75C8222255bc855a974568Dd4`). The Smart Router splits a
+  route across V2, V3 and stableswap pools, so its `getAmountsOut()` is not the
+  plain V2 pair formula — using it as ground truth produced a consistent
+  **+0.19 bps** disagreement that looked exactly like a maths bug. For wei-exact
+  verification the ground truth must be a single-pool contract.
+* PancakeSwap V3 is a Uniswap V3 fork, but `slot0()` returns `feeProtocol` as
+  `uint32` where Uniswap uses `uint8`. The selector is identical (it is
+  `keccak("slot0()")`, and the *inputs* are empty), so the `eth_call` succeeds
+  against either and only the **decode** fails. `v3_pool_abi_for()` picks the
+  right ABI from the venue.
+
+### WBNB, BNB and the index price
+
+On BNB Chain the base symbol is `WBNB`, but no exchange lists WBNB — they list
+`BNB`. So `INDEX_SYMBOL_ALIASES` in `config.py` maps the *index* query
+`WBNB → BNB` (also `WBTC → BTC`, `WETH → ETH`). The on-chain lookup is
+deliberately untouched: `BNB` and `WBNB` both resolve to the same wrapped
+contract `0xbb4C…095c`, which is what the pools hold, so either symbol works for
+`--base`.
+
+The output says which symbol was really priced, so the alias is never invisible:
+
+```
+    1 BNB = 766.06 USDT (mid)   via kraken (BNB, alias of WBNB)   (3s old)
+```
+
+Also worth knowing: PancakeSwap V3 exists on Ethereum but is effectively
+abandoned — its 0.25% and 1.00% tiers have zero liquidity and the mid spread
+across its tiers measures ~3,500 bps. BNB Chain is where both DEXes have real
+depth.
 
 ### Index source order
 
@@ -442,10 +918,13 @@ the chain automatically. Verify the address on the chain's block explorer first
 
 ```
 trying/
-├── main.py                     CLI: info | scan | watch | verify | selftest
+├── README.md                   this file
+├── NOTES-phase1.md             what Phase 1 shipped, and the five bugs it cost
+├── NOTES-testnet.md            BSC testnet addresses and liquidity, measured
+├── main.py                     CLI: info | scan | watch | verify | cross | wallet | arb | selftest
 ├── __main__.py                 makes the project FOLDER itself runnable
 ├── bootstrap.py                dependency preflight -> readable setup errors
-├── config.py                   networks, contract addresses, thresholds, fee units
+├── config.py                   networks, VENUES registry, addresses, thresholds
 ├── rpc.py                      node connection with endpoint failover + chain-id check
 │                               (also MockNode, the offline stand-in used by tests)
 ├── abis.py                     minimal hand-written ABIs (no Etherscan key needed)
@@ -458,17 +937,27 @@ trying/
 │   ├── uniswap_v2_math.py      constant-product maths, fees, decimals
 │   ├── uniswap_v3_math.py      port of TickMath/SwapMath/TickBitmap + swap sim
 │   ├── types.py                QuoteSnapshot — dependency-free result type
+│   ├── cross.py                multi-venue scan, depth gate, route picking
 │   └── fetcher.py              on-chain readers (needs web3) -> QuoteSnapshot
 ├── index/
 │   ├── base.py                 PricePoint, IndexPriceFeed (multi-source failover)
 │   ├── cmc.py                  CoinMarketCap, with the cross-rate fix
 │   └── fallbacks.py            Coinbase + Kraken order books, no key needed
+├── contracts/
+│   └── FlashArb.sol            the flash-loan arbitrage contract (Solidity 0.8.26)
 ├── arb/
-│   └── signals.py              gas costing and the trade/no-trade decision
+│   ├── compiler.py             compiles that file from Python via py-solc-x
+│   ├── deployer.py             gas estimate, affordability check, sign, revert decoding
+│   ├── executor.py             scan -> exact calldata; slippage floors; event decoding
+│   ├── signals.py              gas costing and the trade/no-trade decision
+│   └── wallet.py               encrypted testnet keystore; refuses non-ignored paths
+├── build/                      compiled artifacts (regenerated; gitignored)
+├── state/                      YOUR deployment records — keep this, it is not gitignored
+├── wallets/                    YOUR encrypted keystore (gitignored, never committed)
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            36 offline tests — no network, no dependencies
+    └── test_math.py            71 offline tests — no network, no dependencies
 ```
 
 `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`
@@ -483,8 +972,33 @@ net effect is that `main.py selftest` runs on a bare Python install.
 
 ## What this does NOT do — read before trading on it
 
-This is a **price fetcher and signal generator**. It has no private key, signs
-nothing, and sends no transactions. That is on purpose.
+### It now signs transactions, but only when you tell it to
+
+Phase 1 was a read-only price fetcher. **Phase 2 changed that**: `arb deploy`,
+`arb run --execute` and `arb withdraw --execute` sign and broadcast real
+transactions using the encrypted keystore in `wallets/`.
+
+The safeguards, so you know what you are relying on:
+
+* **Every trading command is a dry run by default.** `arb run` plans, loads the
+  wallet and estimates gas, then stops. Only `--execute` broadcasts. Same for
+  `arb withdraw`.
+* **The contract itself refuses a losing trade.** It reverts unless the round trip
+  ends with at least `minProfit` more than it started with, so a bad scan cannot
+  cost you the traded amount — only gas.
+* **Only the owner can withdraw.** `owner()` is the wallet that deployed it, and
+  `arb status` shows you that address so you can check it is yours.
+* **The private key is never printed and never leaves the keystore file.** No
+  command in this project will show it to you. The password is typed, not passed
+  on the command line, so it does not land in your shell history.
+
+What it still does not do: it has no MEV protection (your transaction is
+broadcast to the public mempool and can be front-run), no private order flow, no
+position management, and no way to cancel a submitted transaction. On testnet
+none of that matters. On mainnet it is the difference between a working strategy
+and donating your edge to a searcher.
+
+### The edge it reports is gross
 
 The reported edge is *gross of* the costs that decide whether a cross-venue
 arbitrage is actually profitable:
@@ -505,6 +1019,30 @@ arbitrage is actually profitable:
 
 Set `MIN_EDGE_BPS` high enough to cover all of that, and treat the output as a
 research feed rather than a trade instruction.
+
+### The Uniswap↔PancakeSwap pairing specifically
+
+It was measured, on live mainnet and BNB Chain data, before any of this was
+built: the literal "buy on Uniswap, sell on PancakeSwap" trade on major pairs
+does not clear its own fees.
+
+* Round-trip cost is roughly **6 bps** — 3 bps of swap fee on each leg, before
+  impact.
+* The observed mid-price gap between the two venues on a major pair sits around
+  **2–4 bps**, and frequently negative. A −3.9 bps measurement against a 6 bps
+  cost is the shape of the trade, not bad luck.
+* The two venues' prices are kept tight by the same arbitrageurs, so the gap is
+  small *because* the trade is well-known.
+
+`cross` exists to catch the exceptions rather than to assume them: dislocations
+do appear during fast moves, on newly listed pairs, and on chains where one venue
+is thin. On Ethereum, PancakeSwap V3's 0.25% and 1.00% tiers hold **zero**
+liquidity and its tier spread measures ~3,500 bps — it is abandoned there, so the
+counterparty for a cross-DEX trade is effectively BNB Chain.
+
+What `cross` reports is a **gross** edge. Before it becomes a trade it still has
+to survive gas, a flash-loan fee if the capital is borrowed, and MEV. See
+`dex/cross.py` for the depth gate that decides whether an edge is even quotable.
 
 ---
 
@@ -556,5 +1094,20 @@ usable, add MIT or Apache-2.0.
 
 ## Requirements
 
-Python 3.9+, `web3`, `requests`, `python-dotenv`. Tested against `web3` 8.0;
-`dex/fetcher.py` also supports the 6.x/7.x contract APIs.
+Python 3.9+, `web3`, `requests`, `python-dotenv`, and — for Phase 2 only —
+`py-solc-x`. Tested against `web3` 8.0; `dex/fetcher.py` also supports the
+6.x/7.x contract APIs.
+
+```
+pip install -r requirements.txt
+```
+
+`py-solc-x` downloads the pinned `solc` binary the first time you run
+`arb compile` (about a minute, once, cached in your home directory). That is the
+whole Solidity toolchain: **no Node.js, no npm, no Hardhat, no Foundry, no
+Rust.** Everything else in the project needs only those four packages, and
+`main.py selftest` needs none of them at all.
+
+There is deliberately no C compiler, no Rust and no Node in this stack — you said
+you are building in Python, and needing a second toolchain to compile one file is
+how projects stop being reproducible on a new machine.

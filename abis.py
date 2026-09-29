@@ -248,3 +248,62 @@ def abi_function(abi: list, name: str) -> dict:
         if entry.get("name") == name:
             return entry
     raise KeyError(f"function '{name}' not present in ABI")
+
+
+# --------------------------------------------------------------------------
+# PancakeSwap V3 (a Uniswap V3 fork)
+# --------------------------------------------------------------------------
+# PancakeSwap V3 is a fork of Uniswap V3, so nearly every function has an
+# identical signature and the maths in dex/uniswap_v3_math.py applies unchanged.
+# There is ONE ABI difference that breaks decoding if you miss it:
+#
+#     Uniswap     slot0() -> (..., uint8  feeProtocol, bool unlocked)
+#     PancakeSwap slot0() -> (..., uint32 feeProtocol, bool unlocked)
+#
+# The 4-byte selector is derived from the function NAME and INPUT types only, so
+# both are 0x3850c7bd and the call itself succeeds either way. What differs is
+# how the returned bytes are sliced: a uint8 output consumes one byte, a uint32
+# consumes four, and everything after it shifts. Decoding a PancakeSwap pool with
+# the Uniswap ABI raises web3's BadFunctionCallOutput rather than returning a
+# plausible-but-wrong number, which is the good failure mode - but only if you
+# know to look for it.
+#
+# Rather than maintain two hand-written copies of the whole pool ABI, build the
+# fork's variant from the Uniswap one by swapping that single output type. This
+# keeps the two in step: if a field is ever added to UNISWAP_V3_POOL_ABI, the
+# PancakeSwap variant inherits it.
+def with_slot0_fee_protocol(abi: list, type_name: str) -> list:
+    """Return a copy of a V3 pool ABI with slot0().feeProtocol retyped."""
+    out = []
+    for entry in abi:
+        if entry.get("name") == "slot0" and entry.get("type") == "function":
+            entry = dict(entry)
+            outputs = []
+            for o in entry["outputs"]:
+                if o.get("name") == "feeProtocol":
+                    o = dict(o)
+                    o["type"] = type_name
+                    o["internalType"] = type_name
+                outputs.append(o)
+            entry["outputs"] = outputs
+        out.append(entry)
+    return out
+
+
+# The composed pool ABI (base + tickBitmap + feeGrowth entries) is assembled in
+# dex/fetcher.py as V3_POOL_ABI, because that is where the extra entries live.
+# PANCACAKE_V3_POOL_ABI is built there too, from this retyped base.
+PANCACAKE_V3_POOL_ABI_BASE = with_slot0_fee_protocol(UNISWAP_V3_POOL_ABI, "uint32")
+
+# The factory, pair and router interfaces are unchanged between the two projects:
+# getPool(tokenA, tokenB, fee) and getPair(tokenA, tokenB) have identical
+# signatures, so the Uniswap ABIs are reused directly. Aliases exist so call
+# sites read honestly rather than implying a Uniswap contract is being called.
+PANCACAKE_V3_FACTORY_ABI = UNISWAP_V3_FACTORY_ABI
+PANCACAKE_V2_FACTORY_ABI = UNISWAP_V2_FACTORY_ABI
+PANCACAKE_V2_PAIR_ABI = UNISWAP_V2_PAIR_ABI
+PANCACAKE_V2_ROUTER_ABI = UNISWAP_V2_ROUTER_ABI
+
+# PancakeSwap's V3 quoter is a fork of Uniswap's QuoterV2 with the same
+# quoteExactInputSingle signature.
+PANCACAKE_V3_QUOTER_ABI = UNISWAP_V3_QUOTER_ABI

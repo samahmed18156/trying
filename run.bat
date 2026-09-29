@@ -4,6 +4,7 @@ REM  run.bat - one-shot setup + scan for Windows
 REM
 REM    Double-click it, or from a terminal:   run.bat
 REM    Other commands:                        run.bat scan --both
+REM                                           run.bat cross --network bsc
 REM                                           run.bat verify
 REM                                           run.bat selftest
 REM
