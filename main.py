@@ -1233,20 +1233,44 @@ def _load_wallet(args):
                             needs_password, prompt_password)
 
     path = getattr(args, "path", None) or default_wallet_path()
-    password = args.password or ""
-    if not password:
+    given = args.password or ""
+
+    # An explicitly supplied password gets exactly one try. Looping on it would
+    # hang a scripted or CI run waiting for input nobody is there to give.
+    if given:
         try:
-            if needs_password(path):
-                password = prompt_password(path)
+            return load_wallet(path, password=given), path
         except WalletError as exc:
             print(fmt.red(f"  {exc}"))
             raise SystemExit(2)
-    try:
-        account = load_wallet(path, password=password)
-    except WalletError as exc:
-        print(fmt.red(f"  {exc}"))
-        raise SystemExit(2)
-    return account, path
+
+    # Interactive: up to three attempts. Worth having because the commands that
+    # need a wallet compile the contract and connect to a node first, so a single
+    # mistyped character otherwise costs a full re-run of all of that.
+    attempts = 3
+    for i in range(attempts):
+        try:
+            if not needs_password(path):
+                return load_wallet(path, password=""), path
+            password = prompt_password(path)
+        except WalletError as exc:
+            print(fmt.red(f"  {exc}"))
+            raise SystemExit(2)
+        try:
+            return load_wallet(path, password=password), path
+        except WalletError:
+            left = attempts - i - 1
+            if left:
+                print(fmt.red(f"  that password did not open it — {left} "
+                              f"attempt{'s' if left > 1 else ''} left"))
+            else:
+                # Print the full guidance exactly once, on the final failure.
+                try:
+                    load_wallet(path, password=password)
+                except WalletError as exc:
+                    print(fmt.red(f"  {exc}"))
+                raise SystemExit(2)
+    raise SystemExit(2)
 
 
 def _connect(settings):

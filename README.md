@@ -65,7 +65,7 @@ cd C:\Users\SERVER\PycharmProjects\trying
 run.bat                 REM creates .venv, installs deps, runs a scan
 run.bat scan --both     REM any main.py subcommand works
 run.bat verify          REM cross-checks the maths against the live chain
-run.bat selftest        REM 73 offline tests, no network needed
+run.bat selftest        REM 75 offline tests, no network needed
 ```
 
 `run.bat` must be run **from the project root** (it `cd`s there itself) — the
@@ -80,7 +80,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # optional — it runs with no keys at all
-python main.py selftest     # 73 offline maths tests, no network needed
+python main.py selftest     # 75 offline maths tests, no network needed
 python main.py info         # config + live check of every RPC and price source
 python main.py scan         # one-shot ETH/USDT comparison
 ```
@@ -195,16 +195,16 @@ way to confirm your checkout and interpreter are healthy. Run it first.
 On a bare install it reports something like:
 
 ```
-63/63 passed, 10 skipped — all good
+64/64 passed, 11 skipped — all good
   skipped because: needs eth_account; needs eth_utils; needs web3; …
   Install them with:  python -m pip install -r requirements.txt
 ```
 
-Those 10 are not failures and not silent passes. They cover things that genuinely
+Those 11 are not failures and not silent passes. They cover things that genuinely
 cannot exist without the libraries — keystore encryption, transaction signing,
 EIP-55 checksums (keccak-256, which Python's `hashlib` does not ship: it has
 SHA3, and SHA3 and keccak differ in padding), and ABI encoding. Once you install
-the dependencies the same command reports **73/73 passed**, with nothing skipped.
+the dependencies the same command reports **75/75 passed**, with nothing skipped.
 
 A skip is reported separately from a pass on purpose. Counting an unrunnable test
 as a failure would make the documented first step look like a broken project;
@@ -218,7 +218,7 @@ top-right dropdown automatically after a reload:
 
 | Configuration | Runs |
 |---|---|
-| **Selftest** | `main.py selftest` — 73 offline maths tests, no network, no keys. Run this first. |
+| **Selftest** | `main.py selftest` — 75 offline maths tests, no network, no keys. Run this first. |
 | **Info** | `main.py info` — live check of every RPC endpoint and price source |
 | **Scan** | `main.py scan` — one-shot ETH/USDT comparison |
 | **Verify** | `main.py verify` — cross-checks the maths against the live chain |
@@ -411,7 +411,7 @@ The official `QuoterV2` cross-check is attempted as a bonus, but it only answers
 through *revert data*, and most free RPC providers strip that. It is not relied
 on. An Infura or Alchemy key will usually return it.
 
-`python main.py selftest` runs 73 offline tests covering TickMath constants
+`python main.py selftest` runs 75 offline tests covering TickMath constants
 (re-derived from first principles to 200 decimal places, which is how two
 single-digit transcription typos were caught), the tick bitmap walk, swap-step
 rounding, V2 closed forms, the arb decision logic, flash-loan plan construction, and the venue registry itself
@@ -797,10 +797,39 @@ Withdraw is owner-only and dry-runs by default; `--execute` sends it.
 | --- | --- | --- |
 | `Unprofitable` | The round trip ended with less than it started. **No tokens moved** — only gas was spent | Normal on testnet. Check the `note:` lines from `arb plan` first |
 | `INSUFFICIENT_OUTPUT_AMOUNT` | A leg's slippage floor was not met: the pool moved between the scan and your transaction | Raise `--slippage` (default 100 bps), or use a smaller `--size` |
+| `could not decrypt …: wrong password` | The password does not match the one the keystore was created with. **It cannot be recovered or reset** — that is what encrypting means | Try again (there is no attempt limit, and the prompt now allows three tries per command). Check Caps Lock and keyboard layout. If it will not come back, see "Lost the wallet password" below |
 | `insufficient balance for this call` | Your wallet cannot cover the gas | `python main.py wallet faucet --network bsc_testnet` |
 | `no recorded deployment of FlashArb` | Nothing deployed yet, or `state/` was deleted | `python main.py arb deploy`, or pass `--address 0x…` |
 | `no usable V2/V3 leg` | The scan rejected every leg, usually on depth | Smaller `--size`, or higher `--max-impact` |
 | `Stack too deep` while compiling | The contract grew past the legacy compiler's 16-slot limit | Pack locals into a struct and scope leg blocks with `{ }`; do not reach for `--via-ir` |
+| `could not download solc 0.8.26` | The one step needing internet access failed — proxy, firewall, or offline | Allow `github.com` and `binaries.soliditylang.com`, then re-run. It caches, so this happens at most once |
+| `PermissionError … .solcx/solc-v0.8.26` | The cached compiler binary lost its execute bit (backup restore, archive, antivirus). The install looks successful, so nothing else points here | Fixed automatically on Linux and macOS. On Windows it means a file lock or antivirus — exclude `~/.solcx`, or delete that folder and re-run `arb compile` to fetch a fresh copy |
+
+### Lost the wallet password
+
+A v3 keystore is scrypt-encrypted, so there is nothing to reset and no back door
+— not in this project, not anywhere. If the password will not come back, make a
+new wallet:
+
+```
+python main.py wallet new --no-password --force
+python main.py wallet faucet --network bsc_testnet
+```
+
+`--no-password` still encrypts the file at rest; it just removes a secret you can
+lose, and it makes every later command non-interactive (no prompt, so it also
+works in PyCharm's Run window). For a testnet wallet that is the better trade.
+
+**This is safe only because nothing has been deployed yet.** Anything already
+sent to the old address stays there — on testnet that costs nothing, since a
+faucet drip is free and takes a minute.
+
+Do **not** do this once a contract is deployed and holding funds. The address
+that deploys `FlashArb` becomes its `owner`, and only the owner can call
+`withdrawTokens` or `withdrawNative`. A new wallet means a new owner, and any
+tokens sitting in the old contract become permanently unreachable. If you ever
+need to move to a new wallet after deploying, withdraw everything first, then
+deploy afresh from the new wallet.
 
 ### Two real constraints worth knowing
 
@@ -975,7 +1004,7 @@ trying/
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            73 offline tests — no network, no dependencies
+    └── test_math.py            75 offline tests — no network, no dependencies
 ```
 
 `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`
@@ -1015,8 +1044,13 @@ The safeguards, so you know what you are relying on:
 * **The contract itself refuses a losing trade.** It reverts unless the round trip
   ends with at least `minProfit` more than it started with, so a bad scan cannot
   cost you the traded amount — only gas.
-* **Only the owner can withdraw.** `owner()` is the wallet that deployed it, and
-  `arb status` shows you that address so you can check it is yours.
+* **Only the owner can run it, or withdraw from it.** `arbitrage()`,
+  `withdrawTokens()` and `withdrawNative()` are all behind the same `onlyOwner`
+  modifier, so a stranger cannot trigger a trade through your contract or take
+  anything out of it. `owner()` is the wallet that deployed it, and `arb status`
+  shows you that address so you can check it is yours. The flip side is that
+  losing that wallet loses the contract entirely — see "Lost the wallet
+  password".
 * **The private key is never printed and never leaves the keystore file.** No
   command in this project will show it to you. The password is typed, not passed
   on the command line, so it does not land in your shell history.

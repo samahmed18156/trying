@@ -118,6 +118,82 @@ def pragma_version(source: str) -> str:
     return spec
 
 
+def solc_binary_path(solcx, version: str) -> Optional[pathlib.Path]:
+    """
+    Locate the cached solc binary, or None if it cannot be found.
+
+    Goes through solcx's own helper first, then falls back to its documented
+    cache layout (`~/.solcx/solc-v<version>`). The fallback exists because the
+    helper's name has moved between py-solc-x releases - an earlier version of
+    this function called `solcx.get_solc_binary`, which does not exist in v2, and
+    the blanket `except Exception: return` around it hid that completely, so the
+    repair silently never ran. Deriving the path from the install folder needs no
+    helper at all and cannot rot the same way.
+    """
+    import os
+
+    try:
+        from solcx.install import get_executable
+        candidate = pathlib.Path(get_executable(version))
+        if candidate.exists():
+            return candidate
+    except Exception:  # noqa: BLE001 - helper missing or renamed; fall through
+        pass
+
+    try:
+        folder = pathlib.Path(solcx.get_solcx_install_folder())
+    except Exception:  # noqa: BLE001
+        return None
+    name = f"solc-v{version}.exe" if os.name == "nt" else f"solc-v{version}"
+    candidate = folder / name
+    return candidate if candidate.exists() else None
+
+
+def _ensure_executable(solcx, version: str) -> None:
+    """
+    Make sure a cached solc binary can actually be run, and fix it if it cannot.
+
+    solcx downloads the binary once and caches it in ~/.solcx. If that file loses
+    its execute bit - a home-directory backup or restore, a copy between machines,
+    an archive that did not preserve modes, or an over-zealous antivirus - then
+    every later compile dies with a raw traceback from inside solcx:
+
+        PermissionError: [Errno 13] Permission denied: '/home/…/.solcx/solc-v0.8.26'
+
+    which says nothing about what to do. This is exactly the case where the
+    install "succeeded" (the version is listed as installed) and the failure only
+    shows up later, so it is worth checking up front and repairing: restoring one
+    permission bit is safe and is what the installer would have done anyway.
+
+    Windows has no execute bit - access is governed by ACLs - so there is nothing
+    to check there, and a PermissionError on Windows means something else entirely
+    (a lock or antivirus), which the caller reports.
+    """
+    import os
+    import stat
+
+    if os.name == "nt":
+        return
+    binary = solc_binary_path(solcx, version)
+    if binary is None:
+        return
+    mode = binary.stat().st_mode
+    if mode & stat.S_IXUSR:
+        return
+    try:
+        binary.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    except OSError as exc:
+        raise CompileError(
+            f"the cached solc {version} binary at {binary} is not executable and "
+            f"could not be fixed automatically ({exc}).\n"
+            f"  Repair it with:  chmod +x \"{binary}\"\n"
+            f"  Or delete it and let this command download a fresh copy:\n"
+            f"      rm -f \"{binary}\"\n"
+            f"  A backup restore or an archive that dropped file modes is the "
+            f"usual cause."
+        ) from exc
+
+
 def ensure_solc(version: str) -> str:
     """Install `version` if needed and return the solcx version string."""
     try:
@@ -131,6 +207,8 @@ def ensure_solc(version: str) -> str:
         ) from exc
 
     installed = {str(v) for v in solcx.get_installed_solc_versions()}
+    if version in installed:
+        _ensure_executable(solcx, version)
     if version not in installed:
         # This is the one step that needs the network, and it is the one step a
         # first-time user is most likely to hit a wall on: a corporate proxy, a
@@ -138,6 +216,9 @@ def ensure_solc(version: str) -> str:
         # from inside solcx. Say what failed and what to do about it.
         try:
             solcx.install_solc(version)
+            _ensure_executable(solcx, version)
+        except CompileError:
+            raise
         except Exception as exc:  # noqa: BLE001 - solcx raises several types
             raise CompileError(
                 f"could not download solc {version}: {type(exc).__name__}: {exc}\n"

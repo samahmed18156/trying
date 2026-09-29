@@ -241,10 +241,46 @@ def load_wallet(path: Optional[str] = None, password: str = "",
     try:
         key = Account.decrypt(keystore, password)
     except Exception as exc:  # noqa: BLE001 - eth_account raises several types
-        raise WalletError(
-            f"could not decrypt {target}: wrong password?\n"
-            f"  ({type(exc).__name__})"
-        ) from exc
+        # EthKeyfileValueError is the MAC check failing, which means one specific
+        # thing: this password did not produce the key that encrypted the file.
+        # Saying "wrong password?" and stopping is a dead end for someone who
+        # cannot remember it, and there is no recovery - a v3 keystore is scrypt
+        # encrypted and nothing in this project can read it without the password.
+        # So say that plainly and give the way forward.
+        name = type(exc).__name__
+        detail = (
+            f"could not decrypt {target}: wrong password\n"
+            f"  ({name})\n"
+            f"\n"
+            f"  The password entered does not match the one this file was created\n"
+            f"  with. There is no way to recover or reset it - that is what\n"
+            f"  encrypting it means. Note that the file itself is fine: your\n"
+            f"  address is readable without the password, which is why\n"
+            f"  `wallet balance` still works.\n"
+            f"\n"
+            f"  Your options:\n"
+            f"    1. Try again. Nothing is locked out and there is no attempt\n"
+            f"       limit - the same command can be re-run as often as needed.\n"
+            f"       Check Caps Lock and your keyboard layout; the password was\n"
+            f"       typed twice when the wallet was created, so a typo then\n"
+            f"       would have been caught, which makes a layout or Caps Lock\n"
+            f"       difference between the two sessions the likely culprit.\n"
+            f"    2. If it will not come back, make a new wallet and fund it\n"
+            f"       again from a free faucet:\n"
+            f"           python main.py wallet new --no-password --force\n"
+            f"           python main.py wallet faucet --network bsc_testnet\n"
+            f"       --no-password still encrypts the file at rest, it just\n"
+            f"       removes a secret you can lose. For a testnet wallet that is\n"
+            f"       the better trade, and it makes every later command\n"
+            f"       non-interactive.\n"
+            f"       Anything sent to the OLD address stays there. On testnet\n"
+            f"       that costs nothing, and it is safe here specifically\n"
+            f"       because nothing has been deployed yet - no contract is\n"
+            f"       tied to the old address. Do NOT do this once a contract is\n"
+            f"       deployed and holding funds, because only the deploying\n"
+            f"       address is its owner and can withdraw from it."
+        )
+        raise WalletError(detail) from exc
     return Account.from_key(key)
 
 

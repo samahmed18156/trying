@@ -2609,6 +2609,175 @@ def the_offline_import_chain_has_no_module_level_third_party_imports():
           + "\n    ".join(offenders))
 
 
+@requires("eth_account")
+def wallet_password_prompt_retries_then_gives_up_with_guidance():
+    """
+    A mistyped password must not force a full re-run of the command that needed
+    it. `arb deploy` compiles the contract and connects to a node before it asks,
+    so one wrong character otherwise costs all of that again.
+
+    Three behaviours are pinned here:
+      * interactive prompts get three attempts, and a later correct one works;
+      * after the last failure the full guidance is printed exactly once;
+      * an explicit --password fails immediately with no prompt, so a scripted or
+        CI run cannot hang waiting for input nobody is there to type.
+    """
+    import tempfile
+    import types
+    import arb.wallet as W
+    import main as cli
+
+    # main.py binds `fmt` (and the rest of its imports) inside _load_deps(),
+    # which main() runs for every command except the offline ones. Importing the
+    # module directly leaves fmt as None, and _load_wallet then dies with
+    # "'NoneType' object has no attribute 'red'" - the same trap that broke the
+    # wallet handlers once before. Call the real loader so the test exercises the
+    # path the CLI actually takes.
+    if cli.fmt is None:
+        cli._load_deps()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = str(pathlib.Path(tmp) / "wallets" / "k.json")
+        made = W.create_wallet(path, password="correct horse")
+
+        orig_prompt, orig_load = W.prompt_password, W.load_wallet
+        try:
+            # --- 1. wrong, wrong, right -> succeeds on the third attempt -------
+            answers = iter(["nope", "also nope", "correct horse"])
+            W.prompt_password = lambda p=None: next(answers)
+            calls = {"n": 0}
+            real_load = orig_load
+            def counting_load(path_, password=""):
+                calls["n"] += 1
+                return real_load(path_, password)
+            W.load_wallet = counting_load
+            account, used = cli._load_wallet(types.SimpleNamespace(path=path, password=""))
+            check(account.address == made.address, "a retry did not reach the account")
+            check(used == path, "the wallet path was not returned")
+            check(calls["n"] == 3, f"expected 3 decrypt attempts, saw {calls['n']}")
+
+            # --- 2. three wrongs -> SystemExit, and the guidance is printed ----
+            answers = iter(["a", "b", "c"])
+            W.prompt_password = lambda p=None: next(answers)
+            try:
+                cli._load_wallet(types.SimpleNamespace(path=path, password=""))
+            except SystemExit as exc:
+                check(exc.code == 2, f"should exit 2, got {exc.code}")
+            else:
+                raise AssertionError("three wrong passwords were accepted")
+            # The prompt must not be asked a fourth time.
+            try:
+                next(answers)
+            except StopIteration:
+                pass
+            else:
+                raise AssertionError("the prompt was asked more than three times")
+
+            # --- 3. explicit --password fails fast, never prompts --------------
+            prompted = {"n": 0}
+            def loud_prompt(p=None):
+                prompted["n"] += 1
+                return "whatever"
+            W.prompt_password = loud_prompt
+            attempts = {"n": 0}
+            def one_try(path_, password=""):
+                attempts["n"] += 1
+                return real_load(path_, password)
+            W.load_wallet = one_try
+            try:
+                cli._load_wallet(types.SimpleNamespace(path=path, password="wrong"))
+            except SystemExit as exc:
+                check(exc.code == 2, f"should exit 2, got {exc.code}")
+            else:
+                raise AssertionError("a wrong --password was accepted")
+            check(prompted["n"] == 0,
+                  "an explicit --password must never fall back to prompting - "
+                  "that would hang an unattended run")
+            check(attempts["n"] == 1,
+                  f"an explicit --password should try once, saw {attempts['n']}")
+
+            # --- 4. the failure text must offer a way forward -----------------
+            try:
+                real_load(path, "definitely wrong")
+            except W.WalletError as exc:
+                text = str(exc)
+                check("no way to recover" in text,
+                      "the message must say the password is unrecoverable")
+                check("--no-password" in text,
+                      "the message must offer the new-wallet escape route")
+                check("wallet faucet" in text,
+                      "the escape route is useless without saying how to re-fund")
+                check("owner" in text,
+                      "it must warn that this is unsafe once a contract is deployed")
+            else:
+                raise AssertionError("a wrong password decrypted the keystore")
+        finally:
+            W.prompt_password, W.load_wallet = orig_prompt, orig_load
+
+
+@test
+def a_cached_solc_binary_that_lost_its_execute_bit_is_repaired():
+    """
+    solcx caches the compiler in ~/.solcx and reuses it forever. If that file
+    loses its execute bit - a home-directory backup or restore, a copy between
+    machines, an archive that did not preserve modes - then every later compile
+    dies with a raw traceback from inside solcx:
+
+        PermissionError: [Errno 13] Permission denied: '…/.solcx/solc-v0.8.26'
+
+    The install is reported as successful (the version IS listed as installed),
+    so nothing suggests what is actually wrong. Restoring one permission bit is
+    what the installer would have done anyway, so the code just does it.
+
+    This test needs no third-party packages and no real solc: it points the
+    lookup at a temp directory holding a fake binary.
+    """
+    import os
+    import stat
+    import tempfile
+    from arb.compiler import CompileError, _ensure_executable, solc_binary_path
+
+    if os.name == "nt":
+        raise SkipTest("Windows has no execute bit; access is governed by ACLs")
+
+    class StubSolcx:
+        """Just enough of the solcx module for the path lookup."""
+        def __init__(self, folder):
+            self._folder = folder
+        def get_solcx_install_folder(self):
+            return self._folder
+
+    with tempfile.TemporaryDirectory() as tmp:
+        folder = pathlib.Path(tmp)
+        stub = StubSolcx(folder)
+
+        # A missing binary must be reported as None, never raise.
+        check(solc_binary_path(stub, "9.9.9") is None,
+              "a missing binary should resolve to None")
+        _ensure_executable(stub, "9.9.9")   # must be a no-op, not a crash
+
+        fake = folder / "solc-v9.9.9"
+        fake.write_bytes(b"#!/bin/sh\necho fake\n")
+        fake.chmod(0o644)
+        check(not (fake.stat().st_mode & stat.S_IXUSR),
+              "the fixture should start out non-executable")
+
+        found = solc_binary_path(stub, "9.9.9")
+        check(found == fake,
+              f"the fallback lookup did not find the cached binary: {found}")
+
+        _ensure_executable(stub, "9.9.9")
+        mode = fake.stat().st_mode
+        check(bool(mode & stat.S_IXUSR),
+              f"the execute bit was not restored; mode is now {oct(mode)}")
+
+        # Idempotent: a second call on an already-executable binary changes nothing.
+        before = fake.stat().st_mode
+        _ensure_executable(stub, "9.9.9")
+        check(fake.stat().st_mode == before,
+              "repairing an already-executable binary should be a no-op")
+
+
 def run_all(verbose: bool = True) -> int:
     passed = 0
     skips: List[tuple] = []
