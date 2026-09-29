@@ -65,7 +65,7 @@ cd C:\Users\SERVER\PycharmProjects\trying
 run.bat                 REM creates .venv, installs deps, runs a scan
 run.bat scan --both     REM any main.py subcommand works
 run.bat verify          REM cross-checks the maths against the live chain
-run.bat selftest        REM 71 offline tests, no network needed
+run.bat selftest        REM 73 offline tests, no network needed
 ```
 
 `run.bat` must be run **from the project root** (it `cd`s there itself) — the
@@ -80,7 +80,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 cp .env.example .env        # optional — it runs with no keys at all
-python main.py selftest     # 71 offline maths tests, no network needed
+python main.py selftest     # 73 offline maths tests, no network needed
 python main.py info         # config + live check of every RPC and price source
 python main.py scan         # one-shot ETH/USDT comparison
 ```
@@ -188,9 +188,27 @@ C:\Users\SERVER\AppData\Local\Programs\Python\Python313\python.exe -m pip instal
 
 Either way, `python main.py scan` now prints a plain-language list of what is
 missing and the exact command to fix it, instead of a traceback. And
-`python main.py selftest` needs **no dependencies at all** — it is pure integer
-maths on the standard library, so it works on a completely bare install and is
-the fastest way to confirm your checkout and interpreter are healthy.
+`python main.py selftest` works on a **completely bare Python install** — no
+`web3`, no `eth_account`, nothing from `requirements.txt` — so it is the fastest
+way to confirm your checkout and interpreter are healthy. Run it first.
+
+On a bare install it reports something like:
+
+```
+63/63 passed, 10 skipped — all good
+  skipped because: needs eth_account; needs eth_utils; needs web3; …
+  Install them with:  python -m pip install -r requirements.txt
+```
+
+Those 10 are not failures and not silent passes. They cover things that genuinely
+cannot exist without the libraries — keystore encryption, transaction signing,
+EIP-55 checksums (keccak-256, which Python's `hashlib` does not ship: it has
+SHA3, and SHA3 and keccak differ in padding), and ABI encoding. Once you install
+the dependencies the same command reports **73/73 passed**, with nothing skipped.
+
+A skip is reported separately from a pass on purpose. Counting an unrunnable test
+as a failure would make the documented first step look like a broken project;
+counting it as a pass would claim coverage that does not exist.
 
 ### Shared Run Configurations (`.run/`)
 
@@ -200,7 +218,7 @@ top-right dropdown automatically after a reload:
 
 | Configuration | Runs |
 |---|---|
-| **Selftest** | `main.py selftest` — 71 offline maths tests, no network, no keys. Run this first. |
+| **Selftest** | `main.py selftest` — 73 offline maths tests, no network, no keys. Run this first. |
 | **Info** | `main.py info` — live check of every RPC endpoint and price source |
 | **Scan** | `main.py scan` — one-shot ETH/USDT comparison |
 | **Verify** | `main.py verify` — cross-checks the maths against the live chain |
@@ -393,10 +411,10 @@ The official `QuoterV2` cross-check is attempted as a bonus, but it only answers
 through *revert data*, and most free RPC providers strip that. It is not relied
 on. An Infura or Alchemy key will usually return it.
 
-`python main.py selftest` runs 71 offline tests covering TickMath constants
+`python main.py selftest` runs 73 offline tests covering TickMath constants
 (re-derived from first principles to 200 decimal places, which is how two
 single-digit transcription typos were caught), the tick bitmap walk, swap-step
-rounding, V2 closed forms, the arb decision logic, and the venue registry itself
+rounding, V2 closed forms, the arb decision logic, flash-loan plan construction, and the venue registry itself
 — fee constants per protocol, PancakeSwap's missing 3000 tier, the `slot0` ABI
 difference (including a proof that the two share a selector, which is why the
 failure is a decode error and not a silent zero), the depth gate, and the
@@ -957,16 +975,27 @@ trying/
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            71 offline tests — no network, no dependencies
+    └── test_math.py            73 offline tests — no network, no dependencies
 ```
 
 `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`
 being installed: `dex/fetcher.py` re-exports it, so
 `from dex.fetcher import QuoteSnapshot` keeps working. Same reasoning puts the
-`requests` import inside `index/base.py::_get_json()` and the `web3` imports
-inside `rpc.py::NodeProvider.connect()` — those modules also define pure-Python
-types (`PricePoint`, `MockNode`) that the offline tests construct directly. The
-net effect is that `main.py selftest` runs on a bare Python install.
+`requests` import inside `index/base.py::_get_json()`, the `web3` imports inside
+`rpc.py::NodeProvider.connect()`, `config.py::_eip55()` and
+`arb/executor.py::checksum()` — those modules also define pure-Python types
+(`PricePoint`, `MockNode`, `ArbPlan`, `TxCost`) that the offline tests construct
+directly. The net effect is that `main.py selftest` runs on a bare Python
+install.
+
+**This invariant is easy to break by accident, so it is worth stating plainly: a
+module-level `from web3 import Web3` anywhere in the `config → dex.types →
+arb.signals → tests.test_math` import chain kills the offline suite before it
+runs a single test.** That is exactly what happened when address-checksum
+validation was added to `config.py` — one import at the top of the file, and
+`selftest` died with `ModuleNotFoundError` instead of reporting anything. If you
+add a helper that needs `web3`, import it *inside the function* and decide what
+the function should do when `web3` is absent.
 
 ---
 

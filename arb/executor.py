@@ -187,7 +187,14 @@ def checksum(addr: str) -> str:
     address entering a plan is normalised here instead of blowing up at encode
     time.
     """
-    from web3 import Web3
+    try:
+        from web3 import Web3
+    except ImportError:
+        # No web3 means there is no encoder to satisfy and no transaction can be
+        # built, so returning the address untouched is safe - and it keeps the
+        # planner's own logic (leg selection, fee maths, revert prediction) fully
+        # testable on a bare Python install. Every real run has web3.
+        return addr
     return Web3.to_checksum_address(addr)
 
 

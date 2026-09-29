@@ -51,6 +51,52 @@ def approx(a: float, b: float, rel: float = 1e-9) -> bool:
     return abs(a - b) / denom <= rel
 
 
+class SkipTest(Exception):
+    """
+    Raised by a test that cannot run in this environment.
+
+    Distinct from a failure, and counted separately. A test that needs web3 is
+    not "broken" on a machine without web3 - it did not run - and reporting that
+    as a FAIL would make the documented first step (`main.py selftest`, which the
+    README promises works on a bare Python install) look like the project is
+    broken. Reporting it as a silent pass would be worse: it would claim coverage
+    that does not exist.
+    """
+
+
+def requires(*modules: str):
+    """
+    Decorator: skip the test unless every named module can be imported.
+
+    Checks with importlib rather than importing, so a module that is installed
+    but broken is reported as a skip with its real error instead of crashing the
+    whole suite at collection time.
+    """
+    import importlib.util
+
+    def decorate(fn):
+        missing = []
+        for name in modules:
+            try:
+                if importlib.util.find_spec(name) is None:
+                    missing.append(name)
+            except Exception as exc:  # noqa: BLE001 - installed but unimportable
+                missing.append(f"{name} ({type(exc).__name__})")
+        if missing:
+            def skipped():
+                raise SkipTest("needs " + ", ".join(missing))
+            skipped.__name__ = fn.__name__
+            skipped.__doc__ = fn.__doc__
+            return test(skipped)
+        return test(fn)
+
+    # NOTE: `requires` registers the test itself, so it REPLACES `@test` rather
+    # than stacking on top of it. Writing both registers the same name twice -
+    # once runnable and once skipped - which shows up as a phantom failure next
+    # to a skip for the identical test.
+    return decorate
+
+
 def test(fn: Callable[[], None]):
     """Decorator registering a test."""
     TESTS.append((fn.__name__, fn))
@@ -1022,7 +1068,7 @@ def pancakeswap_router_is_not_the_smart_router():
           "Ethereum PancakeSwap V2 router is wrong")
 
 
-@test
+@requires("eth_utils")
 def v3_slot0_selector_is_shared_but_decoding_differs():
     """
     The reason one ABI cannot serve both protocols, and the reason the failure
@@ -1284,7 +1330,7 @@ def bsc_network_and_testnet_are_configured():
           f"bsc_testnet V2 router is {v2.router}")
 
 
-@test
+@requires("web3")
 def pool_cache_keys_include_the_factory():
     """
     One ChainReader serves every venue so decimals and token0 lookups are shared.
@@ -1572,7 +1618,7 @@ def cross_json_includes_computed_fields():
         check(field in d, f"cross JSON has no {field!r}")
 
 
-@test
+@requires("web3")
 def every_configured_address_is_a_valid_checksum():
     """
     web3.py rejects a mixed-case address whose capitals are in the wrong places,
@@ -1777,7 +1823,7 @@ def cross_staleness_detector_sees_what_the_depth_gate_cannot():
 # ==========================================================================
 
 
-@test
+@requires("eth_account")
 def wallet_refuses_paths_that_are_not_gitignored():
     """
     The one guard that stops a private key reaching a public repository, which
@@ -1849,7 +1895,7 @@ def wallet_refuses_paths_that_are_not_gitignored():
               "a path outside the project cannot be committed, so allow it")
 
 
-@test
+@requires("eth_account")
 def wallet_keystore_roundtrips_and_never_stores_the_key():
     """
     The plaintext key must exist only in memory. What lands on disk is a v3
@@ -1902,7 +1948,7 @@ def wallet_keystore_roundtrips_and_never_stores_the_key():
         check(other.address != info.address, "two generated wallets produced one address")
 
 
-@test
+@requires("eth_account")
 def wallet_will_not_silently_overwrite():
     """Replacing a wallet discards the old address and any funds sent to it."""
     import tempfile
@@ -1922,7 +1968,7 @@ def wallet_will_not_silently_overwrite():
         check(second.address != first.address, "--force did not actually replace the wallet")
 
 
-@test
+@requires("web3", "eth_account")
 def wallet_signs_a_transaction_offline():
     """
     Proves the loaded account can actually sign, without touching a node. A
@@ -2005,17 +2051,31 @@ def faucet_list_puts_free_ones_first():
 # ==========================================================================
 
 
+def _same_addr(a: str, b: str) -> bool:
+    """
+    Compare two addresses ignoring case.
+
+    Necessary because `plan_arbitrage` upgrades every address to EIP-55 when
+    web3 is installed and leaves it lowercase when web3 is not - so the same plan
+    has different capitalisation depending on the environment. An exact `==`
+    against a lowercase fixture therefore passes on a bare install and fails on a
+    real one. Case is presentation; the 20 bytes are the identity.
+    """
+    return str(a).lower() == str(b).lower()
+
+
 def _addr(seed: int) -> str:
     """
-    A valid, CHECKSUMMED 20-byte address derived from a seed.
+    A syntactically valid all-lowercase 20-byte address derived from a seed.
 
-    Checksumming matters: web3.py refuses to encode a lowercase address, and it
-    says so with a message blaming "the software that gave you this address"
-    instead of naming the field - which sent this suite looking for an
-    argument-packing bug that did not exist.
+    Deliberately NOT checksummed, and deliberately not calling web3: this runs at
+    module scope, so importing web3 here made the whole suite uncollectable on a
+    bare Python install. All-lowercase is a valid EIP-55 style (it carries no
+    checksum information), and `plan_arbitrage` upgrades it to a real checksum
+    when web3 is present. The test that asserts checksumming requires web3 and
+    skips without it.
     """
-    from web3 import Web3
-    return Web3.to_checksum_address("0x" + format(seed & ((1 << 160) - 1), "040x"))
+    return "0x" + format(seed & ((1 << 160) - 1), "040x")
 
 
 # Distinct fixture addresses. They must be valid hex: the encoder rejects
@@ -2150,11 +2210,11 @@ def plan_picks_one_leg_per_protocol_generation():
                           quote_decimals=18)
     check(plan.buy_label.startswith("PancakeSwap V2"), f"leg 1 is {plan.buy_label}")
     check("1.00%" in plan.sell_label, f"leg 2 is {plan.sell_label}")
-    check(plan.v2_path == [_A_QUOTE, _A_BASE],
-          "leg 1 must spend the quote token to buy the base")
-    check(plan.v3_token_in == _A_BASE and plan.v3_token_out == _A_QUOTE,
+    check([_same_addr(x, y) for x, y in zip(plan.v2_path, [_A_QUOTE, _A_BASE])] == [True, True],
+          f"leg 1 must spend the quote token to buy the base, got {plan.v2_path}")
+    check(_same_addr(plan.v3_token_in, _A_BASE) and _same_addr(plan.v3_token_out, _A_QUOTE),
           "leg 2 must sell the base back into the quote")
-    check(plan.borrow_token == _A_QUOTE, "the flash loan must be in the quote token")
+    check(_same_addr(plan.borrow_token, _A_QUOTE), "the flash loan must be in the quote token")
 
     # The plan's own exec prices must match the legs it chose, not the scan's.
     check(approx(plan.buy_exec, buy.exec_price, 1e-12), "buy_exec is not the chosen leg")
@@ -2162,21 +2222,48 @@ def plan_picks_one_leg_per_protocol_generation():
     check(res.buy_leg.exec_price < plan.buy_exec,
           "sanity: the unconstrained cheapest buy really is cheaper than the V2 leg")
 
-    # Every address leaving the planner must be checksummed, or web3 raises
-    # InvalidAddress from inside the encoder without saying which field.
-    from web3 import Web3
-    for field, value in (("pool", plan.pool), ("borrowToken", plan.borrow_token),
-                         ("v2Router", plan.v2_router), ("v3Router", plan.v3_router),
-                         ("v3 tokenIn", plan.v3_token_in),
-                         ("v3 tokenOut", plan.v3_token_out)):
-        check(Web3.is_checksum_address(value), f"{field} is not checksummed: {value}")
-    for i, hop in enumerate(plan.v2_path):
-        check(Web3.is_checksum_address(hop), f"v2_path[{i}] is not checksummed: {hop}")
-
     # And it must say so, rather than silently giving a worse trade.
     joined = " ".join(plan.notes)
     check("V2 router" in joined or "leg 1 is" in joined,
           f"the plan did not explain that it constrained the buy leg: {plan.notes}")
+
+
+@requires("web3")
+def plan_checksums_addresses_so_the_encoder_cannot_reject_them():
+    """
+    Every address leaving the planner must be EIP-55 checksummed.
+
+    web3.py refuses to encode a lowercase one, and it reports that from deep
+    inside the encoder with a message blaming "the software that gave you this
+    address" rather than naming the field - which is how a fixture using
+    lowercase addresses sent this suite hunting for an argument-packing bug that
+    did not exist. Normalising in the planner means the failure can never reach
+    the chain.
+
+    Gated on web3 because EIP-55 is keccak-256 of the lowercase hex, and
+    Python's hashlib ships SHA3 but not keccak - they differ in padding, so
+    there is no std-only way to compute it. `checksum()` degrades to identity
+    without web3, which is safe: with no encoder present nothing can be sent.
+    """
+    from web3 import Web3
+    from arb.executor import plan_arbitrage
+
+    res = _scan_with(*_TESTNET_SPECS)
+    plan = plan_arbitrage(res, _A_BASE, _A_QUOTE, lambda fee: _A_POOL,
+                          quote_decimals=18)
+
+    # The fixtures are deliberately lowercase, so this proves the upgrade.
+    check(_A_POOL == _A_POOL.lower(), "the fixture should start lowercase")
+    check(plan.pool != _A_POOL, "the planner left the address lowercase")
+
+    for label, value in (("pool", plan.pool), ("borrowToken", plan.borrow_token),
+                         ("intermediateToken", plan.intermediate_token),
+                         ("v2Router", plan.v2_router), ("v3Router", plan.v3_router),
+                         ("v3 tokenIn", plan.v3_token_in),
+                         ("v3 tokenOut", plan.v3_token_out)):
+        check(Web3.is_checksum_address(value), f"{label} is not checksummed: {value}")
+    for i, hop in enumerate(plan.v2_path):
+        check(Web3.is_checksum_address(hop), f"v2_path[{i}] is not checksummed: {hop}")
 
 
 @test
@@ -2268,7 +2355,7 @@ def plan_refuses_routes_it_cannot_execute():
         raise AssertionError("a zero-wei borrow produced a plan")
 
 
-@test
+@requires("web3", "eth_abi", "eth_utils")
 def plan_calldata_encoding_survives_a_roundtrip():
     """
     arbitrage() takes a struct containing a nested struct and a dynamic array.
@@ -2395,7 +2482,7 @@ def deployment_record_survives_a_roundtrip_outside_build():
             pass
 
 
-@test
+@requires("eth_account")
 def keystore_password_prompting_decides_correctly():
     """
     `wallet new --no-password` still writes a properly ENCRYPTED v3 keystore; it
@@ -2447,13 +2534,93 @@ def keystore_password_prompting_decides_correctly():
             raise AssertionError("a wrong password was accepted")
 
 
+@test
+def the_offline_import_chain_has_no_module_level_third_party_imports():
+    """
+    Guards the invariant that `main.py selftest` runs on a bare Python install.
+
+    A single module-level `from web3 import Web3` anywhere in the chain
+    config -> dex.types -> arb.signals -> tests.test_math kills the whole suite
+    with ModuleNotFoundError before one test runs. That is precisely what
+    happened when EIP-55 address validation was added to config.py: the code was
+    correct, the import was at the top of the file, and the documented first step
+    for a new user stopped working. Nothing else in the suite would have caught
+    it, because every other test needs the dependencies to be present.
+
+    Parsed with `ast` rather than imported, so this check itself needs no
+    dependencies and works identically in both environments.
+    """
+    import ast
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    third_party = {"web3", "eth_account", "eth_abi", "eth_utils",
+                   "requests", "solcx", "dotenv", "hexbytes", "cytoolz"}
+
+    def module_level_hits(source: str, label: str):
+        """
+        Third-party imports that execute at import time.
+
+        Only TOP-LEVEL statements count: an import inside a function body is lazy
+        and fine, and one inside try/except ImportError is an explicitly optional
+        dependency (`dotenv` in config.py is exactly that).
+        """
+        out = []
+        tree = ast.parse(source, filename=label)
+        for node in tree.body:
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                if node.level == 0 and node.module:
+                    names = [node.module.split(".")[0]]
+            out += [f"{label}:{node.lineno} imports {n} at module level"
+                    for n in names if n in third_party]
+        return out
+
+    # Prove the detector is not vacuous BEFORE trusting it on real files, using
+    # the very same function - a hand-rolled second copy of the logic here once
+    # contained a bug of its own and failed the test for the wrong reason.
+    check(module_level_hits("import web3\n", "probe") != [],
+          "the detector did not notice a plain top-level `import web3`")
+    check(module_level_hits("from eth_account import Account\n", "probe") != [],
+          "the detector did not notice a top-level `from eth_account import ...`")
+    check(module_level_hits("def f():\n    import web3\n", "probe") == [],
+          "the detector wrongly flagged a lazy import inside a function")
+    check(module_level_hits("try:\n    import dotenv\nexcept ImportError:\n    pass\n",
+                            "probe") == [],
+          "the detector wrongly flagged a guarded optional import")
+    check(module_level_hits("import json\nimport pathlib\n", "probe") == [],
+          "the detector wrongly flagged the standard library")
+
+    guarded_files = ["config.py", "dex/types.py", "dex/cross.py",
+                     "arb/executor.py", "arb/deployer.py", "arb/signals.py",
+                     "arb/compiler.py", "formatting.py", "bootstrap.py"]
+
+    offenders = []
+    for rel in guarded_files:
+        path = root / rel
+        if not path.exists():
+            offenders.append(f"{rel} is missing")
+            continue
+        offenders += module_level_hits(path.read_text(encoding="utf-8"), rel)
+
+    check(not offenders,
+          "module-level third-party imports break the bare-install suite:\n    "
+          + "\n    ".join(offenders))
+
+
 def run_all(verbose: bool = True) -> int:
     passed = 0
+    skips: List[tuple] = []
     if verbose:
         print(f"\nRunning {len(TESTS)} offline maths tests\n")
     for name, fn in TESTS:
         try:
             fn()
+        except SkipTest as exc:
+            skips.append((name, str(exc)))
+            if verbose:
+                print(f"  skip  {name}   ({exc})")
         except Exception:  # noqa: BLE001
             FAILURES.append(name)
             if verbose:
@@ -2465,8 +2632,18 @@ def run_all(verbose: bool = True) -> int:
                 print(f"  ok    {name}")
 
     if verbose:
-        print(f"\n{passed}/{len(TESTS)} passed"
-              + (f", {len(FAILURES)} FAILED" if FAILURES else " — all good"))
+        ran = len(TESTS) - len(skips)
+        line = f"\n{passed}/{ran} passed"
+        if skips:
+            line += f", {len(skips)} skipped"
+        line += "" if FAILURES else " — all good"
+        if FAILURES:
+            line += f", {len(FAILURES)} FAILED"
+        print(line)
+        if skips:
+            reasons = sorted({why for _, why in skips})
+            print("  skipped because: " + "; ".join(reasons))
+            print("  Install them with:  python -m pip install -r requirements.txt")
     return len(FAILURES)
 
 

@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 import re
 
-from web3 import Web3
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
@@ -516,15 +515,43 @@ def index_symbol(symbol: str) -> str:
 #   mixed case, checksum INVALID   -> ValueError naming the offending address,
 #                                     because mixed case means someone typed
 #                                     capitals and at least one is wrong
+def _eip55(address: str) -> Optional[str]:
+    """
+    The EIP-55 checksum form of `address`, or None if web3 is not installed.
+
+    EIP-55 is keccak-256 of the lowercase hex, and Python's hashlib ships SHA3
+    but not keccak - the two differ in padding, so there is no std-only way to
+    compute this. Hence web3, hence the lazy import.
+
+    Lazy, not module-level, because config.py is imported by dex/types.py, which
+    is imported by arb/signals.py, which tests/test_math.py imports at module
+    scope. A module-level `from web3 import Web3` here therefore made
+    `main.py selftest` - the one command documented to work on a bare Python
+    install with nothing from requirements.txt - die with ModuleNotFoundError
+    before running a single test.
+    """
+    try:
+        from web3 import Web3
+    except ImportError:
+        return None
+    return Web3.to_checksum_address(address)
+
+
 def _require_checksum_ok(address: str, where: str) -> str:
     if not isinstance(address, str) or not address:
         return address
+    # The structural check needs no dependency, so it always runs.
     if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
         raise ValueError(f"{where}: {address!r} is not a 20-byte hex address")
+    correct = _eip55(address)
+    if correct is None:
+        # No web3 means no chain calls are possible at all, so the only thing
+        # that would consume this address cannot run either. Skipping the
+        # checksum check here costs nothing and keeps the offline suite working.
+        return address
     body = address[2:]
     if body == body.lower() or body == body.upper():
-        return Web3.to_checksum_address(address)
-    correct = Web3.to_checksum_address(address)
+        return correct
     if address != correct:
         raise ValueError(
             f"{where}: address has an INVALID EIP-55 checksum.\n"
@@ -533,6 +560,7 @@ def _require_checksum_ok(address: str, where: str) -> str:
             f"  web3.py would reject this later with an InvalidAddress error "
             f"pointing at its own internals. Fix it here."
         )
+    return address
     return address
 
 
