@@ -1639,6 +1639,11 @@ def _contract_address(args, dep) -> str:
 # 570,906 was the estimate for the first testnet run with its 1.35x margin, so
 # the raw call is ~423k; 600k is that plus headroom. It only feeds the profit
 # FLOOR (which may never be under-priced), never the gas limit sent.
+# Used ONLY when gas cannot be simulated (no contract deployed yet, or `arb plan`
+# with no address). At execution time `_gas_cost_quote_wei` calls estimateGas and
+# uses the measured value. Measured on a BNB Chain fork on 2026-09-30: 350,338 gas
+# for a V2-first round trip and 286,804 for V3-first, so this fallback is a
+# conservative over-estimate — which is the safe direction for a FLOOR.
 ARB_GAS_FALLBACK_UNITS = 600_000
 
 
@@ -2343,6 +2348,271 @@ def cmd_arb_analyze(args) -> int:
     return 0
 
 
+def cmd_arb_preflight(args) -> int:
+    """
+    Ask the live chain every question whose wrong answer costs money. Sends none.
+
+    Order matters: the survey gate is judged first because it is the one that can
+    make every other answer irrelevant, then the deployment, then the wallet, then
+    the venues and tokens the transaction will actually touch.
+
+    Nothing here is a substitute for the fork suite — that proves the contract
+    behaves. This proves the WORLD is what the contract will be pointed at.
+    """
+    import json as _json
+
+    from arb.compiler import CompileError, load_build
+    from arb.deployer import gas_price_wei
+    from arb.executor import checksum
+    from arb.preflight import (Check, FAIL, PASS, SKIP, WARN, base_fee_headroom,
+                               expected_entrypoints, gas_affordability, gas_price_sanity,
+                               gate_one, missing_entrypoints, rollout, sort_for_display)
+    from config import token_address, venues_for
+    from dex.fetcher import ChainReader, UniswapV3Reader, contract_factory
+
+    settings = Settings()
+    _apply_overrides(args, settings)
+    # A preflight is about a NETWORK's readiness, and the CLI's global default
+    # pair is ETH/USDT (Ethereum). On a BSC network that default is simply wrong:
+    # it fails on a token that does not exist there and buries the real findings
+    # under noise. Default to the pair this deployment actually trades.
+    net_key = str(settings.network)
+    if not getattr(args, "base", None) and net_key.startswith("bsc"):
+        settings.base_symbol = "WBNB"
+    if not getattr(args, "quote", None) and net_key.startswith("bsc"):
+        settings.quote_symbol = "USDT"
+    print(fmt.banner(f"ARB  ·  preflight on {settings.network}"))
+    print(fmt.dim("  nothing is signed or sent by this command"))
+
+    checks: list = []
+    payload: dict = {"network": settings.network}
+
+    net, provider = _connect(settings)
+    w3 = provider.w3
+    payload["chain_id"] = net.chain_id
+    payload["block"] = int(w3.eth.block_number)
+    from web3 import Web3
+
+    # ---- gate 1: the market, judged from the collected evidence ---------------
+    try:
+        import glob as _glob
+        from pathlib import Path as _Path
+
+        from arb.survey_report import analyze as _analyze, load_rows as _load_rows
+
+        logs = sorted(_glob.glob(str(_Path(args.logs_dir) / "*survey*.jsonl")))
+        all_rows = _load_rows([_Path(p) for p in logs])
+        # Judge the gate only on rows from THIS network. Evidence gathered on
+        # BSC mainnet says nothing about BSC testnet's liquidity, and mixing them
+        # would let a mainnet run decide a testnet question — or worse, hide an
+        # empty testnet log behind a busy mainnet one.
+        rows = [r for r in all_rows if r.get("network") == str(settings.network)]
+        skipped = len(all_rows) - len(rows)
+        report = _analyze(rows, file_count=len(logs))
+        if skipped:
+            print(fmt.dim(f"  ({skipped} survey row(s) from other networks ignored "
+                          f"for the market gate)"))
+        best_label, best = "", None
+        if report["by_direction"]:
+            best_label, best = max(
+                report["by_direction"].items(),
+                key=lambda kv: kv[1]["net_median"] if kv[1]["net_median"] is not None else -1e9)
+        checks.append(gate_one(report["verdict"]["state"], report["verdict"]["text"],
+                               report["graded"], best_label,
+                               best["net_median"] if best else None))
+        payload["survey"] = {"state": report["verdict"]["state"],
+                             "rows": report["graded"],
+                             "best_group": best_label,
+                             "best_net_median": best["net_median"] if best else None}
+    except Exception as exc:                     # noqa: BLE001 - never block on logs
+        checks.append(Check("gate 1 · market", SKIP, f"could not read survey logs: {exc}"))
+
+    # ---- the compiled build, and the deployment that is supposed to match it --
+    try:
+        build = load_build(args.contract)
+        expected = expected_entrypoints(build.selector_map)
+    except CompileError as exc:
+        print(fmt.red(f"  {exc}"))
+        return 2
+
+    dep = _loaded_deployment(net.key, args.contract)
+    address = _contract_address(args, dep) if (args.address or dep) else ""
+    payload["contract"] = address or None
+
+    if not address:
+        checks.append(Check(
+            "deployment", FAIL,
+            f"no {args.contract} deployed on {net.key} is recorded",
+            fix=(f"python main.py arb deploy --network {net.key} "
+                 f"--private <relay-url>   (~$0.06 of gas at market price)"),
+        ))
+    else:
+        code = w3.eth.get_code(Web3.to_checksum_address(address)).hex()
+        payload["contract_bytes"] = (len(code) - 2) // 2
+        if len(code) <= 2:
+            checks.append(Check("deployment", FAIL, f"no bytecode at {address}",
+                                fix="redeploy; the address in state/ has nothing at it"))
+        else:
+            missing = missing_entrypoints(code, expected)
+            if missing:
+                checks.append(Check(
+                    "deployment is current", FAIL,
+                    f"{address} lacks {', '.join(missing)} — it is an OLDER BUILD",
+                    fix="redeploy the current contract; the recorded address is healthy "
+                        "looking but cannot execute today's calldata (this exact trap was "
+                        "found on the testnet contract on 2026-09-30)",
+                ))
+            else:
+                checks.append(Check("deployment is current", PASS,
+                                    f"{address} carries all "
+                                    f"{len(expected)} required entrypoints"))
+            # owner: only the owner can run an arbitrage or withdraw, so an owner
+            # that is not the wallet this command signs with makes every later
+            # step a revert.
+            try:
+                from dex.fetcher import contract_factory as _cf
+                c = _cf(w3, address, build.abi)
+                owner = c.functions.owner().call()
+                payload["owner"] = owner
+                checks.append(Check("owner", PASS, f"{owner} owns the contract"))
+            except Exception as exc:              # noqa: BLE001
+                checks.append(Check("owner", WARN, f"could not read owner(): {exc}"))
+
+    # ---- the wallet that would sign ------------------------------------------
+    account = None
+    try:
+        account, wpath = _load_wallet(args)
+        payload["wallet"] = account.address
+        on_chain_owner = payload.get("owner")
+        if (address and on_chain_owner
+                and on_chain_owner.lower() != account.address.lower()):
+            checks.append(Check(
+                "wallet owns the contract", FAIL,
+                f"{account.address} is not the owner ({on_chain_owner})",
+                fix="sign with the owner key, or transfer ownership; a non-owner "
+                    "call reverts with NotOwner before doing anything",
+            ))
+        checks.append(gas_affordability(int(w3.eth.get_balance(account.address)),
+                                        args.gas_units, gas_price_wei(w3), args.attempts))
+    except (SystemExit, Exception):               # noqa: BLE001
+        checks.append(Check("wallet funded", SKIP, "no wallet configured or unreadable",
+                            fix="python main.py wallet new --network bsc"))
+
+    # ---- gas economics --------------------------------------------------------
+    try:
+        market = int(w3.eth.gas_price)
+        payload["gas_price_market_wei"] = market
+        configured = gas_price_wei(w3)
+        payload["gas_price_used_wei"] = configured
+        checks.append(gas_price_sanity(configured, market))
+        base_fee = None
+        try:
+            latest = w3.eth.get_block("latest")
+            base_fee = latest.get("baseFeePerGas")
+        except Exception:                          # noqa: BLE001
+            pass
+        checks.append(base_fee_headroom(configured, base_fee))
+    except Exception as exc:                       # noqa: BLE001
+        checks.append(Check("gas price", SKIP, f"could not read gas price: {exc}"))
+
+    # ---- the venues and tokens the transaction touches -----------------------
+    base_sym = settings.base_symbol.upper()
+    quote_sym = settings.quote_symbol.upper()
+    venues = venues_for(net.key)
+    reader = ChainReader(provider, net)
+    for venue in venues:
+        if not venue.router:
+            checks.append(Check(f"venue {venue.key}", WARN, "no router configured",
+                                fix="add one to config.VENUES"))
+            continue
+        try:
+            router_code = w3.eth.get_code(Web3.to_checksum_address(venue.router)).hex()
+        except Exception as exc:                   # noqa: BLE001
+            checks.append(Check(f"venue {venue.key}", FAIL, f"router unreadable: {exc}"))
+            continue
+        if len(router_code) <= 2:
+            checks.append(Check(f"venue {venue.key}", FAIL,
+                                f"no bytecode at router {venue.router}"))
+            continue
+        if venue.version == "v3":
+            # A resolved pool is the only proof the factory is a real V3 factory:
+            # a wrong address that happens to have code answers getPool() with
+            # zeros, and a zero answer looks exactly like "tier not deployed".
+            try:
+                bound = UniswapV3Reader(reader, venue=venue)
+                resolved = bound.pool_for_fee(token_address(net, base_sym),
+                                              token_address(net, quote_sym),
+                                              venue.fee_tiers[0])
+                if resolved:
+                    checks.append(Check(f"venue {venue.key}", PASS,
+                                        f"router live, {venue.fee_tiers[0]} tier resolves "
+                                        f"to {resolved}"))
+                else:
+                    checks.append(Check(
+                        f"venue {venue.key}", WARN,
+                        f"router live but no {base_sym}/{quote_sym} pool at tier "
+                        f"{venue.fee_tiers[0]}",
+                        fix="the planner will skip this venue; check the factory address"))
+            except Exception as exc:               # noqa: BLE001
+                checks.append(Check(f"venue {venue.key}", WARN, f"pool probe failed: {exc}"))
+        else:
+            checks.append(Check(f"venue {venue.key}", PASS, f"router live at {venue.router}"))
+
+    for symbol in (base_sym, quote_sym):
+        try:
+            addr = token_address(net, symbol)
+            code = w3.eth.get_code(Web3.to_checksum_address(addr)).hex()
+            if len(code) <= 2:
+                checks.append(Check(f"token {symbol}", FAIL, f"no bytecode at {addr}"))
+            else:
+                decimals = reader.decimals(addr)
+                checks.append(Check(f"token {symbol}", PASS,
+                                    f"{addr}, {decimals} decimals"))
+        except Exception as exc:                   # noqa: BLE001
+            checks.append(Check(f"token {symbol}", FAIL, f"unusable: {exc}"))
+
+    # ---- how a trade would be submitted -------------------------------------
+    if args.private:
+        from arb.deployer import probe_relay
+        reachable, note = probe_relay(args.private)
+        payload["relay"] = {"url": args.private, "reachable": reachable, "note": note}
+        if reachable:
+            checks.append(Check("submission relay", PASS, f"{args.private} — {note}"))
+        else:
+            checks.append(Check("submission relay", FAIL, f"{args.private} — {note}",
+                                fix="fix the URL or drop --private; the deployer refuses "
+                                    "to fall back to the public mempool on its own"))
+    else:
+        checks.append(Check(
+            "submission path", WARN, "no --private relay: broadcasts would go to the "
+                                     "public mempool",
+            fix="add --private <relay-url> for anything competitive; see "
+                "docs/ev-private-memo.md"))
+
+    # ---- report ---------------------------------------------------------------
+    checks = sort_for_display(checks)
+    status, headline = rollout(checks)
+    colour = {PASS: fmt.green, WARN: fmt.yellow, FAIL: fmt.red, SKIP: fmt.dim}[status]
+    print(fmt.cyan("\n  CHECKS"))
+    for c in checks:
+        mark = {PASS: fmt.green("PASS"), WARN: fmt.yellow("WARN"),
+                FAIL: fmt.red("FAIL"), SKIP: fmt.dim("SKIP")}[c.status]
+        print(f"    {mark}  {c.name:<24} {c.detail}")
+        if c.fix and c.status in (FAIL, WARN):
+            print(f"          {'':<24} {fmt.dim('-> ' + c.fix)}")
+    print()
+    print(f"  {colour(status)}  {headline}")
+    payload["status"] = status
+    payload["checks"] = [{"name": c.name, "status": c.status, "detail": c.detail,
+                          "fix": c.fix} for c in checks]
+    if args.json_out:
+        print(_json.dumps(payload, indent=2, default=str))
+    print()
+    # NO-GO for a trade still exits 0 for a deploy/status workflow, but a caller
+    # scripting decisions wants the difference, so FAIL is exit 1.
+    return 1 if status == FAIL else 0
+
+
 def cmd_arb_status(args) -> int:
     from arb.compiler import load_build
     from config import token_address
@@ -2679,6 +2949,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", dest="json_out", action="store_true",
                     help="emit the report as JSON instead of text")
     ap.set_defaults(func=cmd_arb_analyze)
+
+    ap = asub.add_parser("preflight",
+                         help="check everything real execution depends on "
+                              "(market, deployment, wallet, venues, relay) — sends nothing")
+    common(ap)
+    wallet_flags(ap)
+    ap.add_argument("--contract", default="FlashArb")
+    ap.add_argument("--address", help="contract address (default: the recorded deployment)")
+    ap.add_argument("--private", metavar="URL", default=None,
+                    help="private/MEV-protected relay to check reachability of, e.g. "
+                         "https://bsc.blockrazor.xyz")
+    ap.add_argument("--attempts", type=int, default=3,
+                    help="how many attempts the wallet should be able to afford (default 3). "
+                         "Measured round trips on a BNB Chain fork 2026-09-30: 350,338 gas "
+                         "(V2-first) and 286,804 (V3-first), so --gas-units 400000 is a "
+                         "tighter affordability test than the 600000 default")
+    ap.add_argument("--logs-dir", default="logs", help="where the survey logs live")
+    ap.set_defaults(func=cmd_arb_preflight)
 
     ap = asub.add_parser("status", help="check the deployment and what it holds")
     common(ap)

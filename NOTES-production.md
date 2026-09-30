@@ -413,3 +413,73 @@ are reported as their own group rather than dropped or assigned one.
 The readiness rules are unchanged and still gated on this: a positive survey
 median sustained across a week, then a mainnet deploy + source verify, then a
 micro-drill at 0.1–1 USDT.
+
+
+---
+
+## The real-execution path — what was missing, 2026-09-30
+
+"Ready to execute" turned out to be two gaps, neither of them contract logic.
+
+### 1. A deployment check that cannot be fooled by a stale address
+
+The BSC testnet contract was still the **pre-direction build** hours after the
+direction work was finished: it contained `7aa04fe9` (the old `arbitrage()`) and
+had no `uniswapV3FlashCallback`. `arb status` called it healthy, correctly — there
+WAS code at the address. The code was just a generation out of date, and the next
+`--execute` would have failed on chain.
+
+`arb preflight` now reads the **runtime bytecode at the recorded address** and
+looks for the selectors the current source produces, derived from the compiled ABI
+rather than hard-coded — because `arbitrage`'s selector changed twice today, and a
+stale constant would silently check for the wrong thing.
+
+```
+FAIL  deployment is current  0xFeD78A65… lacks arbitrage((...)), uniswapV3FlashCallback(…)
+```
+
+### 2. Every other question whose wrong answer costs money
+
+In one command, none of them signing anything: the market gate (from the survey
+logs, scoped to the network being checked), wallet funding for three attempts and
+actual ownership of the contract, configured vs market gas price, base-fee
+headroom, router bytecode, V3 factory resolution to a real pool, token decimals,
+and relay reachability.
+
+The gas-price check earns its place: the bot's default is 2 gwei while BSC trades
+near 0.05, a 40x overpay that nothing else can report, because every number
+downstream — including the profit floor — is computed consistently from the price
+you configured.
+
+### 3. Measured costs, replacing assumptions
+
+`scripts/upgrade_proof.py` deploys the current artifact to a fresh mainnet fork and
+exercises both directions against real pools:
+
+| | gas |
+|---|---|
+| V2-first round trip | 350,338 |
+| V3-first round trip | 286,804 |
+| deploy | 1,962,419 |
+
+The floor uses a live `estimateGas` at execution time, so these are what it will
+price; the 600,000-unit fallback applies only when there is no contract to simulate
+against, and over-estimating a floor is the safe direction.
+
+The script also reproduced, in its own first draft, the 2×-fee error that made an
+earlier survey look positive: with no exact-output quote for a V3 leg 1, the loan
+is sized from a sell quote and the live edge printed as **+25.85 bps**. With the
+honest quote the same block is **−5.72**. The tool now passes the real buy cost for
+both directions, which is the same fix `main.py` carries — applied to the code that
+reports the numbers, because a proof script that flatters its own output is worse
+than none.
+
+### 4. The procedure, written down
+
+`docs/real-execution-runbook.md`: dedicated wallet funded with 0.01 BNB (≈300
+attempts), fork rehearsal, deploy through a private relay (~0.000098 BNB), then a
+micro-drill at **0.1 USDT** — and only then the size-up ladder, one row at a time.
+
+Gate 1 is still the market, and it is still shut: median net **−14.85 bps**, 0% of
+rows clearing their costs. Everything above is preparation for the hour that
+changes.

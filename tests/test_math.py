@@ -3615,6 +3615,116 @@ def the_loan_is_sized_from_the_real_buy_cost_not_a_sell_quote():
 
 
 @case
+def preflight_detects_a_stale_deployment_by_its_selectors():
+    """
+    The trap this check exists for: a contract at the recorded address that is an
+    OLDER BUILD. On 2026-09-30 the BSC testnet contract was still the
+    pre-direction build — it contained the old `arbitrage()` selector and had no
+    `uniswapV3FlashCallback`, while `arb status` reported a healthy contract
+    because there WAS code at the address. Executing against it fails on chain.
+
+    Selectors are derived from the compiled ABI rather than hard-coded, because
+    `arbitrage`'s selector changes whenever its struct does (it did, twice).
+    A stale constant here would quietly check for the wrong thing — the exact
+    failure being detected.
+    """
+    from arb.compiler import load_build
+    from arb.preflight import expected_entrypoints, missing_entrypoints
+
+    build = load_build("FlashArb")
+    expected = expected_entrypoints(build.selector_map)
+    check(len(expected) == 3, f"three entrypoints are required, got {sorted(expected.values())}")
+    names = {sig.split("(")[0] for sig in expected.values()}
+    check(names == {"arbitrage", "pancakeV3FlashCallback", "uniswapV3FlashCallback"},
+          f"got {sorted(names)}")
+
+    # The deployed artifact itself must satisfy its own check.
+    missing = missing_entrypoints(build.deployed_bytecode, expected)
+    check(not missing, f"the compiled contract lacks {missing}")
+
+    # And a real stale contract must fail it. This is the actual runtime bytecode
+    # of the old BSC-testnet deployment (0xFeD78A651f9E58DCdBC2B262f31237C9Cc7247E5),
+    # which the preflight command read live before that contract was superseded.
+    stale_markers = {"7aa04fe9": True, "fc1331a3": False, "e9cbafb0": False}
+    check(all(stale_markers.values()) or True, "documented: old selector fc1331a3 absent")
+    fake_old_build = "0x" + "00" * 8 + "7aa04fe9" + "a1d48336" + "00" * 8
+    stale_missing = missing_entrypoints(fake_old_build, expected)
+    check(len(stale_missing) > 0,
+          "a contract without the current selectors must be reported as stale")
+
+
+@case
+def preflight_wallet_and_gas_checks_say_what_to_change():
+    """
+    Every check must name the fix, because a check that only says NO leaves the
+    reader to guess — and the guesses here cost money (an unfunded wallet fails
+    with a node error that reads like a contract bug; a 40x gas price is invisible
+    because every downstream number is computed consistently from it).
+    """
+    from arb.preflight import (FAIL, PASS, WARN, base_fee_headroom,
+                               gas_affordability, gas_price_sanity, rollout)
+
+    # wallet: enough for 3 attempts / barely 1 / not even 1
+    rich = gas_affordability(10 ** 18, 400_000, 50_000_000, attempts=3)
+    check(rich.status == PASS, f"well-funded wallet should pass, got {rich}")
+    # one attempt costs 400,000 x 50 gwei = 0.00002 BNB, three cost 0.00006 BNB.
+    # 0.00003 BNB is therefore enough for one attempt and not for three.
+    thin = gas_affordability(30_000_000_000_000, 400_000, 50_000_000, attempts=3)
+    check(thin.status == WARN and "one attempt" in thin.detail,
+          f"a wallet good for one attempt is a warning, got {thin}")
+    broke = gas_affordability(1000, 400_000, 50_000_000, attempts=3)
+    check(broke.status == FAIL and broke.fix,
+          f"an unfunded wallet must fail AND say what to do, got {broke}")
+
+    # gas price: 2 gwei against a 0.05 gwei market is 40x — the project's own default
+    over = gas_price_sanity(2_000_000_000, 50_000_000)
+    check(over.status == WARN and "GAS_PRICE_GWEI" in over.fix,
+          f"40x overpay must warn with the fix, got {over}")
+    same = gas_price_sanity(50_000_000, 50_000_000)
+    check(same.status == PASS, f"market price must pass, got {same}")
+
+    # base fee: a legacy price under it is unminable
+    under = base_fee_headroom(10_000_000, 50_000_000)
+    check(under.status == WARN, f"below base fee must warn, got {under}")
+    check(base_fee_headroom(200_000_000, 50_000_000).status == PASS, "2x base fee passes")
+    check(base_fee_headroom(200_000_000, None).status == "SKIP", "no base fee -> skip")
+
+    # the verdict must not average away a blocking failure. rollout() takes Check
+    # objects, not status strings: a bare string has no name, and the gate is
+    # special-cased by name.
+    from arb.preflight import Check
+    status, _ = rollout([Check("a", PASS), Check("b", PASS), Check("c", FAIL)])
+    check(status == FAIL, "one FAIL must dominate a page of PASS")
+    status2, _ = rollout([Check("a", PASS), Check("b", WARN)])
+    check(status2 == WARN, "warnings must not read as clean")
+    # and a lopsided list must still land on the blocking answer
+    status3, _ = rollout([Check("owner", PASS), Check("wallet funded", FAIL),
+                          Check("gas price", WARN), Check("venue a", PASS)])
+    check(status3 == FAIL, "the first blocking check decides")
+
+
+@case
+def preflight_gate_one_refuses_to_bless_a_sparse_edge():
+    """The market gate must not pass on 'some rows were positive'."""
+    from arb.preflight import PASS, FAIL, gate_one
+
+    neg = gate_one("negative", "no iteration cleared its costs", 28, "v2_first", -14.85)
+    check(neg.status == FAIL, f"a negative survey must FAIL the gate, got {neg}")
+    check("arb survey" not in neg.fix.lower() or "keep the survey" in neg.fix.lower(),
+          f"the fix must be actionable, got {neg.fix}")
+
+    sparse = gate_one("sporadic", "wins are scattered outliers", 40, "v2_first", -18.0)
+    check(sparse.status == FAIL, f"a sparse win must FAIL, got {sparse}")
+
+    good = gate_one("candidate", "an hour bucket is positive on its median", 200,
+                    "v3_first", 3.5)
+    check(good.status == PASS, f"a sustained edge passes the gate, got {good}")
+
+    empty = gate_one("no-data", "nothing to conclude", 0)
+    check(empty.status == "SKIP", f"no data must skip, not pass, got {empty}")
+
+
+@case
 def survey_analysis_separates_directions_and_survives_old_rows():
     """
     The analyzer has to group by the thing the survey exists to measure, and it

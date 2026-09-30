@@ -452,6 +452,10 @@ python main.py arb survey --network bsc --base WBNB --quote USDT --size 1
                                                      # iteration to logs/arb_survey.jsonl
 python main.py arb analyze                           # read those logs: which direction, venue
                                                      # pair and size the edge is in — files only
+python main.py arb preflight --network bsc --private https://bsc.blockrazor.xyz
+                                                     # every check that real money depends on:
+                                                     # market gate, deployment freshness, wallet,
+                                                     # venues, relay. Sends nothing.
 python main.py arb status --network bsc_testnet      # is it deployed, what does it hold
 python main.py arb withdraw --network bsc_testnet --token USDT --all --execute
 python main.py verify                                # cross-check maths against the chain
@@ -1017,6 +1021,44 @@ dropped or guessed at.
 
 `arb analyze --json` emits the same report for scripting.
 
+## Before real money — `arb preflight`
+
+One command asks the live chain every question whose wrong answer costs money, and
+answers GO or NO-GO without signing anything:
+
+```bash
+python main.py arb preflight --network bsc --private https://bsc.blockrazor.xyz
+```
+
+It checks, in the order that matters:
+
+- **the market gate** — reads the survey logs and refuses to bless a sparse win
+  (`negative` / `sporadic` both fail; only a sustained `candidate` passes)
+- **deployment freshness** — reads the runtime bytecode at the recorded address
+  for the selectors the CURRENT source produces. `arb status` cannot see this: a
+  contract can have code at its address and still be an older build that cannot
+  execute today's calldata. That is not hypothetical — on 2026-09-30 the BSC
+  testnet deployment was exactly that, and the check now names it:
+
+  ```
+  FAIL  deployment is current  0xFeD78A65… lacks arbitrage((...)), uniswapV3FlashCallback(…)
+                               — it is an OLDER BUILD
+        -> redeploy the current contract
+  ```
+
+- **the wallet** — funded for three attempts, and that it actually OWNS the
+  contract (a non-owner call reverts with `NotOwner` before doing anything)
+- **gas economics** — configured vs market price (the 2 gwei default is 40x the
+  BSC market, and nothing downstream can tell you that), and base-fee headroom
+- **venues and tokens** — each router has code, each V3 factory resolves a real
+  pool for the pair, each token has decimals
+- **submission path** — with `--private <relay>`, probes the relay for a live
+  block number before you rely on it; without it, warns that broadcasts would be
+  public
+
+Then the procedure itself — deploy, micro-drill at 0.1 USDT, and the size-up
+ladder — is in **`docs/real-execution-runbook.md`**.
+
 ## Configuration
 
 Everything lives in `config.py` (addresses, networks, thresholds) and `.env`
@@ -1168,6 +1210,7 @@ trying/
 │   ├── compiler.py             compiles that file from Python via py-solc-x
 │   ├── deployer.py             gas estimate, affordability check, sign, revert decoding
 │   ├── executor.py             scan -> exact calldata; both leg directions; slippage floors
+│   ├── preflight.py            GO/NO-GO checks: stale deployments, wallet, gas, market gate
 │   ├── survey_report.py        reads the survey JSONL logs -> where the edge lives
 │   ├── signals.py              gas costing and the trade/no-trade decision
 │   └── wallet.py               encrypted testnet keystore; refuses non-ignored paths
@@ -1176,8 +1219,11 @@ trying/
 ├── wallets/                    YOUR encrypted keystore (gitignored, never committed)
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
+├── scripts/
+│   └── upgrade_proof.py        deploy the current artifact to a mainnet fork and exercise both
+│                               directions end to end, with the runbook hygiene a real deploy needs
 └── tests/
-    ├── test_math.py            101 offline tests — no network, no dependencies
+    ├── test_math.py            104 offline tests — no network, no dependencies
     └── test_fork.py            9 tests against a BNB Chain mainnet fork (needs Foundry)
 ```
 

@@ -499,6 +499,42 @@ def _send_raw_private(submit_url: str, raw) -> Any:
     return result
 
 
+def probe_relay(url: str, timeout: float = 12.0) -> tuple:
+    """
+    (reachable, note) for a private/MEV-protected submission endpoint.
+
+    Asks the relay for `eth_blockNumber` — the cheapest question a JSON-RPC
+    endpoint can be asked, and one that does not submit anything. A relay that
+    answers this will accept a raw transaction; one that does not will fail at the
+    worst possible moment, after the transaction is signed and the market has
+    moved.
+
+    Checked BEFORE signing ever happens, because the alternative is discovering a
+    typo in the URL at the moment of submission — with `_send_raw_private` then
+    refusing to fall back to the public mempool, which is correct behaviour and
+    still leaves a wasted signing round and a stale plan.
+    """
+    import requests
+
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "eth_blockNumber", "params": []}
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 - any transport failure is "unreachable"
+        return False, f"unreachable: {type(exc).__name__}: {exc}"
+
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code} from the relay"
+    try:
+        body = resp.json()
+    except ValueError:
+        return False, f"answered with non-JSON ({resp.text[:80]!r})"
+    if isinstance(body, dict) and body.get("result"):
+        height = int(str(body["result"]), 16)
+        return True, f"live, head block {height:,}"
+    err = (body or {}).get("error") if isinstance(body, dict) else None
+    return False, f"answered without a block number: {err or body!r}"
+
+
 def send_and_wait(w3, account, tx: Dict[str, Any], timeout: int = 240,
                   abi: Optional[list] = None,
                   submit_url: Optional[str] = None) -> Dict[str, Any]:
