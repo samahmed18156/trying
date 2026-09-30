@@ -1,0 +1,2816 @@
+diff --git a/NOTES-production.md b/NOTES-production.md
+index db5646e..71834f2 100644
+--- a/NOTES-production.md
++++ b/NOTES-production.md
+@@ -232,6 +232,64 @@ can never disagree. Now: **94/94 offline, 2 passed under pytest.**
+ * **Key management at size.** The owner key can withdraw everything the contract
+   ever holds. Do not let that key's exposure exceed the drill.
+ 
++---
++
++# Update — 2026-09-30, after the push
++
++The upgrade was pushed to `master` (commit `8441738`) and verified byte-identical
++to the audited copy: all 10 files match, nothing extra, nothing missing. **The
++code on GitHub is the code that was tested.** No mainnet deployment exists yet
++(`state/` holds only `bsc_testnet`).
++
++## Fresh measurement: the edge got worse, and the reason is the leg shape
++
++Four more live iterations, same pair and size:
++
++| | gross bps | net bps | clears |
++|---|---|---|---|
++| 2026-09-30 (blk 124859452–124859755) | −44.3, −47.3, −47.5, −48.6 | −61.2 … −65.5 | **0 of 4** |
++
++Then a test of the one structural variable nobody had questioned: the contract is
++hard-wired to **buy on V2, sell on V3**. Measured on the same scan:
++
++```
++mids: PancakeSwap V2 762.1274   cheapest V3 (0.01%) 760.2967
++      -> V2 sits 24.1 bps ABOVE V3
++
++A: buy V2 (25bp fee) -> sell V3 (1bp fee)   [the contract's shape]
++     gross -53.21 bps    net -58.21 bps
++B: buy V3 (1bp fee)  -> sell V2 (25bp fee)  [the mirror shape]
++     gross  -5.31 bps    net -10.31 bps
++```
++
++**Direction B is ~48 bps better than direction A, and still loses money.**
++Two conclusions, both important:
++
++1. **The current leg shape is the wrong way round in today's market** by roughly
++   48 bps. That is why the measured shortfall is so large rather than marginal.
++2. **Even the better direction is negative (−5 bps gross), and that is
++   informative rather than unlucky.** V2's price sits ~24 bps above the V3 pools
++   — almost exactly V2's 25 bps fee. That is what an efficient market looks like:
++   the cross-venue spread equals the fee you pay to cross it. There is no free
++   money in WBNB/USDT on this pair in either direction right now.
++
++Do NOT read (1) as "shipping the mirror shape unlocks profit". It removes a
++structural 48 bps handicap; it does not create an edge. It was a contract change
++rather than a config flag — `FlashArb.sol` had leg 1 fixed as a V2-style
++`swapExactTokensForTokens` and leg 2 as a V3-style `exactInputSingle` — and it
++was implemented later the same day; see "Leg direction" below.
++
++## What "real execution" would cost today
++
++| | at 2 gwei (bot's default) | at 0.05 gwei (BSC market, `GAS_PRICE_GWEI=0.05`) |
++|---|---|---|
++| one `arbitrage()` attempt, 600k gas | 0.0012 BNB (~$0.91) | 0.00003 BNB (~$0.02) |
++| mainnet deploy, ~1.6M gas | 0.0032 BNB (~$2.43) | — |
++
++With the floor enforced, an attempt on today's market **reverts** — so that gas
++buys a revert, not a trade. Which is the correct behaviour and the reason the
++drill is pointless until the survey turns positive.
++
+ ## Standing rules
+ 
+ 1. The contract's profit check is the only protection that counts; everything
+@@ -244,3 +302,114 @@ can never disagree. Now: **94/94 offline, 2 passed under pytest.**
+    to `arb/`, `config.py`, or `contracts/`.
+ 5. If the survey shows positive net bps, believe it only after it survives a
+    different size (`--size 0.1` and `--size 10`) and a different hour.
++
++
++---
++
++## Leg direction — implemented 2026-09-30 (after the section above)
++
++The 48 bps finding above stopped being a note and became a change: the contract
++now runs EITHER leg order, and the planner prices both on every scan and takes
++the better one. This section is what it cost and what it proved.
++
++### What changed
++
++| file | change |
++|---|---|
++| `contracts/FlashArb.sol` | `ArbParams{v3First, v3Leg1Pool}`; leg bodies split by direction inside the callback; `_swapV3()` shared by either leg; `_requirePool()` validates leg 1's pool (pair + fee, and it must not be the lending pool); new errors `Leg1PoolIsFlashPool`, `V3Leg1PoolMismatch`; `uniswapV3FlashCallback` added alongside `pancakeV3FlashCallback` |
++| `arb/executor.py` | `plan_best_direction()` builds and compares both directions by NET bps (the two can borrow at different tiers, so gross is not comparable); venue-aware `pool_for_fee_for_venue` / `pool_for_fee_any_venue`; loan sized from leg 1's real buy cost whichever leg it is |
++| `dex/fetcher.py` | `UniswapV3Reader.buy_cost_raw()` — exact-output V3 quote, so a V3 leg-1 is sized the same way a V2 leg-1 was |
++| `main.py` | DIRECTION block in `arb plan` / `arb run` / survey; survey rows carry `direction` and both directions' `gross_bps`/`net_bps`; new `arb analyze` |
++| `arb/survey_report.py` | **new** — reads the survey logs and reports where the edge lives (direction, venue pair, size, persistence) |
++| `tests/test_fork.py` | mirror-direction test on real pools, leg-1-pool guard, and a forced UNISWAP-V3 lender test; 6 → 9 tests |
++
++### Three bugs, all caught by the fork suite rather than by review
++
++1. **The entry check was direction-blind.** `arbitrage()` validated
++   `v2Path[0] == borrowToken` unconditionally — correct for V2-first, where the
++   V2 leg buys with the borrowed token, and wrong for the mirror, where that leg
++   SELLS into it and therefore ends at the borrow token instead. Every V3-first
++   plan reverted with `PathEndpointsMismatch` before a single swap ran. Fixed by
++   testing whichever end of the path the direction puts on the borrow token.
++2. **The venue-aware resolvers never reached the planner.** `plan_best_direction`
++   takes them as NAMED parameters, so they were not part of its `**kwargs` and
++   were silently dropped on the way to `plan_arbitrage`. Plans still built — they
++   just resolved pools through the generic single-venue resolver, which cannot
++   see Uniswap's 0.30% tier, leaving leg 1's pool EMPTY. The contract refused it
++   with `ZeroAddress`. Fixed by forwarding them explicitly, with an offline test
++   that fails if the leg-1 pool is empty for a tier only the leg's venue deploys.
++3. **The skew fixtures leaked state between tests.** Each scaled one reserve of
++   the same pair and never wrote it back, so a later fixture re-skewed an
++   already-skewed pair — 0.98× on both sides cancels out, leaving a plan with no
++   edge whose legs failed on their own slippage floors. That reads like a
++   contract bug and is not one. Fixtures are now function-scoped, rebuild the
++   plan AFTER writing, and restore the pair on teardown.
++
++### Why the flash pool may now be a Uniswap pool, and the second callback
++
++Making the V3 leg's venue a choice made the LENDER's venue a choice too, because
++the loan is searched across the pair's fee tiers on every V3 venue. A Uniswap V3
++pool calls `uniswapV3FlashCallback`; Pancake's call `pancakeV3FlashCallback`.
++With only the Pancake entry point, borrowing from a Uniswap pool reverted with
++EMPTY returndata — the call matched no function, which reads like a broken pool
++rather than a missing one. Both entry points now share one private `_flashBody`,
++so the `_inFlash` and `msg.sender == params.pool` guards apply identically.
++
++Proven, not assumed: `test_univ3_lender_repays_through_uniswap_callback` forces
++the lender to the Uniswap V3 pool at the plan's tier and the round trip repays
++and profits. (The two callbacks are otherwise identical, including the fee
++formula `ceil(amount * pool.fee() / 1e6)`.)
++
++### Where the two directions stand now
++
++Measured live, same block, WBNB/USDT, size 1 (DIRECTION block of `arb plan`):
++
++| block | V2-first gross | V3-first gross | chosen |
++|---|---|---|---|
++| 124867668, `GAS_PRICE_GWEI=0.05` | −12.07 bps (net −17.07) | −38.48 bps (net −39.48) | V2-first |
++| earlier, 2 gwei | −38.85 bps | −9.54 bps | V3-first |
++
++**The direction flips with the market.** Which is the whole argument for pricing
++both per scan instead of hard-wiring either: the "wrong way round" finding above
++was a snapshot, not a law. Both directions are still negative at both
++snapshots — an efficient market, as recorded.
++
++### Gas at market price changes the shortfall materially
++
++The earlier survey rows used the bot's 2 gwei default while BSC's market sat at
++0.05 gwei, which overstated the shortfall by ~16 bps. At market:
++
++| size | gross median | net median | rows |
++|---|---|---|---|
++| 1 WBNB | −22.8 bps | −39.8 bps | 12 (mixed gas, pre-change rows included) |
++| 1 WBNB, market gas only | −13.2 bps | −14.5 bps | the first post-change rows |
++
++Still negative, but roughly 25 bps closer to tradeable than the pre-change log
++implied. **Any survey run for evidence must set `GAS_PRICE_GWEI=0.05`**, or the
++verdict is measuring a gas price nobody pays.
++
++### The evidence loop, running
++
++```bash
++# two sizes, market gas, six hours, appended to the JSONL logs
++GAS_PRICE_GWEI=0.05 python main.py arb survey --network bsc --base WBNB \
++    --quote USDT --size 1 --iterations 5000 --interval 5 --duration 21600 \
++    --log logs/arb_survey.jsonl
++GAS_PRICE_GWEI=0.05 python main.py arb survey --network bsc --base WBNB \
++    --quote USDT --size 5 --iterations 5000 --interval 10 --duration 21600 \
++    --log logs/arb_survey_size5.jsonl
++
++python main.py arb analyze          # where the edge lives: direction, venue pair, size, persistence
++```
++
++`arb analyze` reads files only — no node, no wallet. It groups by direction,
++venue pair, size and hour, reports medians and the share of rows that clear
++costs, and returns one of three verdicts: **negative** (nothing cleared),
++**sporadic** (wins scattered around a negative median — the answer that must not
++be read as a green light) or **candidate** (an hour-bucket positive on its
++median, with enough rows behind it). Rows written before directions were logged
++are reported as their own group rather than dropped or assigned one.
++
++The readiness rules are unchanged and still gated on this: a positive survey
++median sustained across a week, then a mainnet deploy + source verify, then a
++micro-drill at 0.1–1 USDT.
+diff --git a/README.md b/README.md
+index f265cc2..0b45207 100644
+--- a/README.md
++++ b/README.md
+@@ -447,6 +447,11 @@ python main.py arb deploy --network bsc_testnet      # deploy it, record the add
+ python main.py arb plan  --network bsc_testnet       # show the exact trade, send nothing
+ python main.py arb run   --network bsc_testnet       # dry run: plan + gas estimate
+ python main.py arb run   --network bsc_testnet --execute   # actually broadcast
++python main.py arb survey --network bsc --base WBNB --quote USDT --size 1
++                                                     # dry-run the planner in a loop, log every
++                                                     # iteration to logs/arb_survey.jsonl
++python main.py arb analyze                           # read those logs: which direction, venue
++                                                     # pair and size the edge is in — files only
+ python main.py arb status --network bsc_testnet      # is it deployed, what does it hold
+ python main.py arb withdraw --network bsc_testnet --token USDT --all --execute
+ python main.py verify                                # cross-check maths against the chain
+@@ -869,7 +874,7 @@ mismatch. It reads like a mystery failure in the pool or the tokens. This cost a
+ deployment to find, and it was found by simulating with `eth_call` before spending
+ gas on the real thing.
+ 
+-### Why the flash loan cannot come from the pool leg 2 swaps through
++### Why the flash loan cannot come from the pool a V3 leg swaps through
+ 
+ A V3 pool's `flash()` takes the pool's reentrancy lock and holds it for the entire
+ callback:
+@@ -878,10 +883,12 @@ callback:
+ modifier lock() { require(!locked, 'LOK'); locked = true; _; locked = false; }
+ ```
+ 
+-The whole arbitrage runs inside that callback. So if leg 2's swap routes back into
+-the pool that lent the money, the router calls `swap()` on a pool that is still
++The whole arbitrage runs inside that callback. So if a swap routes back into the
++pool that lent the money, the router calls `swap()` on a pool that is still
+ locked, and it reverts with the three-character reason `LOK`. No ordering, sizing
+ or slippage setting avoids it — the two are mutually exclusive by construction.
++That applies to whichever leg is the V3 one, so it follows the direction: in
++V2-first it is leg 2, in V3-first it is leg 1.
+ 
+ The obvious design looks better and is impossible: borrow from the pool you also
+ sell into, so the capital and the sale net against each other in one place and the
+@@ -889,16 +896,38 @@ round trip needs no starting inventory. That netting can never happen, because t
+ sale cannot execute at all. This cost a deployment to find, since the plan looked
+ entirely reasonable on screen.
+ 
+-So the planner borrows from a **different tier of the same pair**. It still needs
++So the planner borrows from a **different pool of the same pair**. It still needs
+ no starting inventory, and because tiers carry different fees it is usually a
+ *cheaper* loan: `choose_flash_pool` walks the tiers from cheapest to dearest, skips
+-the one leg 2 uses, skips any that hold less of the borrow token than the loan, and
+-takes the first that survives. On testnet that moved the loan from the 0.05% pool to
+-the 0.01% pool and cut the flash fee five-fold.
++the pool the V3 leg trades through, skips any that hold less of the borrow token
++than the loan, and takes the first that survives. On testnet that moved the loan
++from the 0.05% pool to the 0.01% pool and cut the flash fee five-fold.
+ 
+ PancakeSwap V3 charges the flash fee at the **lending pool's own swap tier**, which
+ is why the tier choice is a direct cost and why the fee estimate can no longer be
+-read off the sell leg.
++read off the V3 leg.
++
++In V2-first the router derives the V3 pool from `(tokenIn, tokenOut, fee)`, so
++avoiding it is the planner's job. In V3-first the leg-1 pool is passed to the
++contract explicitly — the router would otherwise route through whichever pool it
++likes — and the contract **checks it**: the pool must report the exact pair and
++fee the router will use (a factory mints one pool per key, so the check cannot be
++satisfied by some other pool), and it must not be the pool that lent the tokens.
++A plan that breaks either rule reverts with `Leg1PoolIsFlashPool` or
++`V3Leg1PoolMismatch`, both legible, instead of surfacing as `LOK` from inside a
++router, which reads like a broken pool.
++
++### The flash pool's venue, and the second callback
++
++Making the V3 leg's venue a choice made the LENDER's venue a choice too: the loan
++is searched across every V3 venue that has a pool of this pair. A Uniswap V3 pool
++calls `uniswapV3FlashCallback`; Pancake's call `pancakeV3FlashCallback`. The
++contract implements both, sharing one private body so the `_inFlash` and
++`msg.sender == params.pool` guards apply identically. Before the second entry
++point existed, borrowing from a Uniswap pool reverted with **empty returndata** —
++the pool's call matched no function — which looks like a broken pool rather than a
++missing one. `tests/test_fork.py` forces a Uniswap lender and repays it, so this
++is proven rather than assumed.
+ 
+ ### Reading a revert that has already happened
+ 
+@@ -920,11 +949,25 @@ Python traceback only buries the explanation.
+ 
+ ### Two real constraints worth knowing
+ 
+-**Leg 1 must be a V2-style router and leg 2 a V3-style one.** That is what the
+-contract calls, so the planner picks the best venue *of each generation* rather
+-than the best venue overall. On testnet the cheapest buy was PancakeSwap V3
+-0.25%, but the contract cannot buy there — and the planner says so in a note
+-instead of quietly giving you a worse trade or refusing to plan at all.
++**Either leg can be V2 or V3 — the contract prices both orders and picks.** Leg
++order is not cosmetic: each leg pays its OWN venue's fee, so "buy on V2 at 25 bps
++and sell on V3 at 1 bp" is a different trade from its mirror, and on BNB Chain the
++two differed by **~48 bps** (V2-first −58 bps net, V3-first −10 bps net) at the
++same block. The planner builds both directions on every scan, compares them by
++**net** bps — they can borrow from pools at different tiers and therefore pay
++different loans — and reports both, so the choice is visible rather than implied
++by which venue the plan names:
++
++```
++  DIRECTION
++    CHOSEN  V2-first (buy V2, sell V3)     gross   -12.07 bps  net   -17.07 bps
++            V3-first (buy V3, sell V2)     gross   -38.48 bps  net   -39.48 bps
++```
++
++Which direction wins **flips with the market** — the two blocks above were hours
++apart — so neither is hard-wired. Within one generation the planner still picks
++the best venue of that generation, and says so in a note when the overall best
++venue is one the plan cannot use.
+ 
+ **On BSC testnet both legs are PancakeSwap**, because Uniswap V3 is not deployed
+ there. So a testnet run proves the flash mechanism, not a cross-DEX edge. The
+@@ -932,6 +975,48 @@ contract itself is venue-agnostic — it takes routers as arguments — so on BN
+ Chain mainnet the same code runs PancakeSwap V2 against Uniswap V3, which is the
+ pairing the brief asked for.
+ 
++## Proving the edge before risking anything — `arb survey` + `arb analyze`
++
++`arb survey` runs the planner in a loop and never signs or sends. Each iteration
++scans the venues, builds the plan `arb run` WOULD send, prices it exactly as
++`arb run` would (gas floor included), and appends one JSONL line — including both
++directions' gross and net bps, which direction was chosen, the buy/sell venues,
++the flash fee, the gas figure, and the notes explaining what would happen:
++
++```bash
++GAS_PRICE_GWEI=0.05 python main.py arb survey --network bsc --base WBNB \
++    --quote USDT --size 1 --iterations 5000 --interval 5 \
++    --duration 21600 --log logs/arb_survey.jsonl
++```
++
++Set `GAS_PRICE_GWEI` to the market price for evidence runs. The bot's default is
++2 gwei while BSC has been trading near 0.05; at the default the shortfall looks
++about 16 bps worse than the transaction would actually cost.
++
++`arb analyze` reads those logs — files only, no node, no wallet — and answers
++where the edge lives rather than whether one row was lucky:
++
++```
++  WHERE THE EDGE LIVES — by leg direction
++                                         rows   gross md     net md   net best     >0
++    v2_first                              620     -38.20     -57.10     -12.40   0.0%
++    v3_first                              580      -9.40     -10.20      +0.30   0.7%
++  by venue pair (buy -> sell)
++    Uniswap V3 0.30%  ->  PancakeSwap V2   210      -9.80     -10.40      +0.30   0.5%
++  over time (median net bps per hour, UTC)
++    ...
++  VERDICT (negative)
++```
++
++It groups by direction, venue pair, size and hour, and returns **negative**
++(nothing cleared its costs), **sporadic** (wins scattered around a negative
++median — the answer that must not be read as a green light) or **candidate** (an
++hour-bucket positive on its median, with enough rows behind it). Rows written
++before the survey logged a direction are reported as their own group rather than
++dropped or guessed at.
++
++`arb analyze --json` emits the same report for scripting.
++
+ ## Configuration
+ 
+ Everything lives in `config.py` (addresses, networks, thresholds) and `.env`
+@@ -1082,7 +1167,8 @@ trying/
+ ├── arb/
+ │   ├── compiler.py             compiles that file from Python via py-solc-x
+ │   ├── deployer.py             gas estimate, affordability check, sign, revert decoding
+-│   ├── executor.py             scan -> exact calldata; slippage floors; event decoding
++│   ├── executor.py             scan -> exact calldata; both leg directions; slippage floors
++│   ├── survey_report.py        reads the survey JSONL logs -> where the edge lives
+ │   ├── signals.py              gas costing and the trade/no-trade decision
+ │   └── wallet.py               encrypted testnet keystore; refuses non-ignored paths
+ ├── build/                      compiled artifacts (regenerated; gitignored)
+@@ -1091,7 +1177,8 @@ trying/
+ ├── examples/
+ │   └── quickstart.py           using DexPriceFetcher as a library
+ └── tests/
+-    └── test_math.py            84 offline tests — no network, no dependencies
++    ├── test_math.py            101 offline tests — no network, no dependencies
++    └── test_fork.py            9 tests against a BNB Chain mainnet fork (needs Foundry)
+ ```
+ 
+ `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`
+diff --git a/UPGRADE-2026-09-30.md b/UPGRADE-2026-09-30.md
+index d6486e3..c8f4224 100644
+--- a/UPGRADE-2026-09-30.md
++++ b/UPGRADE-2026-09-30.md
+@@ -41,12 +41,28 @@ Note: the patch is code and docs only. `logs/arb_survey*.jsonl` (the evidence
+ `NOTES-production.md` cites) are gitignored, so they are in the full tree but not
+ in the patch. `build/` is likewise not shipped — it regenerates on first compile.
+ 
++## Added later the same day: leg direction
++
++The mirror-direction finding in `NOTES-production.md` (the two leg orders differed
++by ~48 bps on live BSC) stopped being a note and became a change: the contract and
++planner now run EITHER direction and pick the better one per scan. Details and the
++three bugs it uncovered are in **`NOTES-production.md` → "Leg direction"**; the
++short version:
++
++| file | change |
++|---|---|
++| `contracts/FlashArb.sol` | `ArbParams{v3First, v3Leg1Pool}`; legs dispatched by direction; `uniSwapV3FlashCallback` added beside `pancakeV3FlashCallback` (both share `_flashBody`); leg-1 pool validated on chain (`Leg1PoolIsFlashPool`, `V3Leg1PoolMismatch`) |
++| `arb/executor.py` | `plan_best_direction()` compares both directions by NET bps; venue-aware pool resolution so a Uniswap V3 leg resolves through Uniswap's factory, not Pancake's |
++| `arb/survey_report.py` | **new** — `arb analyze`: which direction, venue pair, size and hour the edge is in, with negative/sporadic/candidate verdicts |
++| `main.py` | DIRECTION block in `arb plan` / `arb run` / survey; survey rows record both directions; new `arb analyze` command |
++| `tests/test_fork.py` | 6 → 9 tests: mirror direction on real pools, the leg-1-pool guard, and a forced Uniswap-V3 lender repaying through the second callback |
++
+ ## Verify it works
+ 
+ ```bash
+-python main.py selftest                    # 94/94 offline, no network
++python main.py selftest                    # 101/101 offline, no network
+ python -m pytest tests/ -q                 # 2 passed
+-python -m pytest tests/test_fork.py -q     # 6 passed (needs Foundry + archive RPC)
++python -m pytest tests/test_fork.py -q     # 9 passed (needs Foundry + archive RPC)
+ ```
+ 
+ Fork tests need `anvil`. They probe for a BNB RPC that can serve archive state
+diff --git a/arb/executor.py b/arb/executor.py
+index ac75688..bc98d15 100644
+--- a/arb/executor.py
++++ b/arb/executor.py
+@@ -71,6 +71,14 @@ class ArbPlan:
+     # empty data and no explanation.
+     v3_uses_deadline: bool = True
+ 
++    # Which generation runs leg 1 (the buy). False = the original V2-first
++    # direction; True = V3-first. Leg order is worth ~48 bps on BSC (measured),
++    # so it is chosen per scan by plan_best_direction rather than fixed.
++    v3_first: bool = False
++    # The V3 pool leg 1 swaps through when v3_first, validated on chain by the
++    # contract for (pair, fee) and required to differ from the lending pool.
++    v3_leg1_pool: str = ""
++
+     # Human-readable context, not sent on chain.
+     buy_label: str = ""
+     sell_label: str = ""
+@@ -126,21 +134,44 @@ class ArbPlan:
+             self.v3_params,
+             self.min_profit,
+             self.v3_uses_deadline,
++            self.v3_first,
++            self.v3_leg1_pool or "0x0000000000000000000000000000000000000000",
+         ),)
+ 
+     def describe(self) -> List[str]:
+-        """Lines for the CLI, in the order the transaction will do things."""
++        """
++        Lines for the CLI, in the order the transaction will do things.
++
++        Written for BOTH directions: leg 1 is whichever generation buys, so the
++        labels are derived from `v3_first` rather than hard-coded. Printing "leg
++        2 V3" for a V3-first plan would describe a transaction that is not the
++        one about to be sent — and this output is the last thing read before
++        signing.
++        """
++        v3_leg = "1" if self.v3_first else "2"
++        v2_leg = "2" if self.v3_first else "1"
++        v3_min = self.v3_amount_out_min
++        v2_min = self.v2_amount_out_min
+         out = [
++            f"direction  {'V3-first: buy on V3, sell on V2' if self.v3_first else 'V2-first: buy on V2, sell on V3'}",
+             f"borrow   {self.flash_amount:,} wei of the quote token from {self.pool}",
+             f"         a V3 pool at fee tier {self.flash_fee_pips}, deliberately NOT the "
+-            f"pool leg 2 swaps through (that one is locked for the whole flash)",
+-            f"leg 1    V2 {self.buy_label or 'router'}  {self.v2_router}",
+-            f"         path {' -> '.join(self.v2_path)}",
+-            f"         minimum out {self.v2_amount_out_min:,} wei",
+-            f"leg 2    V3 {self.sell_label or 'router'}  {self.v3_router}  fee {self.v3_fee}",
++            f"pool the V3 leg swaps through (that one is locked for the whole flash)",
++            f"leg {v3_leg}    V3 {self.buy_label if self.v3_first else self.sell_label}  "
++            f"{self.v3_router}  fee {self.v3_fee}",
+             f"         router ABI {'8-field exactInputSingle (with deadline)' if self.v3_uses_deadline else '7-field exactInputSingle (no deadline)'}",
+             f"         {self.v3_token_in} -> {self.v3_token_out}",
+-            f"         minimum out {self.v3_amount_out_min:,} wei",
++            f"         minimum out {v3_min:,} wei",
++            f"leg {v2_leg}    V2 {self.sell_label if self.v3_first else self.buy_label}  "
++            f"{self.v2_router}",
++            f"         path {' -> '.join(self.v2_path)}",
++            f"         minimum out {v2_min:,} wei",
++        ]
++        if self.v3_first:
++            out.insert(3,
++                       f"         leg-1 pool {self.v3_leg1_pool} — validated on chain for "
++                       f"(pair, fee) and required to differ from the lending pool")
++        out += [
+             f"repay    borrowed + flash fee (fee estimated at {self.expected_flash_fee:,} wei)",
+             f"require  profit >= {self.min_profit:,} wei or revert the whole transaction",
+         ]
+@@ -359,10 +390,14 @@ def best_leg(res: CrossScanResult, version: str, side: str) -> Optional[VenueQuo
+     raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
+ 
+ 
+-# Every tier PancakeSwap V3 deploys. Cheapest first is what matters: the flash
+-# fee is the pool's own tier, so a 0.01% pool lends 5x more cheaply than a 0.05%
+-# one for exactly the same capital.
+-DEFAULT_FLASH_FEE_TIERS: Tuple[int, ...] = (100, 500, 2500, 10000)
++# Every tier the V3 venues on this chain deploy. Cheapest first is what matters:
++# the flash fee is the pool's own tier, so a 0.01% pool lends 5x more cheaply
++# than a 0.05% one for exactly the same capital.
++#
++# 3000 is Uniswap V3's 0.30% tier and 2500 is PancakeSwap V3's 0.25%; the two
++# venues do NOT share a tier list, so the union is searched and any tier a given
++# venue does not deploy resolves to no address and is skipped with a reason.
++DEFAULT_FLASH_FEE_TIERS: Tuple[int, ...] = (100, 500, 2500, 3000, 10000)
+ 
+ 
+ def choose_flash_pool(
+@@ -441,6 +476,136 @@ def choose_flash_pool(
+     )
+ 
+ 
++def select_legs(res: CrossScanResult, buy_version: str = "v2",
++                sell_version: str = "v3") -> Tuple[VenueQuote, VenueQuote]:
++    """
++    Pick (buy, sell) for one direction, raising PlanError if either is missing.
++
++    Same selection `plan_arbitrage` performs, exposed so a caller can inspect the
++    chosen venues BEFORE planning — specifically, so it can probe the V3 router of
++    the venue THIS direction will actually use. The two directions need not pick
++    the same V3 venue (one wants the cheapest buy, the other the dearest sell),
++    and routers differ per venue, so probing once and reusing the answer for both
++    can send a router call with the wrong ABI shape.
++    """
++    buy = best_leg(res, buy_version, "buy")
++    sell = best_leg(res, sell_version, "sell")
++    if buy is None or sell is None:
++        missing = [v for v, q in ((buy_version, buy), (sell_version, sell)) if q is None]
++        present = sorted({q.version.upper() for q in res.usable})
++        raise PlanError(
++            f"no usable {'/'.join(missing).upper()} leg to build a route from. "
++            f"Usable legs on this scan: {present or 'none'}. "
++            f"This needs a {buy_version.upper()} venue to buy on and a "
++            f"{sell_version.upper()} venue to sell on. "
++            + (f"Every leg was rejected on depth — try a smaller --size or a higher "
++               f"--max-impact." if not res.usable else
++               f"Add the missing generation with --venues, or lower --max-impact.")
++        )
++    return buy, sell
++
++
++@dataclass
++class DirectionReport:
++    """One candidate direction and how it priced, for the CLI to print."""
++
++    direction: str                 # "v2_first" | "v3_first"
++    plan: Optional["ArbPlan"] = None
++    error: str = ""
++    net_bps: float = 0.0           # gross minus the flash fee, share of the loan
++
++    @property
++    def label(self) -> str:
++        return ("V3-first (buy V3, sell V2)" if self.direction == "v3_first"
++                else "V2-first (buy V2, sell V3)")
++
++
++def plan_best_direction(
++    res: CrossScanResult,
++    base_address: str,
++    quote_address: str,
++    v3_pool_for_fee,
++    v3_uses_deadline_for: Optional[Callable[[str], bool]] = None,
++    pool_for_fee_for_venue: Optional[Callable[[str], Callable[[int], Optional[str]]]] = None,
++    pool_for_fee_any_venue: Optional[Callable[[int], Optional[str]]] = None,
++    **kwargs,
++) -> Tuple[ArbPlan, List[DirectionReport]]:
++    """
++    Build BOTH leg directions and return the better one, plus both for reporting.
++
++    Leg order is not a detail: measured on BNB Chain mainnet on 2026-09-30 the
++    two directions differed by ~48 bps (V2-first -58 bps, V3-first -10 bps) purely
++    because each leg pays its own venue's fee — buying through a 25 bps V2 pool
++    and selling into a 1 bps V3 pool is a different trade from the mirror, even
++    though both are "WBNB/USDT on PancakeSwap". Whichever is better depends on
++    where the price dislocation is, so it is measured per scan, not assumed.
++
++    Comparison is by net (gross minus the flash fee), because the two directions
++    can borrow from pools at different fee tiers and therefore pay different
++    loans.
++
++    `v3_uses_deadline_for(router)` is called with the V3 router each direction
++    selects, so the router-ABI probe follows the venue actually used.
++
++    `pool_for_fee_for_venue(venue_key)` returns a fee -> pool resolver bound to
++    ONE venue, and is preferred over the generic `v3_pool_for_fee`. A single
++    chain can have several V3 venues with DIFFERENT fee tiers - on BSC,
++    PancakeSwap V3 offers 100/500/2500/10000 while Uniswap V3 offers
++    100/500/3000/10000 - so a resolver bound to "the first V3 venue" answers
++    "no such pool" for a tier the leg actually trades on. That left leg 1's pool
++    address empty on a V3-first plan, and the contract refuses an empty one
++    (`ZeroAddress`) because it must prove the leg-1 pool is not the pool it
++    borrowed from.
++    """
++    reports: List[DirectionReport] = []
++    for direction in ("v2_first", "v3_first"):
++        v3_first = direction == "v3_first"
++        buy_version, sell_version = ("v3", "v2") if v3_first else ("v2", "v3")
++        direction_kwargs = dict(kwargs)
++        # Forward these EXPLICITLY. They are named parameters of this function,
++        # so they are NOT part of **kwargs - and plan_arbitrage is the one that
++        # rebinds per direction, from the venue of whichever leg is the V3 one.
++        # Leaving them behind here meant each direction silently used the generic
++        # resolver, which is bound to a single venue: the V3-first plan then had
++        # an EMPTY leg-1 pool (its Uniswap 0.30% tier is invisible to a
++        # Pancake-bound resolver) and the contract refused the plan with
++        # ZeroAddress before any swap ran.
++        if pool_for_fee_for_venue is not None:
++            direction_kwargs["pool_for_fee_for_venue"] = pool_for_fee_for_venue
++        if pool_for_fee_any_venue is not None:
++            direction_kwargs["pool_for_fee_any_venue"] = pool_for_fee_any_venue
++        direction_pool_for_fee = v3_pool_for_fee
++        if v3_uses_deadline_for is not None:
++            try:
++                buy_leg, sell_leg = select_legs(res, buy_version, sell_version)
++                # Whichever leg is the V3 one carries that venue's router, and
++                # the router-ABI probe must follow it: the two venues on BSC need
++                # different `exactInputSingle` shapes.
++                v3_router = (buy_leg.router_address if v3_first
++                             else sell_leg.router_address) or ""
++                direction_kwargs["v3_uses_deadline"] = bool(v3_uses_deadline_for(v3_router))
++            except PlanError:
++                pass                     # the direction will fail below with a reason
++        try:
++            plan = plan_arbitrage(res, base_address, quote_address, direction_pool_for_fee,
++                                  buy_version=buy_version, sell_version=sell_version,
++                                  **direction_kwargs)
++        except PlanError as exc:
++            reports.append(DirectionReport(direction=direction, error=str(exc)))
++            continue
++        net_bps = 0.0
++        if plan.flash_amount:
++            net_bps = plan.expected_gross_bps - (
++                plan.expected_flash_fee / plan.flash_amount * BPS)
++        reports.append(DirectionReport(direction=direction, plan=plan, net_bps=net_bps))
++
++    usable = [r for r in reports if r.plan is not None]
++    if not usable:
++        detail = "; ".join(f"{r.label}: {r.error}" for r in reports)
++        raise PlanError(f"neither leg direction can be planned — {detail}")
++    return max(usable, key=lambda r: r.net_bps).plan, reports
++
++
+ def plan_arbitrage(
+     res: CrossScanResult,
+     base_address: str,
+@@ -459,6 +624,9 @@ def plan_arbitrage(
+     gas_cost_quote_wei: int = 0,
+     min_profit_buffer_bps: float = 2500.0,
+     v2_buy_cost_wei: Optional[int] = None,
++    v3_buy_cost_wei: Optional[int] = None,
++    pool_for_fee_for_venue: Optional[Callable[[str], Callable[[int], Optional[str]]]] = None,
++    pool_for_fee_any_venue: Optional[Callable[[int], Optional[str]]] = None,
+ ) -> ArbPlan:
+     """
+     Build an ArbPlan from a completed cross scan.
+@@ -467,6 +635,18 @@ def plan_arbitrage(
+     a callable so this module needs no reader and no network, and so the caller
+     decides how pools are looked up.
+ 
++    `pool_for_fee_for_venue(venue_key)` gives a resolver bound to ONE venue and
++    takes precedence for the V3 leg's own pool, because the leg must be resolved
++    through the factory of the venue it trades on: BSC runs both PancakeSwap V3
++    (100/500/2500/10000) and Uniswap V3 (100/500/3000/10000), and a resolver
++    bound to the wrong one reports "no pool" for a tier that exists.
++
++    `pool_for_fee_any_venue` is used only to find the pool that LENDS the flash
++    loan. The lender does not have to be the venue we trade on - any V3 pool of
++    this pair holding enough of the borrow token can lend, and the cheapest tier
++    is usually not the one we swap through. Both venues' pools call a callback
++    this contract implements, so crossing venues here is safe.
++
+     WHICH LEGS GET USED, and why this does not just take `res.buy_leg`:
+ 
+     The contract's legs are fixed by the routers it calls — leg 1 is a V2-style
+@@ -550,24 +730,30 @@ def plan_arbitrage(
+     # profitable reverted on chain with CannotRepay. That is the whole reason
+     # `v2_buy_cost_wei` exists: the caller passes the exact getAmountIn cost,
+     # computed from live reserves, and the gross edge is measured against it.
+-    if v2_buy_cost_wei is not None and v2_buy_cost_wei > 0:
+-        borrow_wei = int(v2_buy_cost_wei)
++    v3_first = buy_version == "v3"
++    buy_cost_wei = v3_buy_cost_wei if v3_first else v2_buy_cost_wei
++    buy_cost_source = ("leg 1's real buy cost (exact-output quote on the V3 pool)"
++                       if v3_first else
++                       "leg 1's real buy cost (getAmountIn on the pair's reserves)")
++    if buy_cost_wei is not None and buy_cost_wei > 0:
++        borrow_wei = int(buy_cost_wei)
+         approx_borrow = to_wei(size * buy.exec_price, quote_decimals)
+         if borrow_wei > approx_borrow:
+             diff_bps = (borrow_wei - approx_borrow) / borrow_wei * BPS
+             notes.append(
+-                f"the loan is sized from leg 1's real buy cost (getAmountIn on the "
+-                f"pair's reserves): {borrow_wei:,} wei, which is {diff_bps:,.1f} bps MORE "
+-                f"than the venue's sell quote ({approx_borrow:,} wei) implies. Buying "
+-                f"costs more than selling pays — that spread is the fee paid twice."
++                f"the loan is sized from {buy_cost_source}: {borrow_wei:,} wei, which is "
++                f"{diff_bps:,.1f} bps MORE than the venue's sell quote "
++                f"({approx_borrow:,} wei) implies. Buying costs more than selling pays "
++                f"— that spread is the fee paid twice."
+             )
+     else:
+         borrow_wei = to_wei(size * buy.exec_price, quote_decimals)
+         notes.append(
+-            "the loan is sized from the buy venue's SELL quote, not its real buy "
+-            "cost. That understates the price of buying by about twice that venue's "
+-            "fee, so the edge below is optimistic by the same amount — pass the "
+-            "venue's getAmountIn cost to plan_arbitrage to correct it."
++            f"the loan is sized from the buy venue's SELL quote, not its real buy "
++            f"cost. That understates the price of buying by about twice that venue's "
++            f"fee, so the edge below is optimistic by the same amount — pass the "
++            f"{'exact-output V3 quote' if v3_first else 'getAmountIn V2 cost'} to "
++            f"plan_arbitrage to correct it."
+         )
+     back_wei = to_wei(size * sell.exec_price, quote_decimals)
+     if borrow_wei <= 0:
+@@ -578,13 +764,31 @@ def plan_arbitrage(
+ 
+     # Which pool lends the loan must be settled BEFORE the fee is known, because
+     # PancakeSwap V3 charges the flash fee at the LENDING pool's own swap tier.
+-    # Taking that tier from the sell leg assumes the lending pool and leg 2's pool
+-    # are the same pool, and they cannot be: leg 2 swaps inside flash()'s
+-    # callback, while the lending pool is holding its reentrancy lock.
+-    leg2_pool = v3_pool_for_fee(sell.fee_pips) or ""
++    # Taking that tier from the V3 leg assumes the lending pool and the V3 leg's
++    # pool are the same pool, and they cannot be: the V3 swap runs inside
++    # flash()'s callback, while the lending pool is holding its reentrancy lock.
++    # That is true whichever leg is the V3 one, so the exclusions follow the
++    # direction: V3-first means leg 1's pool is the locked one.
++    v3_leg = buy if v3_first else sell
++
++    # Resolve the V3 leg through ITS OWN venue's factory when the caller can
++    # tell us which venue that is. A single chain can run several V3 venues with
++    # different fee tiers - on BSC, PancakeSwap V3 quotes 100/500/2500/10000 and
++    # Uniswap V3 quotes 100/500/3000/10000 - so a resolver bound to "the first V3
++    # venue" answers "no such pool" for a tier the leg actually trades on. That
++    # produced an EMPTY leg-1 pool on a V3-first plan (the tier-3000 Uniswap pool
++    # was invisible to a Pancake-bound resolver), and the contract refuses an
++    # empty one because it must prove leg 1's pool is not the lending pool.
++    leg_pool_for_fee = v3_pool_for_fee
++    if pool_for_fee_for_venue is not None:
++        bound = pool_for_fee_for_venue(v3_leg.venue_key)
++        if bound is not None:
++            leg_pool_for_fee = bound
++
++    v3_leg_pool = leg_pool_for_fee(v3_leg.fee_pips) or ""
+     pool, flash_tier, flash_bal = choose_flash_pool(
+-        [leg2_pool, sell.pool_address or ""],
+-        v3_pool_for_fee,
++        [v3_leg_pool, v3_leg.pool_address or ""],
++        pool_for_fee_any_venue or leg_pool_for_fee,
+         borrow_wei,
+         flash_pool_quote_balance,
+         flash_fee_tiers,
+@@ -605,11 +809,16 @@ def plan_arbitrage(
+     # its own output token's decimals and expressed in that token:
+     #   leg 1 buys base with the borrowed quote -> floor is in BASE
+     #   leg 2 sells that base back into quote   -> floor is in QUOTE
+-    # The borrow was sized as `size * buy.exec_price` quote, so leg 1 is expected
+-    # to hand back almost exactly `size` base; that is the number to floor, not
+-    # the quote spent to get it.
+-    v2_min = output_floor(size, slippage_bps, base_decimals)
+-    v3_min = output_floor(size * sell.exec_price, slippage_bps, quote_decimals)
++    # The borrow was sized to buy `size` base, so leg 1 is expected to hand back
++    # almost exactly `size` base; that is the number to floor, not the quote spent
++    # to get it. In the mirror direction the roles swap: the V3 leg is the buy
++    # (floor in BASE) and the V2 leg is the sell (floor in QUOTE).
++    if v3_first:
++        v3_min = output_floor(size, slippage_bps, base_decimals)
++        v2_min = output_floor(size * sell.exec_price, slippage_bps, quote_decimals)
++    else:
++        v2_min = output_floor(size, slippage_bps, base_decimals)
++        v3_min = output_floor(size * sell.exec_price, slippage_bps, quote_decimals)
+ 
+     gross_wei = back_wei - borrow_wei
+     gross_bps = gross_wei / borrow_wei * BPS
+@@ -669,13 +878,14 @@ def plan_arbitrage(
+             f"way nothing moves but gas."
+         )
+ 
+-    if leg2_pool and pool.lower() != leg2_pool.lower():
++    if v3_leg_pool and pool.lower() != v3_leg_pool.lower():
+         notes.append(
+             f"the flash loan comes from a different pool ({pool}, tier {flash_tier}) "
+-            f"than the one leg 2 swaps through ({leg2_pool}, tier {sell.fee_pips}). "
+-            f"That is required, not a compromise: flash() holds the lending pool's "
+-            f"reentrancy lock across the whole callback, so a swap routed back into "
+-            f"it reverts with 'LOK' before either leg can settle."
++            f"than the one the V3 leg ({'leg 1' if v3_first else 'leg 2'}) swaps "
++            f"through ({v3_leg_pool}, tier {v3_leg.fee_pips}). That is required, not a "
++            f"compromise: flash() holds the lending pool's reentrancy lock across the "
++            f"whole callback, so a swap routed back into it reverts with 'LOK' before "
++            f"either leg can settle."
+         )
+     if flash_bal is not None:
+         notes.append(
+@@ -683,8 +893,13 @@ def plan_arbitrage(
+             f"this {borrow_wei:,} wei loan"
+         )
+ 
+-    v2_router = buy.router_address or ""
+-    v3_router = sell.router_address or ""
++    # Which venue's router each leg uses follows the DIRECTION, not the buy/sell
++    # role: in mirror mode the V3 leg is the BUY. Reading these off `buy` and
++    # `sell` positionally (the original assumption) put the V2 router into
++    # v3_router on a V3-first plan - an exactInputSingle call to a router that
++    # has no such function, reverting with empty data and no explanation.
++    v3_router = v3_leg.router_address or ""
++    v2_router = (sell if v3_first else buy).router_address or ""
+     if not v2_router or not v3_router:
+         raise PlanError(
+             f"a chosen venue has no router address configured "
+@@ -698,16 +913,19 @@ def plan_arbitrage(
+     return ArbPlan(
+         borrow_token=quote_address,
+         intermediate_token=base_address,
++        v3_first=v3_first,
++        v3_leg1_pool=checksum(v3_leg_pool) if (v3_first and v3_leg_pool) else "",
+         pool=checksum(pool),
+         flash_amount=borrow_wei,
+         flash_fee_pips=int(flash_tier),
+         v2_router=checksum(v2_router),
+-        v2_path=[quote_address, base_address],
++        v2_path=([base_address, quote_address] if v3_first
++                 else [quote_address, base_address]),
+         v2_amount_out_min=v2_min,
+         v3_router=checksum(v3_router),
+-        v3_token_in=base_address,
+-        v3_token_out=quote_address,
+-        v3_fee=sell.fee_pips,
++        v3_token_in=quote_address if v3_first else base_address,
++        v3_token_out=base_address if v3_first else quote_address,
++        v3_fee=buy.fee_pips if v3_first else sell.fee_pips,
+         v3_amount_out_min=v3_min,
+         min_profit=effective_min_profit,
+         min_profit_floor=min_profit_floor,
+diff --git a/arb/survey_report.py b/arb/survey_report.py
+new file mode 100644
+index 0000000..f91d95a
+--- /dev/null
++++ b/arb/survey_report.py
+@@ -0,0 +1,320 @@
++"""
++Read the survey's JSONL logs and answer the question they exist for.
++
++The survey is a dry run of the planner, one line per iteration. A week of them is
++the only honest evidence that a real edge survives all costs, and the question
++being asked is not "was any single scan positive" — one lucky row is noise — but
++WHERE the edge lives:
++
++  * which LEG DIRECTION pays (buy V2/sell V3, or the mirror),
++  * which VENUE PAIR the money is between (Pancake V2 -> Uniswap V3 is a
++    different trade from the reverse, and each leg pays its own venue's fee),
++  * which SIZE it survives, since a bigger trade eats more price impact,
++  * and whether whatever shows up PERSISTS, hour after hour.
++
++Nothing here talks to the network. It reads files, which is the point: the
++numbers being interpreted were recorded by a process that has since exited, and
++re-deriving them from a live chain would answer a different question (what the
++market is NOW) than the one asked (what it has been).
++
++Rows written before 2026-09-30 have no `direction` field — the survey knew only
++one shape then — so they are reported as their own group rather than dropped or
++guessed at. Dropping them would hide evidence; assigning them a direction would
++invent it.
++"""
++
++from __future__ import annotations
++
++import json
++import statistics
++from pathlib import Path
++from typing import Dict, Iterable, List, Optional, Sequence
++
++# A direction is only interesting as a direction if enough rows back it. Below
++# this, a "median" is three coin flips wearing a number's clothes.
++MIN_GROUP_ROWS = 8
++
++
++def load_rows(paths: Sequence[Path]) -> List[dict]:
++    """Read every JSONL row from `paths`, skipping unreadable ones."""
++    rows: List[dict] = []
++    for path in paths:
++        try:
++            text = path.read_text(encoding="utf-8")
++        except OSError:
++            continue
++        for line in text.splitlines():
++            line = line.strip()
++            if not line:
++                continue
++            try:
++                row = json.loads(line)
++            except ValueError:
++                continue
++            if isinstance(row, dict):
++                row["_file"] = str(path)
++                rows.append(row)
++    rows.sort(key=lambda r: r.get("ts") or 0.0)
++    return rows
++
++
++def _median(values: Iterable[float]) -> Optional[float]:
++    vals = [v for v in values if v is not None]
++    return statistics.median(vals) if vals else None
++
++
++def _mean(values: Iterable[float]) -> Optional[float]:
++    vals = [v for v in values if v is not None]
++    return statistics.fmean(vals) if vals else None
++
++
++def _p90(values: Sequence[float]) -> Optional[float]:
++    """The 90th percentile, nearest-rank: the good end without being the outlier."""
++    vals = sorted(v for v in values if v is not None)
++    if not vals:
++        return None
++    idx = min(len(vals) - 1, int(round(0.9 * (len(vals) - 1))))
++    return vals[idx]
++
++
++def _group(rows: Sequence[dict]) -> dict:
++    """The numbers one group of rows is judged by."""
++    net = [r.get("net_bps") for r in rows if isinstance(r.get("net_bps"), (int, float))]
++    gross = [r.get("gross_bps") for r in rows if isinstance(r.get("gross_bps"), (int, float))]
++    return {
++        "rows": len(rows),
++        "graded": len(net),
++        "net_median": _median(net),
++        "net_mean": _mean(net),
++        "net_best": max(net) if net else None,
++        "net_p90": _p90(net),
++        "gross_median": _median(gross),
++        "positive": sum(1 for v in net if v > 0),
++        "clears": sum(1 for r in rows if r.get("clears_floor") is True),
++        "no_plan": sum(1 for r in rows if r.get("plan_error")),
++        "errors": sum(1 for r in rows if r.get("error")),
++    }
++
++
++def _by(rows: Sequence[dict], key) -> Dict[str, dict]:
++    groups: Dict[str, List[dict]] = {}
++    for row in rows:
++        groups.setdefault(key(row), []).append(row)
++    return {name: _group(g) for name, g in groups.items()}
++
++
++def _venues(row: dict) -> str:
++    buy = row.get("buy") or "?"
++    sell = row.get("sell") or "?"
++    return f"{buy}  ->  {sell}"
++
++
++def _hour(ts: Optional[float]) -> str:
++    if not ts:
++        return "?"
++    import datetime as _dt
++
++    return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%Y-%m-%d %H:00")
++
++
++def analyze(rows: Sequence[dict], file_count: int = 1) -> dict:
++    """Everything the report prints, as data, so it can also be asserted on."""
++    graded = [r for r in rows if isinstance(r.get("net_bps"), (int, float))]
++    times = [r.get("ts") for r in rows if r.get("ts")]
++    window = (min(times), max(times)) if times else (None, None)
++
++    # Old rows have no `direction`; say so instead of dropping or inventing one.
++    by_direction = _by(rows, lambda r: r.get("direction")
++                       or ("unknown (pre-2026-09-30 rows)" if "directions" not in r
++                           else "unknown"))
++    by_venue = _by(graded, _venues)
++    by_size = _by(graded, lambda r: f"{r.get('size_base', '?')} base")
++    by_pair = _by(graded, lambda r: r.get("pair", "?"))
++    by_hour = _by(graded, lambda r: _hour(r.get("ts")))
++
++    total = max(1, len(rows))
++    return {
++        "files": file_count,
++        "rows": len(rows),
++        "graded": len(graded),
++        "window": window,
++        "by_direction": by_direction,
++        "by_venue": by_venue,
++        "by_size": by_size,
++        "by_pair": by_pair,
++        "by_hour": by_hour,
++        "overall": _group(rows),
++        "verdict": _verdict(rows, graded, by_hour, by_size),
++        "chosen": _chosen_directions(rows),
++    }
++
++
++def _chosen_directions(rows: Sequence[dict]) -> Dict[str, int]:
++    """How often each direction was the one the chooser picked."""
++    counts: Dict[str, int] = {}
++    for row in rows:
++        chosen = row.get("direction")
++        if not chosen and isinstance(row.get("directions"), dict):
++            # A row that logged both directions but never picked one: infer from
++            # whichever direction clears, and only when exactly one does.
++            ok = [d for d, v in row["directions"].items()
++                  if isinstance(v, dict) and v.get("net_bps") is not None
++                  and v["net_bps"] > 0]
++            chosen = ok[0] if len(ok) == 1 else None
++        if chosen:
++            counts[chosen] = counts.get(chosen, 0) + 1
++    return counts
++
++
++def _verdict(rows: Sequence[dict], graded: Sequence[dict], by_hour: Dict[str, dict],
++             by_size: Dict[str, dict]) -> dict:
++    """
++    The three-way answer: is there an edge, is it close, or is it not there.
++
++    Deliberately conservative. "Positive somewhere" is not enough — a single row
++    out of hundreds is what the costs look like when they are not yet covered,
++    not an edge. What counts as a candidate is a group with enough rows whose
++    median is above zero, because that is the cheapest claim to falsify with the
++    next hour of data.
++    """
++    if not graded:
++        return {"state": "no-data", "text": "no graded rows yet — nothing to conclude"}
++
++    net = [r["net_bps"] for r in graded if isinstance(r.get("net_bps"), (int, float))]
++    positive = [v for v in net if v > 0]
++    best_hour = max(by_hour.items(), key=lambda kv: kv[1]["net_median"] or -1e9)
++    best_size = max(by_size.items(), key=lambda kv: kv[1]["net_median"] or -1e9)
++
++    if not positive:
++        return {
++            "state": "negative",
++            "text": (f"no iteration cleared its own costs in {len(net)} graded rows. "
++                     f"Best single row {max(net):+.2f} bps, median {_median(net):+.2f}. "
++                     f"Trading this would be buying gas, not edge. The best group is "
++                     f"still negative ({best_hour[0]}: {best_hour[1]['net_median']:+.2f} "
++                     f"bps median), so there is nothing to size up yet."),
++        }
++
++    sustained = [name for name, g in by_hour.items()
++                 if g["rows"] >= MIN_GROUP_ROWS and (g["net_median"] or -1) > 0]
++    if sustained and best_size[1]["rows"] >= MIN_GROUP_ROWS:
++        return {
++            "state": "candidate",
++            "text": (f"{len(sustained)} hour-bucket(s) are positive on their median "
++                     f"({len(positive)} of {len(net)} rows cleared). That is the shape "
++                     f"of a real edge, and it is still only a candidate: keep the "
++                     f"survey running, and confirm with a micro-drill (0.1% of the "
++                     f"usual size) before trusting it."),
++        }
++
++    return {
++        "state": "sporadic",
++        "text": (f"{len(positive)} of {len(net)} rows cleared their costs, but no "
++                 f"hour-bucket is positive on its median — the wins are scattered "
++                 f"outliers around a negative centre (median {_median(net):+.2f} bps). "
++                 f"Not tradeable: at these costs a sparse win is a loss with timing."),
++    }
++
++
++# ---------------------------------------------------------------------------
++# Rendering
++# ---------------------------------------------------------------------------
++def _fmt(value: Optional[float], width: int = 10, suffix: str = "") -> str:
++    if value is None:
++        return f"{'—':>{width}}"
++    return f"{value:>+{width}.2f}{suffix}"
++
++
++def _row_line(label: str, g: dict, extra: str = "") -> str:
++    share = f"{(g['positive'] / g['graded'] * 100):>5.1f}%" if g["graded"] else "    —"
++    return (f"    {label:<34} {g['rows']:>6} {_fmt(g['gross_median'])} "
++            f"{_fmt(g['net_median'])} {_fmt(g['net_best'])} {share} {extra}")
++
++
++def render(report: dict, title: str = "SURVEY") -> List[str]:
++    """The report as lines of text, so the CLI only has to print them."""
++    out: List[str] = []
++    import datetime as _dt
++
++    rows = report["rows"]
++    start, end = report["window"]
++    out.append(f"  {title}")
++    out.append(f"    files        {report['files']}")
++    out.append(f"    rows         {rows:,}  "
++               f"(graded {report['graded']:,}, no plan {report['overall']['no_plan']:,}, "
++               f"errors {report['overall']['errors']:,})")
++    if start and end:
++        fmt_t = lambda t: _dt.datetime.fromtimestamp(t, _dt.timezone.utc).strftime(
++            "%Y-%m-%d %H:%M")
++        hours = (end - start) / 3600.0
++        out.append(f"    window       {fmt_t(start)} → {fmt_t(end)} UTC "
++                   f"({hours:,.1f} h)")
++
++    header = (f"    {'':<34} {'rows':>6} {'gross md':>10} {'net md':>10} "
++              f"{'net best':>10} {'>0':>6}")
++
++    out.append("")
++    out.append("  WHERE THE EDGE LIVES — by leg direction")
++    out.append(header)
++    for name in sorted(report["by_direction"]):
++        chosen = report["chosen"].get(name, 0)
++        g = report["by_direction"][name]
++        extra = f"chosen {chosen:>5}" if chosen else ""
++        out.append(_row_line(name, g, extra))
++
++    out.append("")
++    out.append("  by venue pair (buy -> sell)")
++    out.append(header)
++    for name, g in sorted(report["by_venue"].items(),
++                          key=lambda kv: kv[1]["net_median"] if kv[1]["net_median"] is not None else -1e9,
++                          reverse=True):
++        out.append(_row_line(name, g))
++
++    if len(report["by_size"]) > 1:
++        out.append("")
++        out.append("  by size (impact is what caps size)")
++        out.append(header)
++        for name in sorted(report["by_size"]):
++            out.append(_row_line(name, report["by_size"][name]))
++
++    if len(report["by_pair"]) > 1:
++        out.append("")
++        out.append("  by pair")
++        out.append(header)
++        for name in sorted(report["by_pair"]):
++            out.append(_row_line(name, report["by_pair"][name]))
++
++    out.append("")
++    out.append("  over time (median net bps per hour, UTC)")
++    out.append(header)
++    for name, g in sorted(report["by_hour"].items()):
++        bar = ""
++        med = g["net_median"]
++        if med is not None:
++            # A tiny text histogram, so "improving" or "worsening" is visible
++            # without reading 40 rows of numbers.
++            if med > 0:
++                bar = "  " + "+" * max(1, min(20, int(med)))
++            else:
++                bar = "  " + "-" * max(1, min(20, int(abs(med))))
++        out.append(_row_line(name, g, bar))
++
++    verdict = report["verdict"]
++    out.append("")
++    out.append(f"  VERDICT ({verdict['state']})")
++    for line in _wrap(verdict["text"], 84):
++        out.append("    " + line)
++    return out
++
++
++def _wrap(text: str, width: int) -> List[str]:
++    words, lines, line = text.split(), [], ""
++    for word in words:
++        if len(line) + len(word) + 1 > width:
++            lines.append(line)
++            line = word
++        else:
++            line = f"{line} {word}".strip()
++    if line:
++        lines.append(line)
++    return lines
+diff --git a/contracts/FlashArb.sol b/contracts/FlashArb.sol
+index e45f944..6e69685 100644
+--- a/contracts/FlashArb.sol
++++ b/contracts/FlashArb.sol
+@@ -138,6 +138,10 @@ contract FlashArb {
+         int256 profit;
+         uint256 balanceBefore;
+         uint256 balanceAfter;
++        /// Which generation ran leg 1 (the buy). false = V2 first (the original
++        /// single-direction behaviour), true = V3 first. Recorded so a run can be
++        /// read back without having to infer it from the router addresses.
++        bool v3First;
+     }
+ 
+     event ArbitrageExecuted(
+@@ -169,6 +173,14 @@ contract FlashArb {
+     error V3RouterCallFailed();
+     /// The V3 router returned success but not a decodable uint256.
+     error V3RouterBadReturn(uint256 length);
++    /// `v3First` was set but leg 1's V3 pool is the pool the flash loan came
++    /// from. Not merely inefficient: flash() holds that pool's reentrancy lock
++    /// for the whole callback, so the swap would revert with "LOK".
++    error Leg1PoolIsFlashPool(address pool);
++    /// The address given as `v3Leg1Pool` is not a pool of (borrowToken,
++    /// intermediate) at `v3Params.fee`. Guards against a plan that names one
++    /// pool while the router would use another.
++    error V3Leg1PoolMismatch(address given);
+ 
+     constructor() {
+         owner = msg.sender;
+@@ -209,6 +221,38 @@ contract FlashArb {
+         /// does not. See the comment above the two structs - this varies per
+         /// deployment and cannot be inferred from the chain.
+         bool v3RouterUsesDeadline;
++
++        // ---- direction ----------------------------------------------------
++        //
++        // The round trip is quote -> base on leg 1 and base -> quote on leg 2,
++        // but WHICH GENERATION runs each leg is a market question, not a fixed
++        // design choice. Measured on BNB Chain mainnet, 2026-09-30:
++        //
++        //   V2 first (buy on V2, 25 bps; sell on V3, 1 bps) .... net -58 bps
++        //   V3 first (buy on V3, 1 bps;  sell on V2, 25 bps) ... net -10 bps
++        //
++        // a ~48 bps difference from leg order alone. Hard-coding one direction
++        // means paying that handicap on every trade, so both are supported and
++        // the caller picks per plan.
++        //
++        /// true  -> leg 1 buys on the V3 router, leg 2 sells on the V2 router
++        /// false -> leg 1 buys on the V2 router, leg 2 sells on the V3 router
++        bool v3First;
++
++        /// Required when `v3First`: the V3 pool leg 1 will swap through, i.e.
++        /// the pool for (borrowToken, intermediate, v3Params.fee). Checked
++        /// against the pool's own token0/token1/fee, and required to differ
++        /// from `pool`.
++        ///
++        /// The difference matters because `flash()` holds the LENDING pool's
++        /// reentrancy lock for the whole callback: a leg-1 swap routed into it
++        /// reverts with "LOK" before either leg settles. When leg 2 was the V3
++        /// leg that was the planner's problem to avoid; now that leg 1 can be
++        /// the V3 leg, the contract checks it, because a silent misconfiguration
++        /// here is indistinguishable from a broken pool. Ignored when
++        /// `v3First` is false (leg 2's pool is resolved by the router from
++        /// tokenIn/tokenOut/fee, which the planner already pins).
++        address v3Leg1Pool;
+     }
+ 
+     // -----------------------------------------------------------------------
+@@ -218,7 +262,18 @@ contract FlashArb {
+     function arbitrage(ArbParams calldata params) external onlyOwner returns (int256 profit) {
+         if (params.flashAmount == 0) revert ZeroBorrow();
+         if (params.v2Path.length < 2) revert EmptyPath();
+-        if (params.v2Path[0] != params.borrowToken) revert PathEndpointsMismatch();
++        // Which END of the V2 path touches the borrow token depends on the
++        // direction: V2-first BUYS with the borrowed token, so the path starts
++        // there, while V3-first SELLS into it, so the path ends there. Checking
++        // only the V2-first shape here rejected every mirror plan with
++        // PathEndpointsMismatch before a single swap ran — the fork suite caught
++        // it. The callback re-checks this at execution time with the token
++        // addresses it actually derived; this copy exists so that a malformed
++        // plan fails before the flash loan rather than in the middle of it.
++        address v2BorrowSide = params.v3First
++            ? params.v2Path[params.v2Path.length - 1]
++            : params.v2Path[0];
++        if (v2BorrowSide != params.borrowToken) revert PathEndpointsMismatch();
+ 
+         uint256 balanceBefore = _balanceOf(params.borrowToken, address(this));
+ 
+@@ -246,6 +301,27 @@ contract FlashArb {
+     // The flash callback — where both legs and the repay happen
+     // -----------------------------------------------------------------------
+     function pancakeV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external {
++        _flashBody(fee0, fee1, data);
++    }
++
++    /// @notice Uniswap V3's name for the same callback, same three arguments.
++    ///
++    /// Same body, same guard. It exists because the flash loan may come from
++    /// EITHER venue: the planner searches fee tiers on the V3 venue it is
++    /// trading through, and on BSC that can be Uniswap V3, whose pools call
++    /// `uniswapV3FlashCallback`. Without this entry point such a loan could not
++    /// be repaid — the pool's call would match no function and the whole
++    /// transaction would revert with empty returndata, which reads like a broken
++    /// pool rather than a missing function. The pools are otherwise identical:
++    /// the same (fee0, fee1, data) arguments, the same fee formula
++    /// `ceil(amount * pool.fee() / 1e6)`, and the same reentrancy lock.
++    function uniswapV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external {
++        _flashBody(fee0, fee1, data);
++    }
++
++    /// @dev Shared body of both callbacks. Private, so the only ways in are the
++    ///      two external entry points above, and they both start here.
++    function _flashBody(uint256 fee0, uint256 fee1, bytes calldata data) private {
+         // Only valid while WE initiated the flash. This is the check that stops
+         // anyone calling this function directly to make the contract move tokens.
+         if (!_inFlash) revert BadCallback();
+@@ -259,16 +335,55 @@ contract FlashArb {
+         // pool for the duration of flash(), so this pins it exactly.
+         if (msg.sender != params.pool) revert BadCallback();
+ 
++        // ---- which leg is which -------------------------------------------
++        //
++        // The plan is quote -> base -> quote. `v3First` decides which generation
++        // runs the buy (leg 1) and which runs the sell (leg 2). The two
++        // directions are mirror images, so the same two legs run in either
++        // order rather than duplicating the body.
++        bool v3First = params.v3First;
++        address intermediate;
++        if (v3First) {
++            // V3 buys base (leg 1), so the V2 path SELLS base: it must start at
++            // the intermediate token and end at the borrow token.
++            if (params.v2Path[params.v2Path.length - 1] != params.borrowToken) {
++                revert PathEndpointsMismatch();
++            }
++            intermediate = params.v2Path[0];
++            if (params.v3Params.tokenIn != params.borrowToken
++                || params.v3Params.tokenOut != intermediate) {
++                revert PathEndpointsMismatch();
++            }
++        } else {
++            // V2 buys base (leg 1): the path starts at the borrow token.
++            if (params.v2Path[0] != params.borrowToken) revert PathEndpointsMismatch();
++            intermediate = params.v2Path[params.v2Path.length - 1];
++        }
++
+         Outcome memory o;
+         o.pool = params.pool;
+         o.borrowToken = params.borrowToken;
+         o.borrowed = params.flashAmount;
+         o.balanceBefore = balanceBefore;
+-
+-        // ---- leg 1: borrowToken -> intermediateToken, on the V2 router -------
+-        address intermediate = params.v2Path[params.v2Path.length - 1];
+-        _approve(params.borrowToken, params.v2Router, params.flashAmount);
+-        {
++        o.v3First = v3First;
++
++        // ---- leg 1: borrowToken -> intermediateToken ------------------------
++        if (v3First) {
++            // The lending pool is locked for this whole callback, so a leg-1
++            // swap routed through it cannot work. Verified rather than assumed:
++            // the address must be a pool of the exact token pair and fee the
++            // router will use (a pool cannot be spoofed for a given
++            // token0/token1/fee key - the factory mints one per key), and it
++            // must not be the pool that lent us the tokens.
++            address leg1Pool = params.v3Leg1Pool;
++            if (leg1Pool == address(0)) revert ZeroAddress();
++            if (leg1Pool == params.pool) revert Leg1PoolIsFlashPool(leg1Pool);
++            _requirePool(leg1Pool, params.borrowToken, intermediate, params.v3Params.fee);
++
++            _approve(params.borrowToken, params.v3Router, params.flashAmount);
++            o.leg1Out = _swapV3(params, params.flashAmount);
++        } else {
++            _approve(params.borrowToken, params.v2Router, params.flashAmount);
+             uint256[] memory amounts = IPancakeV2Router(params.v2Router).swapExactTokensForTokens(
+                 params.flashAmount,
+                 params.v2AmountOutMin,
+@@ -279,42 +394,24 @@ contract FlashArb {
+             o.leg1Out = amounts[amounts.length - 1];
+         }
+ 
+-        // ---- leg 2: intermediateToken -> borrowToken, on the V3 router -------
++        // ---- leg 2: intermediateToken -> borrowToken ------------------------
+         // Use what actually arrived rather than trusting the caller's amountIn:
+         // if leg 1 returned less than expected, this still sweeps exactly what we
+         // hold instead of reverting on an allowance or balance shortfall.
+         uint256 haveIntermediate = _balanceOf(intermediate, address(this));
+-        _approve(intermediate, params.v3Router, haveIntermediate);
+-        {
+-            V3ParamsWithDeadline memory v3 = params.v3Params;
+-            v3.amountIn = haveIntermediate;
+-            v3.recipient = address(this);
+-            v3.deadline = block.timestamp;
+-
+-            bytes memory payload = params.v3RouterUsesDeadline
+-                ? abi.encodeWithSelector(SEL_EXACT_INPUT_SINGLE_WITH_DEADLINE, v3)
+-                : abi.encodeWithSelector(
+-                    SEL_EXACT_INPUT_SINGLE_NO_DEADLINE,
+-                    V3ParamsNoDeadline(
+-                        v3.tokenIn, v3.tokenOut, v3.fee, v3.recipient,
+-                        v3.amountIn, v3.amountOutMinimum, v3.sqrtPriceLimitX96
+-                    )
+-                );
+-
+-            (bool ok, bytes memory ret) = params.v3Router.call(payload);
+-            if (!ok) {
+-                // Bubble the router's own reason up rather than replacing it with
+-                // a generic one. INSUFFICIENT_OUTPUT_AMOUNT arriving intact is
+-                // what tells the caller their slippage floor was too tight; an
+-                // EMPTY returndata is the distinct signature of a selector the
+-                // router does not implement, which points at v3RouterUsesDeadline.
+-                if (ret.length == 0) revert V3RouterCallFailed();
+-                assembly {
+-                    revert(add(ret, 32), mload(ret))
+-                }
+-            }
+-            if (ret.length < 32) revert V3RouterBadReturn(ret.length);
+-            o.leg2Out = abi.decode(ret, (uint256));
++        if (v3First) {
++            _approve(intermediate, params.v2Router, haveIntermediate);
++            uint256[] memory back = IPancakeV2Router(params.v2Router).swapExactTokensForTokens(
++                haveIntermediate,
++                params.v2AmountOutMin,
++                params.v2Path,
++                address(this),
++                block.timestamp
++            );
++            o.leg2Out = back[back.length - 1];
++        } else {
++            _approve(intermediate, params.v3Router, haveIntermediate);
++            o.leg2Out = _swapV3(params, haveIntermediate);
+         }
+ 
+         // ---- repay the flash loan -------------------------------------------
+@@ -401,6 +498,59 @@ contract FlashArb {
+         return (a % b == 0) ? q : q + 1;
+     }
+ 
++    /// @dev Run one `exactInputSingle` through the V3 router and return the
++    ///      amount received. Used by BOTH legs: leg 1 when `v3First` (swapping
++    ///      the borrowed tokens) and leg 2 otherwise (swapping what leg 1
++    ///      delivered). `recipient`, `deadline` and `amountIn` are overwritten
++    ///      here rather than trusted from the caller, so a plan cannot send the
++    ///      output elsewhere, let a stale transaction sit in the mempool, or
++    ///      claim to spend tokens it does not have.
++    function _swapV3(ArbParams memory params, uint256 amountIn) private returns (uint256) {
++        V3ParamsWithDeadline memory v3 = params.v3Params;
++        v3.amountIn = amountIn;
++        v3.recipient = address(this);
++        v3.deadline = block.timestamp;
++
++        bytes memory payload = params.v3RouterUsesDeadline
++            ? abi.encodeWithSelector(SEL_EXACT_INPUT_SINGLE_WITH_DEADLINE, v3)
++            : abi.encodeWithSelector(
++                SEL_EXACT_INPUT_SINGLE_NO_DEADLINE,
++                V3ParamsNoDeadline(
++                    v3.tokenIn, v3.tokenOut, v3.fee, v3.recipient,
++                    v3.amountIn, v3.amountOutMinimum, v3.sqrtPriceLimitX96
++                )
++            );
++
++        (bool ok, bytes memory ret) = params.v3Router.call(payload);
++        if (!ok) {
++            // Bubble the router's own reason up rather than replacing it with a
++            // generic one. INSUFFICIENT_OUTPUT_AMOUNT arriving intact is what
++            // tells the caller their slippage floor was too tight; an EMPTY
++            // returndata is the distinct signature of a selector the router does
++            // not implement, which points at v3RouterUsesDeadline.
++            if (ret.length == 0) revert V3RouterCallFailed();
++            assembly {
++                revert(add(ret, 32), mload(ret))
++            }
++        }
++        if (ret.length < 32) revert V3RouterBadReturn(ret.length);
++        return abi.decode(ret, (uint256));
++    }
++
++    /// @dev Check that `pool` really is the pool of (tokenA, tokenB) at `fee`.
++    ///      A factory mints exactly one pool per (token0, token1, fee) key, so a
++    ///      pool that reports this pair and this fee IS the one the router will
++    ///      route through - there is no way to satisfy the check with a
++    ///      different pool. Order-independent: the pool decides which token is
++    ///      token0, and neither side may be assumed.
++    function _requirePool(address pool, address tokenA, address tokenB, uint24 fee) private view {
++        if (IPancakeV3PoolFlash(pool).fee() != fee) revert V3Leg1PoolMismatch(pool);
++        address t0 = IPancakeV3PoolFlash(pool).token0();
++        address t1 = IPancakeV3PoolFlash(pool).token1();
++        bool pairMatches = (t0 == tokenA && t1 == tokenB) || (t0 == tokenB && t1 == tokenA);
++        if (!pairMatches) revert V3Leg1PoolMismatch(pool);
++    }
++
+     function _balanceOf(address token, address who) private view returns (uint256) {
+         (bool ok, bytes memory ret) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (who)));
+         require(ok && ret.length >= 32, "balanceOf failed");
+@@ -441,9 +591,14 @@ contract FlashArb {
+ //         _flashBody(fee0, fee1, data);
+ //     }
+ //
+-// and move the body of pancakeV3FlashCallback into a private `_flashBody`. Both
+-// callbacks then share the logic and the same `_inFlash` guard. That is NOT done
+-// here yet, because the leg-2 router interface would also need a Uniswap variant
+-// and the Phase 2 target is BNB Chain testnet, where Uniswap V3 is not deployed.
+-// Adding a second callback later does not change anything already deployed.
++// and share the body via a private `_flashBody`. That IS done as of
++// 2026-09-30: both entry points exist and both start at `_flashBody`, so the
++// `_inFlash` and `msg.sender == params.pool` guards apply identically to either.
++//
++// It became necessary when the planner learned to choose its flash pool from the
++// venue's own fee tiers - on BSC that can be Uniswap V3, whose pools call this
++// other selector. The legacy concern about the V3 router interface needing a
++// Uniswap variant turned out not to apply: `exactInputSingle` is already encoded
++// explicitly in both of its shapes and selected by flag, so the router side was
++// never venue-specific.
+ // ===========================================================================
+diff --git a/dex/fetcher.py b/dex/fetcher.py
+index 4882273..1fde6a7 100644
+--- a/dex/fetcher.py
++++ b/dex/fetcher.py
+@@ -445,6 +445,58 @@ class UniswapV3Reader:
+         return f0, f1
+ 
+     # -- quoting -------------------------------------------------------------
++    def buy_cost_raw(
++        self,
++        base: str,
++        quote: str,
++        size_base_raw: int,
++        fee_tier: Optional[int] = None,
++    ) -> Tuple[int, str]:
++        """
++        What it costs, in raw quote units, to BUY `size_base_raw` of base here.
++
++        Returns (amount_in_raw, pool_address).
++
++        Why this is a separate function and not `1 / quote()`: the swap quoter
++        every venue uses answers the SELL question - "I send this much base, how
++        much quote comes back?" - and pricing a buy off that answer understates
++        the cost by about twice the pool fee. Measured against the real WBNB/USDT
++        V2 pair on BNB Chain, the sell quote said 753.6651 while `getAmountIn`
++        said 757.4768: 50.3 bps, exactly 2 x the 25 bps fee. Sizing the flash
++        loan from the sell quote therefore borrowed ~50 bps too little and the
++        plan reverted at the repay (CannotRepay) after the router had already
++        spent the gas.
++
++        So this asks the pool the inverse question directly: exact OUTPUT of
++        `size_base_raw`, priced by the same local maths used everywhere else
++        (UniswapV3Pool.swap replayed against the real tick bitmap), with
++        `amount_specified` negative to mean "this is what I want out".
++        """
++        pool_address, fee = self.pick_best_pool(base, quote, fee_tier)
++        state = self.read_state(pool_address)
++        base_is_token0 = base.lower() == state["token0"].lower()
++
++        # pool.swap() is quoted as token0<->token1, so "buy the base token" is
++        # zero_for_one when the base is token1 (paying token0 = quote).
++        zero_for_one = not base_is_token0
++
++        cache = v3math.TickBitmapCache(
++            fetch_word=lambda wp: self.tick_bitmap_word(pool_address, wp),
++            fetch_tick=lambda t: self.tick_info(pool_address, t),
++        )
++        q = v3math.quote(
++            zero_for_one=zero_for_one,
++            amount_specified=-int(size_base_raw),      # negative = exact output
++            sqrt_price_x96=state["sqrt_price_x96"],
++            liquidity=state["liquidity"],
++            tick_current=state["tick"],
++            tick_spacing=state["tick_spacing"],
++            fee_pips=state["fee"],
++            tick_bitmap=cache.word,
++            tick_info=cache.info,
++        )
++        return int(q.amount_in), pool_address
++
+     def quote(
+         self,
+         base: str,
+diff --git a/docs/ev-private-memo.md b/docs/ev-private-memo.md
+index 59da321..7fe7ab6 100644
+--- a/docs/ev-private-memo.md
++++ b/docs/ev-private-memo.md
+@@ -10,6 +10,16 @@ edge is negative and nothing should be sent at all.
+ 
+ Written 2026-09-29. Re-read whenever the survey's median net bps turns positive.
+ 
++**Addendum 2026-09-30 (leg direction).** The contract now executes either leg
++order and the planner picks per scan — worth ~48 bps between the two, which is
++larger than the whole shortfall being chased. It does not change this memo's
++decision; if anything it sharpens it. A thinner edge means a front-runner taking
++the trade costs proportionally more of it, and the direction that wins is now
++visible in the SURVEY row's `direction` field, so there is a
++record of which shape was being attempted when it was taken. The submission rule
++is unchanged: private relay for anything competitive, public only for deploy,
++withdraw and funding.
++
+ ---
+ 
+ ## What the contract already protects
+diff --git a/main.py b/main.py
+index 38307a3..c30f3ba 100644
+--- a/main.py
++++ b/main.py
+@@ -1450,7 +1450,7 @@ def _loaded_deployment(net_key: str, contract: str):
+ 
+ 
+ def cmd_arb_plan(args) -> int:
+-    from arb.executor import PlanError, plan_arbitrage
++    from arb.executor import PlanError, plan_best_direction, plan_arbitrage, v3_router_uses_deadline
+     from config import get_venue, token_address, venues_for
+     from dex.cross import scan_venues
+     from dex.fetcher import ChainReader
+@@ -1511,32 +1511,62 @@ def cmd_arb_plan(args) -> int:
+     base_decimals = _decimals_on_chain(reader, base)
+     uses_deadline = _v3_router_shape(provider.w3, res)
+     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
+-    # The real cost of leg 1's buy. See _v2_buy_cost_fn: the sell quote the scan
+-    # reports is ~2x-fee cheaper than what buying actually costs.
++    # The real cost of leg 1's buy, for BOTH directions. See _v2_buy_cost_fn and
++    # _v3_buy_cost_fn: the sell quote the scan reports is ~2x-fee cheaper than
++    # what buying actually costs, whichever venue does the buying.
+     buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
++    v3_buy_fn, _v3r = _v3_buy_cost_fn(reader, venues, base, quote)
+ 
+     # Two passes, because the profit floor needs the gas cost and the gas cost
+     # needs a plan to simulate. Pass 1 builds with no floor; its only job is to
+     # be encodable so the exact call can be simulated. Pass 2 rebuilds from the
+     # same scan with the floor priced in. plan_arbitrage is pure, so the rebuild
+     # is deterministic and cheap.
++    v3_buy = v3_buy_fn(settings.trade_size_base) if v3_buy_fn else (None, None)
+     plan_kwargs = dict(
+         slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+         quote_decimals=quote_decimals, base_decimals=base_decimals,
+         v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
+         min_profit_buffer_bps=args.min_profit_buffer,
+         v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
++        v3_buy_cost_wei=v3_buy[0],
+     )
+     try:
+-        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
++        deadline_probe = (lambda r: bool(v3_router_uses_deadline(provider.w3, r))
++                          if r else True)
++        venue_pools = _pool_resolver_factory(reader, venues, base, quote)
++        any_venue = _any_venue_pool_for_fee(reader, venues, base, quote)
++        probe, _reports = plan_best_direction(
++            res, base, quote, pool_for_fee,
++            v3_uses_deadline_for=deadline_probe,
++            pool_for_fee_for_venue=venue_pools,
++            pool_for_fee_any_venue=any_venue, **plan_kwargs)
+         gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
+             provider, net, settings, res, probe, sender=None, contract_address=None)
+-        plan = plan_arbitrage(res, base, quote, pool_for_fee,
+-                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
++        plan, direction_reports = plan_best_direction(
++            res, base, quote, pool_for_fee,
++            v3_uses_deadline_for=deadline_probe,
++            pool_for_fee_for_venue=venue_pools,
++            pool_for_fee_any_venue=any_venue,
++            gas_cost_quote_wei=gas_quote, **plan_kwargs)
+     except PlanError as exc:
+         print(fmt.red(f"\n  {exc}"))
+         return 4
+ 
++    # Print how BOTH directions priced before the plan itself: leg order is the
++    # single biggest lever (measured ~48 bps on BSC), so the choice must be
++    # visible rather than implicit in which venue the plan names.
++    print(fmt.cyan("\n  DIRECTION"))
++    for r in direction_reports:
++        if r.plan is None:
++            print(f"    {r.label:<30} {fmt.dim('not plannable: ' + r.error[:60])}")
++        else:
++            # The chooser returns the chosen report's own plan object, so identity
++            # is the comparison.
++            mark = fmt.green("CHOSEN ") if r.plan is plan else fmt.dim("       ")
++            print(f"    {mark} {r.label:<30} gross {r.plan.expected_gross_bps:>+8.2f} bps  "
++                  f"net {r.net_bps:>+8.2f} bps")
++
+     print(fmt.cyan("\n  THE TRANSACTION THIS WOULD SEND"))
+     for line in plan.describe():
+         print("    " + line)
+@@ -1750,6 +1780,106 @@ def _v2_buy_cost_fn(reader, venues, base: str, quote: str):
+     return cost
+ 
+ 
++def _v3_buy_cost_fn(reader, venues, base: str, quote: str):
++    """
++    A callable(size_base) -> quote wei: what buying `size` costs on the V3 venue.
++
++    The mirror of `_v2_buy_cost_fn`. Every venue's quote answers the SELL
++    question ("I send this much base, what comes back?"), so pricing a V3 buy off
++    `size x exec_price` understates it by about twice that pool's fee — the same
++    bug that was measured at 50.3 bps on PancakeSwap V2 and is now fixed for that
++    leg. This asks the pool the inverse question directly with an exact-output
++    quote against the real tick bitmap.
++
++    Returned as (callable, fee_tier) so the planner can be told which pool leg 1
++    will swap through: V3-first borrows from one pool and buys through another,
++    and the contract requires the two to differ.
++    """
++    from dex.fetcher import UniswapV3Reader
++
++    v3_venue = next((v for v in venues if v.version == "v3"), None)
++    if v3_venue is None:
++        return None, None
++    v3_reader = UniswapV3Reader(reader, venue=v3_venue)
++
++    def cost(size_base: float):
++        from dex import uniswap_v2_math as v2math
++        from dex.fetcher import ChainReader  # noqa: F401 - documented dependency
++
++        # The pool the cheapest V3 buy would use; buy_cost_raw picks the deepest
++        # pool for the pair at that tier, which is what the router will use.
++        decimals = int(reader.decimals(base))
++        raw, pool = v3_reader.buy_cost_raw(base, quote, v2math.to_raw(size_base, decimals))
++        return int(raw), pool
++
++    return cost, v3_reader
++
++
++def _pool_resolver_factory(reader, venues, base: str, quote: str):
++    """
++    venue_key -> (fee_pips -> V3 pool address), bound to that venue's factory.
++
++    Needed because one chain can host several V3 venues with DIFFERENT fee tiers:
++    PancakeSwap V3 on BSC has 100/500/2500/10000, Uniswap V3 has
++    100/500/3000/10000. Resolving every leg through "the first V3 venue" answers
++    "no such pool" for tiers the other venue actually trades, which silently
++    produced an EMPTY leg-1 pool on a V3-first plan — and the contract rejects an
++    empty one, because it has to prove leg 1's pool is not the pool that lent the
++    tokens. It also meant the flash-loan search never considered the right venue's
++    tiers.
++    """
++    from dex.fetcher import UniswapV3Reader
++
++    readers: Dict[str, object] = {}
++
++    def for_venue(venue_key: str):
++        if venue_key not in readers:
++            venue = next((v for v in venues if v.key == venue_key), None)
++            readers[venue_key] = (UniswapV3Reader(reader, venue=venue)
++                                  if venue is not None else None)
++        bound = readers[venue_key]
++        if bound is None:
++            return lambda fee: ""
++        return lambda fee: bound.pool_for_fee(base, quote, fee)
++
++    return for_venue
++
++
++def _any_venue_pool_for_fee(reader, venues, base: str, quote: str):
++    """
++    fee_pips -> the first venue's pool at that tier, looking across ALL V3 venues.
++
++    Used only for the flash-loan search. The lender does not have to be the venue
++    the trade runs on, and the cheapest loan at a tier the traded venue deploys
++    may be thin while another venue's pool of the same pair is deep — so the
++    search should see every pool of this pair, not just the traded venue's.
++    Restricting it to one venue is what left a V3-first plan without a lender on
++    a chain that hosts two V3 venues with different tier lists.
++    """
++    from dex.fetcher import UniswapV3Reader
++
++    v3_venues = [v for v in venues if getattr(v, "version", "") == "v3"]
++    readers = [UniswapV3Reader(reader, venue=v) for v in v3_venues]
++    cache: Dict[int, str] = {}
++
++    def pool_for_fee(fee_pips: int) -> str:
++        key = int(fee_pips)
++        if key not in cache:
++            found = ""
++            for bound in readers:
++                try:
++                    addr = bound.pool_for_fee(base, quote, key)
++                except Exception:
++                    addr = ""
++                if addr:
++                    found = addr
++                    break
++            cache[key] = found
++        return cache[key]
++
++    return pool_for_fee
++
++
+ def _pool_quote_balance_fn(w3, quote_address: str):
+     """
+     A callable giving the quote-token balance held by any pool address.
+@@ -1814,7 +1944,8 @@ def _decimals_on_chain(reader, token_address_: str) -> int:
+ def cmd_arb_run(args) -> int:
+     from arb.compiler import load_build
+     from arb.deployer import DeployError, RevertedTx, build_tx, estimate_cost, send_and_wait
+-    from arb.executor import PlanError, decode_outcome, plan_arbitrage
++    from arb.executor import (PlanError, decode_outcome, plan_arbitrage,
++                              plan_best_direction, v3_router_uses_deadline)
+     from config import get_venue, token_address, venues_for
+     from dex.cross import scan_venues
+     from dex.fetcher import ChainReader, contract_factory
+@@ -1857,6 +1988,7 @@ def cmd_arb_run(args) -> int:
+     uses_deadline = _v3_router_shape(provider.w3, res)
+     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
+     buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
++    v3_buy_fn, _v3r = _v3_buy_cost_fn(reader, venues, base, quote)
+ 
+     # Only --execute needs the private key; a dry run just needs the address.
+     sender, account, wpath = _sender(args, need_key=bool(args.execute))
+@@ -1865,24 +1997,45 @@ def cmd_arb_run(args) -> int:
+     # exact call to simulate. Pass 1's plan exists only to be encoded; pass 2
+     # is what gets printed and sent. See _gas_cost_quote_wei for the conversion
+     # rules and what happens when the quote token is not the native asset.
++    v3_buy = v3_buy_fn(settings.trade_size_base) if v3_buy_fn else (None, None)
++    deadline_probe = (lambda r: bool(v3_router_uses_deadline(provider.w3, r))
++                      if r else True)
++    venue_pools = _pool_resolver_factory(reader, venues, base, quote)
++    any_venue = _any_venue_pool_for_fee(reader, venues, base, quote)
+     plan_kwargs = dict(
+         slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+         quote_decimals=quote_decimals, base_decimals=base_decimals,
+         v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
+         min_profit_buffer_bps=args.min_profit_buffer,
+         v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
++        v3_buy_cost_wei=v3_buy[0],
+     )
+     try:
+-        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
++        probe, _reports = plan_best_direction(
++            res, base, quote, pool_for_fee, v3_uses_deadline_for=deadline_probe,
++            pool_for_fee_for_venue=venue_pools,
++            pool_for_fee_any_venue=any_venue, **plan_kwargs)
+         gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
+             provider, net, settings, res, probe,
+             sender=sender, contract_address=contract_address)
+-        plan = plan_arbitrage(res, base, quote, pool_for_fee,
+-                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
++        plan, direction_reports = plan_best_direction(
++            res, base, quote, pool_for_fee, v3_uses_deadline_for=deadline_probe,
++            pool_for_fee_for_venue=venue_pools,
++            pool_for_fee_any_venue=any_venue,
++            gas_cost_quote_wei=gas_quote, **plan_kwargs)
+     except PlanError as exc:
+         print(fmt.red(f"  {exc}"))
+         return 4
+ 
++    print(fmt.cyan("  direction"))
++    for r in direction_reports:
++        if r.plan is None:
++            print(f"    {r.label:<30} {fmt.dim('not plannable: ' + r.error[:60])}")
++        else:
++            mark = fmt.green("CHOSEN ") if r.plan is plan else fmt.dim("       ")
++            print(f"    {mark} {r.label:<30} gross {r.plan.expected_gross_bps:>+8.2f} bps  "
++                  f"net {r.net_bps:>+8.2f} bps")
++
+     print(fmt.cyan("  plan"))
+     for line in plan.describe():
+         print("    " + line)
+@@ -1990,7 +2143,7 @@ def cmd_arb_survey(args) -> int:
+     import json as _json
+     import time
+ 
+-    from arb.executor import PlanError, plan_arbitrage
++    from arb.executor import PlanError, plan_best_direction, v3_router_uses_deadline
+     from config import get_venue, token_address, venues_for
+     from dex.cross import scan_venues
+     from dex.fetcher import ChainReader
+@@ -2053,15 +2206,21 @@ def cmd_arb_survey(args) -> int:
+                 return _v3_reader_for(reader, v3_venue).pool_for_fee(base, quote, fee_pips)
+ 
+             buy_cost = _v2_buy_cost_fn(reader, venues, base, quote)
+-            plan = plan_arbitrage(
++            v3_buy_fn_s, _ = _v3_buy_cost_fn(reader, venues, base, quote)
++            v3_buy_s = v3_buy_fn_s(settings.trade_size_base) if v3_buy_fn_s else (None, None)
++            plan, reports = plan_best_direction(
+                 res, base, quote, pool_for_fee,
++                v3_uses_deadline_for=(lambda r: bool(v3_router_uses_deadline(provider.w3, r))
++                                      if r else True),
++                pool_for_fee_for_venue=_pool_resolver_factory(reader, venues, base, quote),
++                pool_for_fee_any_venue=_any_venue_pool_for_fee(reader, venues, base, quote),
+                 slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+                 quote_decimals=_decimals_on_chain(reader, quote),
+                 base_decimals=_decimals_on_chain(reader, base),
+-                v3_uses_deadline=_v3_router_shape(provider.w3, res),
+                 flash_pool_quote_balance=_pool_quote_balance_fn(provider.w3, quote),
+                 min_profit_buffer_bps=args.min_profit_buffer,
+                 v2_buy_cost_wei=buy_cost(settings.trade_size_base) if buy_cost else None,
++                v3_buy_cost_wei=v3_buy_s[0],
+             )
+             # No contract and no sender here, so gas is priced from the fixed
+             # unit estimate x the live gas price — the same arithmetic the
+@@ -2083,6 +2242,13 @@ def cmd_arb_survey(args) -> int:
+                 if plan.flash_amount else 0.0
+             clears = net_wei >= max(plan.min_profit_floor, args.min_profit)
+ 
++            row["direction"] = "v3_first" if plan.v3_first else "v2_first"
++            row["directions"] = {
++                r.direction: ({"gross_bps": round(r.plan.expected_gross_bps, 2),
++                               "net_bps": round(r.net_bps, 2)} if r.plan is not None
++                              else {"error": r.error[:120]})
++                for r in reports
++            }
+             row.update({
+                 "buy": plan.buy_label, "sell": plan.sell_label,
+                 "buy_exec": plan.buy_exec, "sell_exec": plan.sell_exec,
+@@ -2101,7 +2267,7 @@ def cmd_arb_survey(args) -> int:
+             mark = fmt.green("CLEARS") if clears else fmt.dim("below ")
+             print(f"  [{i:>3}] blk {row.get('block', '?'):>10}  {mark}  "
+                   f"gross {row['gross_bps']:>+8.2f} bps  net {net_bps:>+8.2f} bps  "
+-                  f"({plan.buy_label} -> {plan.sell_label})")
++                  f"[{row['direction']}] ({plan.buy_label} -> {plan.sell_label})")
+         except PlanError as exc:
+             row["plan_error"] = str(exc)
+             print(f"  [{i:>3}] no plan: {exc}")
+@@ -2133,6 +2299,50 @@ def cmd_arb_survey(args) -> int:
+     return 0
+ 
+ 
++def cmd_arb_analyze(args) -> int:
++    """
++    Summarise the survey logs: which direction, venue pair and size the money is
++    in, and whether it persists over time.
++
++    Reads files only - no network, no wallet, no keys. It is safe to run against
++    logs that a survey is still appending to: each row is a complete JSON object
++    on its own line, so a partially written final line is skipped rather than
++    corrupting the read.
++    """
++    import glob as _glob
++    import json as _json
++    from pathlib import Path
++
++    from arb.survey_report import analyze, load_rows, render
++
++    if args.logs:
++        paths = [Path(p) for p in args.logs]
++    else:
++        found = sorted(_glob.glob("logs/*survey*.jsonl")) or \
++            sorted(_glob.glob("logs/*.jsonl"))
++        paths = [Path(p) for p in found]
++
++    rows = load_rows(paths)
++    if not rows:
++        print(fmt.red("  no survey rows found."))
++        print(fmt.dim("    looked in: "
++                      + (", ".join(str(p) for p in paths) if paths else "logs/*.jsonl")))
++        print(fmt.dim("    start one with:  python main.py arb survey --network bsc "
++                      "--base WBNB --quote USDT --size 1"))
++        return 2
++
++    report = analyze(rows, file_count=len(paths))
++    if args.json_out:
++        print(_json.dumps(report, indent=2, default=str))
++        return 0
++
++    print(fmt.banner("ARB  ·  survey analysis"))
++    for line in render(report):
++        print(line)
++    print()
++    return 0
++
++
+ def cmd_arb_status(args) -> int:
+     from arb.compiler import load_build
+     from config import token_address
+@@ -2461,6 +2671,15 @@ def build_parser() -> argparse.ArgumentParser:
+                     help="JSONL file to append results to (default logs/arb_survey.jsonl)")
+     ap.set_defaults(func=cmd_arb_survey)
+ 
++    ap = asub.add_parser("analyze",
++                         help="read the survey logs and say where the edge lives "
++                              "(direction, venue pair, size, and whether it persists)")
++    ap.add_argument("--logs", nargs="*", default=None,
++                    help="JSONL files (default: every logs/*survey*.jsonl)")
++    ap.add_argument("--json", dest="json_out", action="store_true",
++                    help="emit the report as JSON instead of text")
++    ap.set_defaults(func=cmd_arb_analyze)
++
+     ap = asub.add_parser("status", help="check the deployment and what it holds")
+     common(ap)
+     ap.add_argument("--contract", default="FlashArb")
+diff --git a/tests/test_fork.py b/tests/test_fork.py
+index 5bae87c..763bafe 100644
+--- a/tests/test_fork.py
++++ b/tests/test_fork.py
+@@ -343,13 +343,49 @@ def _scan(provider, net):
+     return res, reader
+ 
+ 
+-def _plan_from(provider, net, res, reader):
+-    """Build the exact plan `arb run` would send, floor included."""
++def _pool_resolver_for(reader, venues, base: str, quote: str):
++    """venue_key -> (fee -> pool), as the CLI builds it. See main._pool_resolver_factory."""
++    from dex.fetcher import UniswapV3Reader
++
++    readers: dict = {}
++
++    def for_venue(venue_key: str):
++        if venue_key not in readers:
++            venue = next((v for v in venues if v.key == venue_key), None)
++            readers[venue_key] = (UniswapV3Reader(reader, venue=venue)
++                                  if venue is not None else None)
++        bound = readers[venue_key]
++        if bound is None:
++            return lambda fee: ""
++        return lambda fee: bound.pool_for_fee(base, quote, fee)
++
++    return for_venue
++
++
++def _direction_versions(direction: str):
++    if direction == "v3_first":
++        return "v3", "v2"
++    if direction == "v2_first":
++        return "v2", "v3"
++    return None, None          # auto: let the chooser decide
++
++
++def _plan_from(provider, net, res, reader, direction: str = "auto",
++               lender_venue: str = ""):
++    """
++    Build the exact plan `arb run` would send, floor included.
++
++    Mirrors production for BOTH directions: the buy cost is priced with the same
++    exact-output quote for a V3 leg and getAmountIn for a V2 leg, pool resolution
++    is venue-aware, and `direction="auto"` runs the same chooser the CLI does.
++    A fork test that plans differently from the bot tests nothing about the bot.
++    """
+     from abis import ERC20_ABI
+     from arb.deployer import gas_price_wei
+-    from arb.executor import plan_arbitrage, v3_router_uses_deadline
++    from arb.executor import plan_arbitrage, plan_best_direction, v3_router_uses_deadline
+     from config import token_address, venues_for
+-    from dex.fetcher import UniswapV3Reader
++    from dex import uniswap_v2_math as v2math
++    from dex.fetcher import UniswapV2Reader, UniswapV3Reader
+ 
+     w3 = provider.w3
+     base = token_address(net, "WBNB")
+@@ -362,6 +398,21 @@ def _plan_from(provider, net, res, reader):
+             return ""
+         return UniswapV3Reader(reader, venue=v3_venue).pool_for_fee(base, quote, fee_pips)
+ 
++    venue_pools = _pool_resolver_for(reader, venues, base, quote)
++
++    # The lender may come from any V3 venue's pool of this pair, so the search
++    # resolver walks them all - the same way main._any_venue_pool_for_fee does.
++    def any_venue_pool_for_fee(fee_pips: int) -> str:
++        for v in venues:
++            if getattr(v, "version", "") != "v3":
++                continue
++            addr = venue_pools(v.key)(fee_pips)
++            if addr:
++                return addr
++        return ""
++
++    assert any_venue_pool_for_fee.__name__ == "any_venue_pool_for_fee"
++
+     token = w3.eth.contract(address=Web3.to_checksum_address(quote), abi=ERC20_ABI)
+     cache: dict = {}
+ 
+@@ -371,20 +422,13 @@ def _plan_from(provider, net, res, reader):
+             cache[key] = int(token.functions.balanceOf(pool).call())
+         return cache[key]
+ 
+-    sell = next((q for q in res.usable if q.version == "v3"), None)
+-    assert sell is not None and sell.router_address, "no usable V3 leg on the fork"
+-
+     # The floor's gas figure, converted to the quote token the way the CLI does:
+-    # units x price = native wei; x USDT-per-WBNB (the sell price IS that, and
+-    # WBNB is BNB) = USDT wei.
+-    gas_quote = int(Decimal(GAS_UNITS * gas_price_wei(w3)) * Decimal(str(sell.exec_price)))
+-
+-    # Leg 1's real buy cost, exactly as the CLI computes it: getAmountIn on the
+-    # pair's live reserves. Mirroring production here is the point — a fork test
+-    # that plans differently from the bot tests nothing about the bot.
+-    from dex import uniswap_v2_math as v2math
+-    from dex.fetcher import UniswapV2Reader
++    # units x price = native wei; x USDT-per-WBNB (WBNB is BNB) = USDT wei.
++    v3_quote = next((q for q in res.usable if q.version == "v3"), None)
++    assert v3_quote is not None and v3_quote.router_address, "no usable V3 leg on the fork"
++    gas_quote = int(Decimal(GAS_UNITS * gas_price_wei(w3)) * Decimal(str(v3_quote.exec_price)))
+ 
++    # Leg 1's real buy cost for BOTH possible legs.
+     v2_venue = next(v for v in venues if v.version == "v2")
+     pair_reader = UniswapV2Reader(reader, venue=v2_venue)
+     pair = pair_reader.pair_address(base, quote)
+@@ -392,20 +436,55 @@ def _plan_from(provider, net, res, reader):
+     reserve_base, reserve_quote = reserves.reserves_for(base)
+     base_dec = (reserves.decimals0 if base.lower() == reserves.token0.lower()
+                 else reserves.decimals1)
+-    buy_cost = int(v2math.get_amount_in(v2math.to_raw(SIZE_BASE, base_dec),
+-                                        reserve_quote, reserve_base,
+-                                        pair_reader.fee_num, pair_reader.fee_den))
++    v2_buy_cost = int(v2math.get_amount_in(v2math.to_raw(SIZE_BASE, base_dec),
++                                           reserve_quote, reserve_base,
++                                           pair_reader.fee_num, pair_reader.fee_den))
+ 
+-    plan = plan_arbitrage(
+-        res, base, quote, pool_for_fee,
++    v3_buy_cost = None
++    if v3_venue is not None:
++        try:
++            v3_reader = UniswapV3Reader(reader, venue=v3_venue)
++            raw, _pool = v3_reader.buy_cost_raw(
++                base, quote, v2math.to_raw(SIZE_BASE, int(reader.decimals(base))))
++            v3_buy_cost = int(raw)
++        except Exception:            # a V3 venue that cannot be quoted exact-out
++            v3_buy_cost = None
++
++    # A lender from ONE venue, when a test wants to force which venue's pool
++    # lends the loan. That is how the Uniswap V3 flash callback gets exercised:
++    # both venues' pools of this pair call a callback this contract implements,
++    # and only a forced choice proves the second one works.
++    if lender_venue:
++        any_lender = venue_pools(lender_venue)
++    else:
++        any_lender = any_venue_pool_for_fee
++
++    kwargs = dict(
+         slippage_bps=100.0, min_profit_wei=0,
+         quote_decimals=int(reader.decimals(quote)),
+         base_decimals=int(reader.decimals(base)),
+-        v3_uses_deadline=v3_router_uses_deadline(w3, sell.router_address),
+         flash_pool_quote_balance=quote_balance_of,
+         gas_cost_quote_wei=gas_quote,
+-        v2_buy_cost_wei=buy_cost,
++        v2_buy_cost_wei=v2_buy_cost,
++        v3_buy_cost_wei=v3_buy_cost,
+     )
++    buy_version, sell_version = _direction_versions(direction)
++    if buy_version is None:
++        plan, _reports = plan_best_direction(
++            res, base, quote, pool_for_fee,
++            v3_uses_deadline_for=lambda r: v3_router_uses_deadline(w3, r) if r else True,
++            pool_for_fee_for_venue=venue_pools,
++            pool_for_fee_any_venue=any_lender, **kwargs)
++    else:
++        v3_router = (next((q for q in res.usable if q.version == "v3"), None)
++                     .router_address)
++        plan = plan_arbitrage(
++            res, base, quote, pool_for_fee,
++            buy_version=buy_version, sell_version=sell_version,
++            v3_uses_deadline=v3_router_uses_deadline(w3, v3_router),
++            pool_for_fee_for_venue=venue_pools,
++            pool_for_fee_any_venue=any_lender,
++            **kwargs)
+     return plan, pool_for_fee
+ 
+ 
+@@ -453,9 +532,17 @@ def _reserves_slot(w3, pair: str) -> int:
+     )
+ 
+ 
+-def _apply_skew(w3, pair: str, slot: int, factor: float) -> Tuple[int, int, int]:
++def _apply_skew(w3, pair: str, slot: int, factor: float,
++                field: str = "quote") -> Tuple[int, int, int]:
+     """
+-    Scale a pair's stored input-token reserve, and return (r0, r1, new_r0).
++    Scale ONE of a pair's stored reserves, and return (r0, r1, new_value).
++
++    `field="quote"` scales reserve0 (the quote token's side) and makes the BASE
++    token cheaper on this pair: buying base here becomes the profitable leg, so
++    the V2-FIRST direction has an edge. `field="base"` scales reserve1 and makes
++    base dearer: selling base here pays more, which is the V3-FIRST (mirror)
++    direction's edge. Between them the two fields let either leg order be tested
++    on real pools instead of only the one the market happens to offer.
+ 
+     This must be re-applied before every trade that consumes it: V2's swap()
+     ends with `_update(balance0, balance1, ...)`, which writes the pair's REAL
+@@ -466,71 +553,158 @@ def _apply_skew(w3, pair: str, slot: int, factor: float) -> Tuple[int, int, int]
+     """
+     r0, r1, ts = _decoded_reserves(w3, pair, slot)
+     assert r0 > 0 and r1 > 0, "pair has empty reserves; nothing to skew"
+-    new_r0 = int(r0 * factor)
+-    packed = new_r0 | (r1 << 112) | (ts << 224)
++    new_r0 = int(r0 * factor) if field == "quote" else r0
++    new_r1 = int(r1 * factor) if field == "base" else r1
++    packed = new_r0 | (new_r1 << 112) | (ts << 224)
+     resp = w3.provider.make_request(
+         "anvil_setStorageAt", [Web3.to_checksum_address(pair), hex(slot), hex(packed)])
+     assert "error" not in resp or not resp["error"], \
+         f"anvil refused the storage write: {resp}"
+     after = _decoded_reserves(w3, pair, slot)
+-    assert after[0] == new_r0 and after[1] == r1, "the storage write did not take effect"
+-    return r0, r1, new_r0
++    assert after[0] == new_r0 and after[1] == new_r1, "the storage write did not take effect"
++    return r0, r1, (new_r0 if field == "quote" else new_r1)
++
++
++def _write_reserves(w3, pair: str, slot: int, r0: int, r1: int) -> None:
++    """Write a pair's stored reserves back, with a fresh timestamp."""
++    packed = int(r0) | (int(r1) << 112) | (int(time.time()) << 224)
++    resp = w3.provider.make_request(
++        "anvil_setStorageAt", [Web3.to_checksum_address(pair), hex(slot), hex(packed)])
++    assert "error" not in resp or not resp["error"], \
++        f"anvil refused the restore: {resp}"
++    back = _decoded_reserves(w3, pair, slot)
++    assert back[0] == int(r0) and back[1] == int(r1), "the restore did not take effect"
+ 
+ 
+ class Skewed:
+     """A plan whose edge comes from a skewed pair, plus how to re-apply it."""
+ 
+-    def __init__(self, plan, res, skew, resolver, pair, slot):
++    def __init__(self, plan, res, skew, resolver, pair, slot, field="quote",
++                 restore=None, venue_pools=None):
+         self.plan = plan
+         self.res = res
+         self.skew = skew
+         self.resolver = resolver
++        # venue_key -> (fee -> pool), so a test can resolve a leg through the
++        # factory of the venue it actually trades on.
++        self.venue_pools = venue_pools
+         self.pair = pair
+         self.slot = slot
++        self.field = field
++        # The pair's stored reserves as they were before this fixture wrote to
++        # them, so teardown can put them back.
++        self.restore = restore or (0, 0)
+ 
+ 
+-@pytest.fixture(scope="module")
++def _build_skewed(provider, net, res0, field: str, direction: str,
++                  lender_venue: str = "") -> "Skewed":
++    """
++    Skew the WBNB/USDT pair's stored reserves, then build the plan for ONE
++    direction against that state.
++
++    Order matters and is the whole point: the write happens FIRST and the plan is
++    built from a fresh scan of the skewed state, because a plan built before the
++    write prices a market that no longer exists. Sharing one plan across tests
++    while re-skewing per test is the same mistake one level up - the second test
++    then trades against a floor derived from the first test's reserves.
++    """
++    w3 = provider.w3
++    v2 = next((q for q in res0.usable if q.version == "v2"), None)
++    assert v2 is not None and v2.pool_address, "no usable V2 leg to skew"
++
++    slot = _reserves_slot(w3, v2.pool_address)
++    before = _decoded_reserves(w3, v2.pool_address, slot)
++    skew = _apply_skew(w3, v2.pool_address, slot, SKEW_FACTOR, field=field)
++
++    # Re-scan so the plan prices the skewed state exactly as production would,
++    # and PIN the direction: these fixtures exist to exercise a specific leg
++    # order, and letting the chooser pick would silently swap what is under test
++    # whenever the market moves.
++    res, reader = _scan(provider, net)
++    plan, resolver = _plan_from(provider, net, res, reader, direction=direction,
++                                lender_venue=lender_venue)
++    from config import token_address, venues_for
++
++    resolvers = _pool_resolver_for(reader, venues_for(net.key),
++                                   token_address(net, "WBNB"),
++                                   token_address(net, "USDT"))
++    return Skewed(plan, res, skew, resolver, v2.pool_address, slot, field=field,
++                  restore=(before[0], before[1]), venue_pools=resolvers)
++
++
++@pytest.fixture
+ def skewed_plan(provider, forked_net, live_plan):
+     """
+-    A plan built against a V2 pair whose price has been deliberately skewed.
++    A V2-FIRST plan built against a V2 pair whose price has been deliberately
++    skewed (the shape the original single-direction contract was written for).
+ 
+     The pair's stored USDT reserve is scaled by SKEW_FACTOR (default 0.98), which
+     makes WBNB ~2% cheaper there than the market while leaving the V3 leg priced
+-    by the real market — i.e. a guaranteed, repeatable arbitrage. The write is a
++    by the real market - i.e. a guaranteed, repeatable arbitrage. The write is a
+     single storage slot on a throwaway fork; the contract, routers, pools and
+     token balances are all real mainnet ones.
+ 
+-    The k-invariant check inside V2's swap() is satisfied because it compares
+-    the ACTUAL balances (which stay large) against the STORED reserves (which
++    The k-invariant check inside V2's swap() is satisfied because it compares the
++    ACTUAL balances (which stay large) against the STORED reserves (which
+     shrink): the manufactured price is unfavourable to the pool in the same
+     direction that makes the k check pass more easily.
+-    """
+-    w3 = provider.w3
+-    plan0, res0, _ = live_plan
+-    v2 = next((q for q in res0.usable if q.version == "v2"), None)
+-    assert v2 is not None and v2.pool_address, "no usable V2 leg to skew"
+-
+-    slot = _reserves_slot(w3, v2.pool_address)
+-    skew = _apply_skew(w3, v2.pool_address, slot, SKEW_FACTOR)
+ 
+-    # Re-scan so the plan prices the skewed state exactly as production would.
+-    res, reader = _scan(provider, forked_net)
+-    plan, resolver = _plan_from(provider, forked_net, res, reader)
+-    return Skewed(plan, res, skew, resolver, v2.pool_address, slot)
++    Function-scoped, and the pair is handed back exactly as it was found. Both
++    halves are load-bearing: a trade through the pair syncs its stored reserves
++    back to reality, so a module-scoped plan would hand later tests a price that
++    no longer exists, and a leaked write would leave the next fixture skewing an
++    already-skewed pair (0.98 x on both sides cancels out entirely, leaving a
++    plan with no edge whose legs fail on their own slippage floors).
++    """
++    built = _build_skewed(provider, forked_net, live_plan[1], "quote", "v2_first")
++    assert not built.plan.v3_first, "this fixture must produce a V2-first plan"
++    try:
++        yield built
++    finally:
++        _write_reserves(provider.w3, built.pair, built.slot, *built.restore)
+ 
+ 
+ @pytest.fixture
+-def fresh_skew(provider, skewed_plan):
++def mirror_plan(provider, forked_net, live_plan):
++    """
++    A V3-FIRST plan with a manufactured edge: the pair's stored BASE reserve is
++    scaled down, so V2 pays MORE per WBNB than the market does and buying on V3
++    to sell on V2 is profitable.
++
++    This is the direction added on 2026-09-30, specifically because the two leg
++    orders differed by ~48 bps on live BSC. It also exercises the Uniswap V3
++    flash path when the lender ends up being a Uniswap pool, which is what the
++    venue-aware pool resolver now allows and what `uniswapV3FlashCallback` exists
++    for.
+     """
+-    The skewed plan, with the skew re-applied for THIS test.
++    built = _build_skewed(provider, forked_net, live_plan[1], "base", "v3_first")
++    assert built.plan.v3_first, "this fixture must produce a V3-first plan"
++    try:
++        yield built
++    finally:
++        _write_reserves(provider.w3, built.pair, built.slot, *built.restore)
+ 
+-    Function-scoped on purpose: any trade through the pair syncs its reserves
+-    back to reality (see _apply_skew), so a module-scoped fixture would hand
+-    later tests a plan whose price no longer exists.
++
++def _v3_pool_of_plan(plan, res, venue_pools) -> str:
+     """
+-    w3 = provider.w3
+-    _apply_skew(w3, skewed_plan.pair, skewed_plan.slot, SKEW_FACTOR)
+-    return skewed_plan
++    The V3 pool the plan's V3 leg will actually swap through, resolved the same
++    way the plan was.
++
++    Not `plan.v3_leg1_pool`: that is only populated for V3-FIRST plans, because
++    in the other direction the pool is whatever the router derives from
++    (tokenIn, tokenOut, fee) - the planner pinned the fee, not the address. And
++    not the generic resolver either: it is bound to ONE venue, and the V3 leg can
++    easily be on the other one (Uniswap 0.30% has no Pancake equivalent), which
++    answers "no pool" for the tier the plan actually trades.
++    """
++    if plan.v3_first and plan.v3_leg1_pool:
++        return plan.v3_leg1_pool
++    venue_key = next((q.venue_key for q in res.usable
++                      if q.version == "v3" and q.router_address
++                      and q.router_address.lower() == plan.v3_router.lower()), None)
++    if venue_key is None:
++        return ""
++    return venue_pools(venue_key)(plan.v3_fee) or ""
+ 
+ 
+ def _usdt_balance_of(w3, token_address_: str, who: str) -> int:
+@@ -572,6 +746,28 @@ def _run_trade(w3, contract, plan, sender: str):
+     return receipt, outcome
+ 
+ 
++@pytest.fixture
++def univ3_lender_plan(provider, forked_net, live_plan):
++    """
++    A V3-first plan forced to borrow from the UNISWAP V3 pool, not Pancake's.
++
++    This exists because the flash pool stopped being implicitly the Pancake pool
++    on 2026-09-30: the planner now searches fee tiers across every V3 venue of
++    the pair, and whichever pool lends must call a callback this contract
++    implements. Uniswap V3 pools call `uniswapV3FlashCallback`; Pancake's call
++    `pancakeV3FlashCallback`. Before the second entry point existed, borrowing
++    from a Uniswap pool reverted with EMPTY returndata - which reads like a
++    broken pool, not a missing function - so this test is the difference between
++    "the planner may choose it" and "the contract can survive it".
++    """
++    built = _build_skewed(provider, forked_net, live_plan[1], "base", "v3_first",
++                          lender_venue="uniswap_v3")
++    try:
++        yield built
++    finally:
++        _write_reserves(provider.w3, built.pair, built.slot, *built.restore)
++
++
+ # --------------------------------------------------------------------------
+ # 1. the live plan is atomic: profit, or a clean revert
+ # --------------------------------------------------------------------------
+@@ -630,10 +826,10 @@ def test_live_plan_either_profits_or_reverts_cleanly(provider, live_plan, deploy
+ # --------------------------------------------------------------------------
+ # 2. a real round trip, on real pools, with a manufactured edge
+ # --------------------------------------------------------------------------
+-def test_manufactured_edge_profits_though_real_pools(provider, fresh_skew, deployed):
++def test_manufactured_edge_profits_though_real_pools(provider, skewed_plan, deployed):
+     contract, abi, acct, addr = deployed
+-    plan, res, skew, resolver = fresh_skew.plan, fresh_skew.res, \
+-        fresh_skew.skew, fresh_skew.resolver
++    plan, res, skew, resolver = skewed_plan.plan, skewed_plan.res, \
++        skewed_plan.skew, skewed_plan.resolver
+     w3 = provider.w3
+     r0, r1, new_r0 = skew
+ 
+@@ -668,12 +864,117 @@ def test_manufactured_edge_profits_though_real_pools(provider, fresh_skew, deplo
+     )
+ 
+ 
++# --------------------------------------------------------------------------
++# 2b. the MIRROR direction (V3-first) profits on real pools
++# --------------------------------------------------------------------------
++def test_mirror_direction_profits_though_real_pools(provider, mirror_plan, deployed):
++    """
++    The direction that did not exist before 2026-09-30.
++
++    Leg 1 buys on the V3 router and leg 2 sells on the V2 router - the mirror of
++    the original design, and worth ~48 bps on live BSC because each leg pays its
++    own venue's fee. Proving it here means: the struct's new fields reach the
++    contract, the direction dispatch in the callback works, the V3 leg-1 pool
++    validation passes against a real pool, and the V2 sell leg settles.
++
++    It also exercises `uniswapV3FlashCallback` whenever the lender is a Uniswap
++    pool, which the venue-aware pool resolver now permits.
++    """
++    contract, abi, acct, addr = deployed
++    plan, res, skew, resolver = (mirror_plan.plan, mirror_plan.res,
++                                 mirror_plan.skew, mirror_plan.resolver)
++    w3 = provider.w3
++
++    assert plan.v3_first, "fixture must be V3-first"
++    assert plan.v3_leg1_pool, "a V3-first plan must name leg 1's pool for the contract"
++    assert plan.v3_leg1_pool.lower() != plan.pool.lower(), (
++        "leg 1's pool must differ from the lending pool; flash() holds that pool's lock"
++    )
++    assert plan.expected_gross_bps > 0, (
++        f"the skew was meant to create an edge; the plan sees "
++        f"{plan.expected_gross_bps:.1f} bps"
++    )
++
++    before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
++    receipt, outcome = _run_trade(w3, contract, plan, acct)
++    assert receipt.status == 1, "the V3-first arbitrage reverted on real mainnet pools"
++    assert outcome is not None, "no ArbitrageExecuted event was emitted"
++    assert bool(outcome.get("outcome.v3First", False)) is True, (
++        "the event must record the direction that ran"
++    )
++
++    profit = int(outcome["outcome.profit"])
++    assert profit > 0, f"mirror round trip did not profit: {profit} wei"
++    assert profit >= plan.min_profit, (
++        f"profit {profit} below the plan's own floor {plan.min_profit}"
++    )
++    assert _usdt_balance_of(w3, plan.borrow_token, addr) == before_usdt + profit
++
++
++# --------------------------------------------------------------------------
++# 2bb. a flash loan from a UNISWAP V3 pool repays through the second callback
++# --------------------------------------------------------------------------
++def test_univ3_lender_repays_through_uniswap_callback(provider, univ3_lender_plan,
++                                                      deployed):
++    contract, abi, acct, addr = deployed
++    plan = univ3_lender_plan.plan
++    w3 = provider.w3
++
++    univ3_pool = univ3_lender_plan.venue_pools("uniswap_v3")(plan.flash_fee_pips)
++    assert univ3_pool, "no Uniswap V3 pool at the plan's tier; fixture is wrong"
++    assert plan.pool.lower() == univ3_pool.lower(), (
++        f"the fixture must force a Uniswap V3 lender; the plan borrows from "
++        f"{plan.pool} instead"
++    )
++
++    before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
++    receipt, outcome = _run_trade(w3, contract, plan, acct)
++
++    assert receipt.status == 1, (
++        "the trade reverted when the flash loan came from a Uniswap V3 pool - "
++        "check that uniswapV3FlashCallback reaches the same body as Pancake's"
++    )
++    assert outcome is not None, "no ArbitrageExecuted event was emitted"
++    profit = int(outcome["outcome.profit"])
++    assert profit > 0, f"round trip did not profit: {profit} wei"
++    assert _usdt_balance_of(w3, plan.borrow_token, addr) == before_usdt + profit
++
++
++# --------------------------------------------------------------------------
++# 2c. a leg-1 pool equal to the lending pool is refused by the contract
++# --------------------------------------------------------------------------
++def test_leg1_pool_equal_to_flash_pool_is_refused(provider, mirror_plan, deployed):
++    """
++    In mirror mode the V3 swap is leg 1, so a plan naming the LENDING pool as
++    leg 1's pool would swap into a pool that is locked for the whole callback.
++
++    Two layers stop it: the planner excludes the lending pool when choosing legs,
++    and the contract now validates leg 1's pool explicitly. This asserts the
++    CONTRACT's layer, because that is the one that holds when a hand-built plan
++    is sent - and the failure it produces (`Leg1PoolIsFlashPool`) is legible,
++    where the underlying 'LOK' from the router is not.
++    """
++    contract, abi, acct, addr = deployed
++    plan = mirror_plan.plan
++    w3 = provider.w3
++
++    trapped = dataclasses.replace(plan, pool=plan.v3_leg1_pool)
++    selector = "0x" + keccak(text="Leg1PoolIsFlashPool(address)")[:4].hex()
++
++    with pytest.raises(Exception) as excinfo:      # noqa: PT011 - asserted below
++        _retry(lambda: contract.functions.arbitrage(*trapped.call_args)
++               .call({"from": acct}), "simulating a trapped leg-1 pool")
++    assert selector.lower() in str(excinfo.value).lower(), (
++        f"expected Leg1PoolIsFlashPool ({selector}), got: {excinfo.value}"
++    )
++
++
+ # --------------------------------------------------------------------------
+ # 3. an unreachable floor reverts and moves nothing
+ # --------------------------------------------------------------------------
+-def test_impossible_min_profit_reverts_without_moving_tokens(provider, fresh_skew, deployed):
++def test_impossible_min_profit_reverts_without_moving_tokens(provider, skewed_plan, deployed):
+     contract, abi, acct, addr = deployed
+-    plan = fresh_skew.plan
++    plan = skewed_plan.plan
+     w3 = provider.w3
+ 
+     before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
+@@ -694,7 +995,7 @@ def test_impossible_min_profit_reverts_without_moving_tokens(provider, fresh_ske
+ # --------------------------------------------------------------------------
+ # 4. the LOK trap stays closed
+ # --------------------------------------------------------------------------
+-def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, deployed):
++def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, skewed_plan, deployed):
+     """
+     The flash loan must not come from the pool leg 2 swaps through: flash()
+     holds that pool's lock for the whole callback, so the swap inside it reverts
+@@ -702,7 +1003,7 @@ def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, dep
+     choose_flash_pool avoiding it is load-bearing rather than defensive.
+     """
+     contract, abi, acct, addr = deployed
+-    plan, resolver = fresh_skew.plan, fresh_skew.resolver
++    plan, resolver = skewed_plan.plan, skewed_plan.resolver
+     w3 = provider.w3
+ 
+     # The pool leg 2 actually swaps through is the one the PLANNER resolved for
+@@ -710,8 +1011,9 @@ def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, dep
+     # different tier much of the time, and the trapped plan then fails for an
+     # unrelated reason (it borrowed from an arbitrary pool) instead of
+     # demonstrating LOK — which is exactly what happened while writing this.
+-    leg2_pool = resolver(plan.v3_fee)
+-    assert leg2_pool, f"could not resolve a pool for tier {plan.v3_fee}"
++    leg2_pool = _v3_pool_of_plan(plan, skewed_plan.res, skewed_plan.venue_pools)
++    assert leg2_pool, (f"could not resolve the plan's V3 pool for tier {plan.v3_fee} "
++                       f"on router {plan.v3_router}")
+     assert leg2_pool.lower() != plan.pool.lower(), (
+         "the flash pool and leg 2's pool must differ; otherwise this tests nothing"
+     )
+@@ -731,9 +1033,9 @@ def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, dep
+ # --------------------------------------------------------------------------
+ # 5. withdrawals are owner-only, and move the real amount
+ # --------------------------------------------------------------------------
+-def test_withdraw_is_owner_only_then_moves_exactly_that_amount(provider, fresh_skew, deployed):
++def test_withdraw_is_owner_only_then_moves_exactly_that_amount(provider, skewed_plan, deployed):
+     contract, abi, acct, addr = deployed
+-    plan = fresh_skew.plan
++    plan = skewed_plan.plan
+     w3 = provider.w3
+ 
+     if _usdt_balance_of(w3, plan.borrow_token, addr) == 0:
+@@ -766,7 +1068,7 @@ def test_withdraw_is_owner_only_then_moves_exactly_that_amount(provider, fresh_s
+ # --------------------------------------------------------------------------
+ # 6. the contract's fee preview agrees with the planner, to the wei
+ # --------------------------------------------------------------------------
+-def test_preview_flash_fee_matches_the_planner(provider, fresh_skew, deployed):
++def test_preview_flash_fee_matches_the_planner(provider, skewed_plan, deployed):
+     """
+     The planner computes ceil(amount * tier / 1e6) off-chain and the pool
+     charges its own figure on-chain. If they ever disagree the plan is
+@@ -774,10 +1076,11 @@ def test_preview_flash_fee_matches_the_planner(provider, fresh_skew, deployed):
+     pool — and compare.
+     """
+     contract, abi, acct, addr = deployed
+-    plan = fresh_skew.plan
++    plan = skewed_plan.plan
+ 
+     fee0, fee1 = contract.functions.previewFlashFee(plan.pool, plan.flash_amount).call()
+     assert fee0 == fee1 == plan.expected_flash_fee, (
+         f"planner says the flash fee is {plan.expected_flash_fee} wei, the pool says "
+         f"{fee0}/{fee1} wei — the plan is pricing its own loan wrong"
+     )
++
+diff --git a/tests/test_math.py b/tests/test_math.py
+index ce43da7..c045770 100644
+--- a/tests/test_math.py
++++ b/tests/test_math.py
+@@ -2438,16 +2438,45 @@ def plan_calldata_encoding_survives_a_roundtrip():
+     # unpacked: passing it whole makes web3 try to encode a list as an address.
+     data = obj.encode_abi(abi_element_identifier="arbitrage", args=list(plan.call_args))
+ 
++    # The expected selector and the decode signature are both DERIVED from the
++    # compiled ABI rather than written out by hand. A hand-typed signature is a
++    # copy of the struct that can silently disagree with it - the previous
++    # version of this test hard-coded the pre-direction signature, which is a
++    # fine way to detect ABI drift and a terrible way to then fix it, since the
++    # fix is another hand-typed string that can be wrong in the same way.
++    fn_abi = next(e for e in compiled.abi
++                  if e.get("type") == "function" and e.get("name") == "arbitrage")
++
++    def _type_of(item: dict) -> str:
++        t = item["type"]
++        if t == "tuple":
++            return "(" + ",".join(_type_of(c) for c in item["components"]) + ")"
++        if t.startswith("tuple["):
++            return ("(" + ",".join(_type_of(c) for c in item["components"]) + ")"
++                    + t[len("tuple"):])
++        return t
++
++    # Two different strings are needed here and they are easy to swap:
++    #
++    #   selector  = keccak("arbitrage" + "(" + args + ")")  -> one parenthesised
++    #               parameter list, so `args` = the struct type
++    #   decode    = the STRUCT type alone. Calldata for a function taking one
++    #               dynamic tuple starts with the offset word for that tuple, and
++    #               eth_abi consumes exactly that when the type is the dynamic
++    #               tuple itself - wrapping it again makes it read the offset as
++    #               the first field and fail on the next pointer.
++    struct_type = _type_of(fn_abi["inputs"][0])
++    selector_sig = "(" + struct_type + ")"
+     expected = "0x" + __import__("eth_utils").keccak(
+-        text="arbitrage((address,address,uint256,address,address[],uint256,address,"
+-             "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256,bool))"
+-    )[:4].hex()
+-    check(data[:10] == expected, f"selector {data[:10]} != {expected}")
+-
+-    sig = ("(address,address,uint256,address,address[],uint256,address,"
+-           "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256,bool)")
+-    (decoded,) = abi_decode([sig], bytes.fromhex(data[10:]))
+-    pool, borrow, amount, v2r, path, v2min, v3r, v3p, minprofit, uses_deadline = decoded
++        text="arbitrage" + selector_sig)[:4].hex()
++    check(data[:10] == expected,
++          f"planner encoded {data[:10]}, the compiled ABI says {expected} - "
++          f"call_args and the struct have drifted apart")
++
++    (decoded,) = abi_decode([struct_type], bytes.fromhex(data[10:]))
++    check(len(decoded) == 12, f"expected 12 struct fields, decoded {len(decoded)}")
++    (pool, borrow, amount, v2r, path, v2min, v3r, v3p,
++     minprofit, uses_deadline, v3_first, v3_leg1_pool) = decoded
+     eq = lambda a, b: str(a).lower() == str(b).lower()
+     check(eq(pool, plan.pool), "pool did not survive encoding")
+     check(eq(borrow, plan.borrow_token), "borrowToken did not survive encoding")
+@@ -3585,6 +3614,228 @@ def the_loan_is_sized_from_the_real_buy_cost_not_a_sell_quote():
+           "the correction must be visible in the notes")
+ 
+ 
++@case
++def survey_analysis_separates_directions_and_survives_old_rows():
++    """
++    The analyzer has to group by the thing the survey exists to measure, and it
++    has to do something explicit with rows written before the survey logged a
++    direction at all: reporting them as their own group. Dropping them would hide
++    evidence, and assigning them a direction would invent it.
++    """
++    from arb.survey_report import analyze
++
++    def row(ts, direction, gross, net, buy="PancakeSwap V2", sell="Uniswap V3 0.30%"):
++        r = {"ts": ts, "gross_bps": gross, "net_bps": net, "size_base": 1.0,
++             "buy": buy, "sell": sell, "pair": "WBNB/USDT", "clears_floor": net > 0}
++        if direction:
++            r["direction"] = direction
++        return r
++
++    rows = [row(1000, "v2_first", -50.0, -60.0),
++            row(1001, "v2_first", -40.0, -50.0),
++            row(1002, "v3_first", -10.0, -12.0),
++            row(1003, "v3_first", -8.0, -10.0),
++            row(2000, None, -30.0, -35.0)]          # written before directions existed
++    report = analyze(rows, file_count=1)
++
++    dirs = report["by_direction"]
++    check(set(dirs) == {"v2_first", "v3_first", "unknown (pre-2026-09-30 rows)"},
++          f"every group must appear, got {sorted(dirs)}")
++    check(dirs["v2_first"]["net_median"] == -55.0, f"v2 median {dirs['v2_first']}")
++    check(dirs["v3_first"]["net_median"] == -11.0, f"v3 median {dirs['v3_first']}")
++    # The old row must carry its own numbers, not be silently absorbed.
++    check(dirs["unknown (pre-2026-09-30 rows)"]["rows"] == 1, "old row must be kept")
++    check(report["graded"] == 5, "all five rows are graded on net bps")
++
++    # Venue pairs group separately even within one direction: the same two
++    # venues in the other order is a different trade.
++    venue_keys = set(report["by_venue"])
++    check(len(venue_keys) == 1, f"one venue pair here, got {venue_keys}")
++
++
++@case
++def survey_verdict_refuses_a_sparse_win():
++    """
++    A handful of positive rows around a negative centre is what "not yet" looks
++    like, and the verdict must say so. This is the check that stops a survey from
++    being read as a green light because one iteration got lucky.
++    """
++    from arb.survey_report import analyze
++
++    def row(ts, net, direction="v3_first"):
++        return {"ts": ts, "net_bps": net, "gross_bps": net + 2.0, "direction": direction,
++                "size_base": 1.0, "buy": "Uniswap V3 0.30%", "sell": "PancakeSwap V2",
++                "pair": "WBNB/USDT", "clears_floor": net > 0}
++
++    # 4 lucky rows early, then a long negative stretch: median negative.
++    rows = [row(1000 + i, 5.0) for i in range(4)]
++    rows += [row(2000 + i, -30.0) for i in range(40)]
++    report = analyze(rows, file_count=1)
++    check(report["verdict"]["state"] == "sporadic",
++          f"a sparse win must not read as a candidate, got {report['verdict']}")
++
++    # And the mirror case: every row positive, sustained -> candidate.
++    rows2 = [row(3000 + i, 6.0) for i in range(40)]
++    report2 = analyze(rows2, file_count=1)
++    check(report2["verdict"]["state"] == "candidate",
++          f"a sustained positive must be reported, got {report2['verdict']}")
++
++    # No positive rows at all -> the plain answer.
++    rows3 = [row(4000 + i, -20.0) for i in range(12)]
++    check(analyze(rows3, file_count=1)["verdict"]["state"] == "negative",
++          "an all-negative log must be called negative")
++
++
++@case
++def the_direction_chooser_picks_the_better_leg_order():
++    """
++    Leg order is worth ~48 bps on BSC (measured), so the planner must price both
++    directions and take the better one rather than assuming V2-first.
++    """
++    from arb.executor import plan_best_direction
++
++    # V3 venue priced CHEAP (760) and V2 priced DEAR (765): buying on V3 and
++    # selling on V2 is the profitable shape here.
++    res, pool_for_fee = _fake_scan(buy_exec=765.0, sell_exec=760.0)
++    plan, reports = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20,
++                                        pool_for_fee)
++    check(len(reports) == 2, f"both directions must be reported, got {len(reports)}")
++    check(plan.v3_first, "the chooser must pick V3-first when that direction prices better")
++    check(plan.expected_gross_bps > 0,
++          f"fixture should be profitable V3-first, got {plan.expected_gross_bps:.1f} bps")
++
++    # And the mirror: V2 cheap, V3 dear -> V2-first wins.
++    res2, pool_for_fee2 = _fake_scan(buy_exec=760.0, sell_exec=765.0)
++    plan2, _ = plan_best_direction(res2, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee2)
++    check(not plan2.v3_first, "the chooser must pick V2-first when that prices better")
++
++
++@case
++def the_chooser_forwards_the_venue_aware_resolvers():
++    """
++    In which the two named resolvers must reach plan_arbitrage PER DIRECTION.
++
++    They are named parameters of plan_best_direction, so they are not part of
++    **kwargs, and forgetting to forward them is invisible here: the plan still
++    builds, it just uses the generic single-venue resolver. On BSC that produced
++    a V3-first plan with an EMPTY leg-1 pool (Uniswap's 0.30% tier does not exist
++    on the Pancake-bound resolver) and the contract refused it with ZeroAddress
++    on the fork. This asserts the leg-1 pool is filled, which only the
++    venue-aware path can do.
++    """
++    from arb.executor import plan_best_direction
++
++    res, generic = _fake_scan(buy_exec=765.0, sell_exec=760.0)
++
++    # The generic resolver knows the V2 venue's tiers only (100/500/2500/10000);
++    # the leg's own venue knows 3000 as well. V3-first trades tier 3000, so only
++    # the venue-aware resolver can answer.
++    venue_pools = {"pancakeswap_v3": {2500: "0x" + "55" * 20}}
++    leg_venue = "uniswap_v3"
++    # 3000 is the tier the V3 leg trades (leg 1, when V3-first) and 10000 is a
++    # second tier the venue deploys, so something can still LEND the flash loan:
++    # the leg's own pool is locked for the whole callback and can never lend.
++    venue_pools[leg_venue] = {3000: "0x" + "77" * 20, 10000: "0x" + "88" * 20}
++
++    def for_venue(key):
++        table = venue_pools.get(key, {})
++        return lambda fee: table.get(int(fee), "")
++
++    # V3-first buys on the V3 quote, so that is the leg whose venue decides which
++    # factory resolves its pool - set it to a tier only that venue deploys.
++    v3_quote = next(q for q in res.quotes if q.version == "v3")
++    v3_quote.fee_pips = 3000
++    v3_quote.venue_key = leg_venue
++    plan, _ = plan_best_direction(
++        res, "0x" + "BB" * 20, "0x" + "EE" * 20, lambda fee: "",
++        pool_for_fee_for_venue=for_venue,
++        pool_for_fee_any_venue=lambda fee: venue_pools[leg_venue].get(int(fee), ""))
++    check(plan.v3_first, "fixture must plan V3-first")
++    from arb.executor import checksum as _checksum
++    check(plan.v3_leg1_pool == _checksum("0x" + "77" * 20),
++          f"the venue-aware resolver must supply leg 1's pool, got "
++          f"{plan.v3_leg1_pool!r}")
++
++
++@case
++def the_chooser_survives_one_direction_being_unplannable():
++    """One dead direction must not take the other down with it."""
++    from arb.executor import plan_best_direction
++    from dex.cross import CrossScanResult, VenueQuote
++
++    v2 = VenueQuote(venue_key="pancakeswap_v2", venue_name="PancakeSwap V2",
++                    version="v2", fee_pips=25, fee_bps=25.0, ok=True,
++                    exec_price=760.0, router_address="0x" + "AA" * 20,
++                    pool_address="0x" + "BB" * 20)
++    v3 = VenueQuote(venue_key="pancakeswap_v3", venue_name="PancakeSwap V3",
++                    version="v3", fee_pips=100, fee_bps=1.0, ok=True,
++                    exec_price=765.0, router_address="0x" + "CC" * 20,
++                    pool_address="0x" + "11" * 20)
++    res = CrossScanResult(network="bsc", base_symbol="WBNB", quote_symbol="USDT",
++                          trade_size_base=1.0, max_impact_bps=50.0,
++                          quotes=[v2, v3], buy_leg=v2, sell_leg=v3)
++    pools = {100: "0x" + "11" * 20, 500: "0x" + "22" * 20,
++             2500: "0x" + "33" * 20, 10000: "0x" + "44" * 20}
++    plan, reports = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20,
++                                        lambda f: pools.get(int(f), ""))
++    check(plan is not None, "a plannable direction exists and must be returned")
++    check(any(r.plan is None for r in reports) or len(reports) == 2,
++          "both directions should be attempted and reported")
++
++
++@case
++def v3_first_plans_mirror_the_paths_tokens_and_floors():
++    """
++    In mirror mode every leg-carrying field flips: the V2 path sells base, the
++    V3 tokens buy it, and each slippage floor stays denominated in the token
++    THAT leg pays out. Getting one of these wrong hands the contract a plan that
++    cannot execute - or worse, one that executes the wrong pair.
++    """
++    from arb.executor import plan_best_direction, checksum
++
++    res, pool_for_fee = _fake_scan(buy_exec=765.0, sell_exec=760.0)
++    plan, _ = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee)
++
++    base, quote = checksum("0x" + "BB" * 20), checksum("0x" + "EE" * 20)
++    check(plan.v3_first, "this fixture must plan V3-first")
++    check(plan.v2_path == [base, quote],
++          f"mirror V2 path must start at base and end at quote, got {plan.v2_path}")
++    check(plan.v3_token_in == quote and plan.v3_token_out == base,
++          f"mirror V3 leg must buy base with quote, got "
++          f"{plan.v3_token_in} -> {plan.v3_token_out}")
++    check(plan.v3_leg1_pool, "a V3-first plan must name leg 1's pool")
++
++    # Floors: leg 1 is the V3 buy (floor in BASE wei), leg 2 the V2 sell (QUOTE).
++    check(plan.v3_amount_out_min == int(1.0 * 10 ** 18 * 0.99),
++          f"leg-1 floor must be ~1 base minus slippage, got {plan.v3_amount_out_min}")
++    # In mirror mode leg 2 is the V2 SELL, so its floor comes from the V2 venue's
++    # exec price (765 in this fixture), not from leg 1's V3 buy price (760).
++    check(abs(plan.v2_amount_out_min - int(765.0 * 10 ** 18 * 0.99)) < 10 ** 15,
++          f"leg-2 floor must be the V2 sell proceeds minus slippage, "
++          f"got {plan.v2_amount_out_min}")
++
++    # Routers must not be crossed: the V3 router is the V3 venue's.
++    check(plan.v3_router == checksum("0x" + "CC" * 20),
++          f"V3 router is wrong: {plan.v3_router}")
++    check(plan.v2_router == checksum("0x" + "AA" * 20),
++          f"V2 router is wrong: {plan.v2_router}")
++
++
++@case
++def v2_first_plans_keep_the_original_shape():
++    """The proven direction must not drift while mirror support is added."""
++    from arb.executor import plan_best_direction, checksum
++
++    res, pool_for_fee = _fake_scan(buy_exec=760.0, sell_exec=765.0)
++    plan, _ = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee)
++    base, quote = checksum("0x" + "BB" * 20), checksum("0x" + "EE" * 20)
++    check(not plan.v3_first, "this fixture must plan V2-first")
++    check(plan.v2_path == [quote, base], f"got {plan.v2_path}")
++    check(plan.v3_token_in == base and plan.v3_token_out == quote,
++          f"V3 leg must sell base for quote, got {plan.v3_token_in} -> {plan.v3_token_out}")
++    check(plan.v3_leg1_pool == "", "leg-1 pool is only meaningful in mirror mode")
++
++
+ @case
+ def legs_without_a_router_are_never_chosen():
+     """

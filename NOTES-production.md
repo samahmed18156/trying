@@ -232,6 +232,64 @@ can never disagree. Now: **94/94 offline, 2 passed under pytest.**
 * **Key management at size.** The owner key can withdraw everything the contract
   ever holds. Do not let that key's exposure exceed the drill.
 
+---
+
+# Update — 2026-09-30, after the push
+
+The upgrade was pushed to `master` (commit `8441738`) and verified byte-identical
+to the audited copy: all 10 files match, nothing extra, nothing missing. **The
+code on GitHub is the code that was tested.** No mainnet deployment exists yet
+(`state/` holds only `bsc_testnet`).
+
+## Fresh measurement: the edge got worse, and the reason is the leg shape
+
+Four more live iterations, same pair and size:
+
+| | gross bps | net bps | clears |
+|---|---|---|---|
+| 2026-09-30 (blk 124859452–124859755) | −44.3, −47.3, −47.5, −48.6 | −61.2 … −65.5 | **0 of 4** |
+
+Then a test of the one structural variable nobody had questioned: the contract is
+hard-wired to **buy on V2, sell on V3**. Measured on the same scan:
+
+```
+mids: PancakeSwap V2 762.1274   cheapest V3 (0.01%) 760.2967
+      -> V2 sits 24.1 bps ABOVE V3
+
+A: buy V2 (25bp fee) -> sell V3 (1bp fee)   [the contract's shape]
+     gross -53.21 bps    net -58.21 bps
+B: buy V3 (1bp fee)  -> sell V2 (25bp fee)  [the mirror shape]
+     gross  -5.31 bps    net -10.31 bps
+```
+
+**Direction B is ~48 bps better than direction A, and still loses money.**
+Two conclusions, both important:
+
+1. **The current leg shape is the wrong way round in today's market** by roughly
+   48 bps. That is why the measured shortfall is so large rather than marginal.
+2. **Even the better direction is negative (−5 bps gross), and that is
+   informative rather than unlucky.** V2's price sits ~24 bps above the V3 pools
+   — almost exactly V2's 25 bps fee. That is what an efficient market looks like:
+   the cross-venue spread equals the fee you pay to cross it. There is no free
+   money in WBNB/USDT on this pair in either direction right now.
+
+Do NOT read (1) as "shipping the mirror shape unlocks profit". It removes a
+structural 48 bps handicap; it does not create an edge. It was a contract change
+rather than a config flag — `FlashArb.sol` had leg 1 fixed as a V2-style
+`swapExactTokensForTokens` and leg 2 as a V3-style `exactInputSingle` — and it
+was implemented later the same day; see "Leg direction" below.
+
+## What "real execution" would cost today
+
+| | at 2 gwei (bot's default) | at 0.05 gwei (BSC market, `GAS_PRICE_GWEI=0.05`) |
+|---|---|---|
+| one `arbitrage()` attempt, 600k gas | 0.0012 BNB (~$0.91) | 0.00003 BNB (~$0.02) |
+| mainnet deploy, ~1.6M gas | 0.0032 BNB (~$2.43) | — |
+
+With the floor enforced, an attempt on today's market **reverts** — so that gas
+buys a revert, not a trade. Which is the correct behaviour and the reason the
+drill is pointless until the survey turns positive.
+
 ## Standing rules
 
 1. The contract's profit check is the only protection that counts; everything
@@ -244,3 +302,114 @@ can never disagree. Now: **94/94 offline, 2 passed under pytest.**
    to `arb/`, `config.py`, or `contracts/`.
 5. If the survey shows positive net bps, believe it only after it survives a
    different size (`--size 0.1` and `--size 10`) and a different hour.
+
+
+---
+
+## Leg direction — implemented 2026-09-30 (after the section above)
+
+The 48 bps finding above stopped being a note and became a change: the contract
+now runs EITHER leg order, and the planner prices both on every scan and takes
+the better one. This section is what it cost and what it proved.
+
+### What changed
+
+| file | change |
+|---|---|
+| `contracts/FlashArb.sol` | `ArbParams{v3First, v3Leg1Pool}`; leg bodies split by direction inside the callback; `_swapV3()` shared by either leg; `_requirePool()` validates leg 1's pool (pair + fee, and it must not be the lending pool); new errors `Leg1PoolIsFlashPool`, `V3Leg1PoolMismatch`; `uniswapV3FlashCallback` added alongside `pancakeV3FlashCallback` |
+| `arb/executor.py` | `plan_best_direction()` builds and compares both directions by NET bps (the two can borrow at different tiers, so gross is not comparable); venue-aware `pool_for_fee_for_venue` / `pool_for_fee_any_venue`; loan sized from leg 1's real buy cost whichever leg it is |
+| `dex/fetcher.py` | `UniswapV3Reader.buy_cost_raw()` — exact-output V3 quote, so a V3 leg-1 is sized the same way a V2 leg-1 was |
+| `main.py` | DIRECTION block in `arb plan` / `arb run` / survey; survey rows carry `direction` and both directions' `gross_bps`/`net_bps`; new `arb analyze` |
+| `arb/survey_report.py` | **new** — reads the survey logs and reports where the edge lives (direction, venue pair, size, persistence) |
+| `tests/test_fork.py` | mirror-direction test on real pools, leg-1-pool guard, and a forced UNISWAP-V3 lender test; 6 → 9 tests |
+
+### Three bugs, all caught by the fork suite rather than by review
+
+1. **The entry check was direction-blind.** `arbitrage()` validated
+   `v2Path[0] == borrowToken` unconditionally — correct for V2-first, where the
+   V2 leg buys with the borrowed token, and wrong for the mirror, where that leg
+   SELLS into it and therefore ends at the borrow token instead. Every V3-first
+   plan reverted with `PathEndpointsMismatch` before a single swap ran. Fixed by
+   testing whichever end of the path the direction puts on the borrow token.
+2. **The venue-aware resolvers never reached the planner.** `plan_best_direction`
+   takes them as NAMED parameters, so they were not part of its `**kwargs` and
+   were silently dropped on the way to `plan_arbitrage`. Plans still built — they
+   just resolved pools through the generic single-venue resolver, which cannot
+   see Uniswap's 0.30% tier, leaving leg 1's pool EMPTY. The contract refused it
+   with `ZeroAddress`. Fixed by forwarding them explicitly, with an offline test
+   that fails if the leg-1 pool is empty for a tier only the leg's venue deploys.
+3. **The skew fixtures leaked state between tests.** Each scaled one reserve of
+   the same pair and never wrote it back, so a later fixture re-skewed an
+   already-skewed pair — 0.98× on both sides cancels out, leaving a plan with no
+   edge whose legs failed on their own slippage floors. That reads like a
+   contract bug and is not one. Fixtures are now function-scoped, rebuild the
+   plan AFTER writing, and restore the pair on teardown.
+
+### Why the flash pool may now be a Uniswap pool, and the second callback
+
+Making the V3 leg's venue a choice made the LENDER's venue a choice too, because
+the loan is searched across the pair's fee tiers on every V3 venue. A Uniswap V3
+pool calls `uniswapV3FlashCallback`; Pancake's call `pancakeV3FlashCallback`.
+With only the Pancake entry point, borrowing from a Uniswap pool reverted with
+EMPTY returndata — the call matched no function, which reads like a broken pool
+rather than a missing one. Both entry points now share one private `_flashBody`,
+so the `_inFlash` and `msg.sender == params.pool` guards apply identically.
+
+Proven, not assumed: `test_univ3_lender_repays_through_uniswap_callback` forces
+the lender to the Uniswap V3 pool at the plan's tier and the round trip repays
+and profits. (The two callbacks are otherwise identical, including the fee
+formula `ceil(amount * pool.fee() / 1e6)`.)
+
+### Where the two directions stand now
+
+Measured live, same block, WBNB/USDT, size 1 (DIRECTION block of `arb plan`):
+
+| block | V2-first gross | V3-first gross | chosen |
+|---|---|---|---|
+| 124867668, `GAS_PRICE_GWEI=0.05` | −12.07 bps (net −17.07) | −38.48 bps (net −39.48) | V2-first |
+| earlier, 2 gwei | −38.85 bps | −9.54 bps | V3-first |
+
+**The direction flips with the market.** Which is the whole argument for pricing
+both per scan instead of hard-wiring either: the "wrong way round" finding above
+was a snapshot, not a law. Both directions are still negative at both
+snapshots — an efficient market, as recorded.
+
+### Gas at market price changes the shortfall materially
+
+The earlier survey rows used the bot's 2 gwei default while BSC's market sat at
+0.05 gwei, which overstated the shortfall by ~16 bps. At market:
+
+| size | gross median | net median | rows |
+|---|---|---|---|
+| 1 WBNB | −22.8 bps | −39.8 bps | 12 (mixed gas, pre-change rows included) |
+| 1 WBNB, market gas only | −13.2 bps | −14.5 bps | the first post-change rows |
+
+Still negative, but roughly 25 bps closer to tradeable than the pre-change log
+implied. **Any survey run for evidence must set `GAS_PRICE_GWEI=0.05`**, or the
+verdict is measuring a gas price nobody pays.
+
+### The evidence loop, running
+
+```bash
+# two sizes, market gas, six hours, appended to the JSONL logs
+GAS_PRICE_GWEI=0.05 python main.py arb survey --network bsc --base WBNB \
+    --quote USDT --size 1 --iterations 5000 --interval 5 --duration 21600 \
+    --log logs/arb_survey.jsonl
+GAS_PRICE_GWEI=0.05 python main.py arb survey --network bsc --base WBNB \
+    --quote USDT --size 5 --iterations 5000 --interval 10 --duration 21600 \
+    --log logs/arb_survey_size5.jsonl
+
+python main.py arb analyze          # where the edge lives: direction, venue pair, size, persistence
+```
+
+`arb analyze` reads files only — no node, no wallet. It groups by direction,
+venue pair, size and hour, reports medians and the share of rows that clear
+costs, and returns one of three verdicts: **negative** (nothing cleared),
+**sporadic** (wins scattered around a negative median — the answer that must not
+be read as a green light) or **candidate** (an hour-bucket positive on its
+median, with enough rows behind it). Rows written before directions were logged
+are reported as their own group rather than dropped or assigned one.
+
+The readiness rules are unchanged and still gated on this: a positive survey
+median sustained across a week, then a mainnet deploy + source verify, then a
+micro-drill at 0.1–1 USDT.

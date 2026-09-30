@@ -445,6 +445,58 @@ class UniswapV3Reader:
         return f0, f1
 
     # -- quoting -------------------------------------------------------------
+    def buy_cost_raw(
+        self,
+        base: str,
+        quote: str,
+        size_base_raw: int,
+        fee_tier: Optional[int] = None,
+    ) -> Tuple[int, str]:
+        """
+        What it costs, in raw quote units, to BUY `size_base_raw` of base here.
+
+        Returns (amount_in_raw, pool_address).
+
+        Why this is a separate function and not `1 / quote()`: the swap quoter
+        every venue uses answers the SELL question - "I send this much base, how
+        much quote comes back?" - and pricing a buy off that answer understates
+        the cost by about twice the pool fee. Measured against the real WBNB/USDT
+        V2 pair on BNB Chain, the sell quote said 753.6651 while `getAmountIn`
+        said 757.4768: 50.3 bps, exactly 2 x the 25 bps fee. Sizing the flash
+        loan from the sell quote therefore borrowed ~50 bps too little and the
+        plan reverted at the repay (CannotRepay) after the router had already
+        spent the gas.
+
+        So this asks the pool the inverse question directly: exact OUTPUT of
+        `size_base_raw`, priced by the same local maths used everywhere else
+        (UniswapV3Pool.swap replayed against the real tick bitmap), with
+        `amount_specified` negative to mean "this is what I want out".
+        """
+        pool_address, fee = self.pick_best_pool(base, quote, fee_tier)
+        state = self.read_state(pool_address)
+        base_is_token0 = base.lower() == state["token0"].lower()
+
+        # pool.swap() is quoted as token0<->token1, so "buy the base token" is
+        # zero_for_one when the base is token1 (paying token0 = quote).
+        zero_for_one = not base_is_token0
+
+        cache = v3math.TickBitmapCache(
+            fetch_word=lambda wp: self.tick_bitmap_word(pool_address, wp),
+            fetch_tick=lambda t: self.tick_info(pool_address, t),
+        )
+        q = v3math.quote(
+            zero_for_one=zero_for_one,
+            amount_specified=-int(size_base_raw),      # negative = exact output
+            sqrt_price_x96=state["sqrt_price_x96"],
+            liquidity=state["liquidity"],
+            tick_current=state["tick"],
+            tick_spacing=state["tick_spacing"],
+            fee_pips=state["fee"],
+            tick_bitmap=cache.word,
+            tick_info=cache.info,
+        )
+        return int(q.amount_in), pool_address
+
     def quote(
         self,
         base: str,

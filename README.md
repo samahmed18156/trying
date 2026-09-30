@@ -447,6 +447,11 @@ python main.py arb deploy --network bsc_testnet      # deploy it, record the add
 python main.py arb plan  --network bsc_testnet       # show the exact trade, send nothing
 python main.py arb run   --network bsc_testnet       # dry run: plan + gas estimate
 python main.py arb run   --network bsc_testnet --execute   # actually broadcast
+python main.py arb survey --network bsc --base WBNB --quote USDT --size 1
+                                                     # dry-run the planner in a loop, log every
+                                                     # iteration to logs/arb_survey.jsonl
+python main.py arb analyze                           # read those logs: which direction, venue
+                                                     # pair and size the edge is in — files only
 python main.py arb status --network bsc_testnet      # is it deployed, what does it hold
 python main.py arb withdraw --network bsc_testnet --token USDT --all --execute
 python main.py verify                                # cross-check maths against the chain
@@ -869,7 +874,7 @@ mismatch. It reads like a mystery failure in the pool or the tokens. This cost a
 deployment to find, and it was found by simulating with `eth_call` before spending
 gas on the real thing.
 
-### Why the flash loan cannot come from the pool leg 2 swaps through
+### Why the flash loan cannot come from the pool a V3 leg swaps through
 
 A V3 pool's `flash()` takes the pool's reentrancy lock and holds it for the entire
 callback:
@@ -878,10 +883,12 @@ callback:
 modifier lock() { require(!locked, 'LOK'); locked = true; _; locked = false; }
 ```
 
-The whole arbitrage runs inside that callback. So if leg 2's swap routes back into
-the pool that lent the money, the router calls `swap()` on a pool that is still
+The whole arbitrage runs inside that callback. So if a swap routes back into the
+pool that lent the money, the router calls `swap()` on a pool that is still
 locked, and it reverts with the three-character reason `LOK`. No ordering, sizing
 or slippage setting avoids it — the two are mutually exclusive by construction.
+That applies to whichever leg is the V3 one, so it follows the direction: in
+V2-first it is leg 2, in V3-first it is leg 1.
 
 The obvious design looks better and is impossible: borrow from the pool you also
 sell into, so the capital and the sale net against each other in one place and the
@@ -889,16 +896,38 @@ round trip needs no starting inventory. That netting can never happen, because t
 sale cannot execute at all. This cost a deployment to find, since the plan looked
 entirely reasonable on screen.
 
-So the planner borrows from a **different tier of the same pair**. It still needs
+So the planner borrows from a **different pool of the same pair**. It still needs
 no starting inventory, and because tiers carry different fees it is usually a
 *cheaper* loan: `choose_flash_pool` walks the tiers from cheapest to dearest, skips
-the one leg 2 uses, skips any that hold less of the borrow token than the loan, and
-takes the first that survives. On testnet that moved the loan from the 0.05% pool to
-the 0.01% pool and cut the flash fee five-fold.
+the pool the V3 leg trades through, skips any that hold less of the borrow token
+than the loan, and takes the first that survives. On testnet that moved the loan
+from the 0.05% pool to the 0.01% pool and cut the flash fee five-fold.
 
 PancakeSwap V3 charges the flash fee at the **lending pool's own swap tier**, which
 is why the tier choice is a direct cost and why the fee estimate can no longer be
-read off the sell leg.
+read off the V3 leg.
+
+In V2-first the router derives the V3 pool from `(tokenIn, tokenOut, fee)`, so
+avoiding it is the planner's job. In V3-first the leg-1 pool is passed to the
+contract explicitly — the router would otherwise route through whichever pool it
+likes — and the contract **checks it**: the pool must report the exact pair and
+fee the router will use (a factory mints one pool per key, so the check cannot be
+satisfied by some other pool), and it must not be the pool that lent the tokens.
+A plan that breaks either rule reverts with `Leg1PoolIsFlashPool` or
+`V3Leg1PoolMismatch`, both legible, instead of surfacing as `LOK` from inside a
+router, which reads like a broken pool.
+
+### The flash pool's venue, and the second callback
+
+Making the V3 leg's venue a choice made the LENDER's venue a choice too: the loan
+is searched across every V3 venue that has a pool of this pair. A Uniswap V3 pool
+calls `uniswapV3FlashCallback`; Pancake's call `pancakeV3FlashCallback`. The
+contract implements both, sharing one private body so the `_inFlash` and
+`msg.sender == params.pool` guards apply identically. Before the second entry
+point existed, borrowing from a Uniswap pool reverted with **empty returndata** —
+the pool's call matched no function — which looks like a broken pool rather than a
+missing one. `tests/test_fork.py` forces a Uniswap lender and repays it, so this
+is proven rather than assumed.
 
 ### Reading a revert that has already happened
 
@@ -920,17 +949,73 @@ Python traceback only buries the explanation.
 
 ### Two real constraints worth knowing
 
-**Leg 1 must be a V2-style router and leg 2 a V3-style one.** That is what the
-contract calls, so the planner picks the best venue *of each generation* rather
-than the best venue overall. On testnet the cheapest buy was PancakeSwap V3
-0.25%, but the contract cannot buy there — and the planner says so in a note
-instead of quietly giving you a worse trade or refusing to plan at all.
+**Either leg can be V2 or V3 — the contract prices both orders and picks.** Leg
+order is not cosmetic: each leg pays its OWN venue's fee, so "buy on V2 at 25 bps
+and sell on V3 at 1 bp" is a different trade from its mirror, and on BNB Chain the
+two differed by **~48 bps** (V2-first −58 bps net, V3-first −10 bps net) at the
+same block. The planner builds both directions on every scan, compares them by
+**net** bps — they can borrow from pools at different tiers and therefore pay
+different loans — and reports both, so the choice is visible rather than implied
+by which venue the plan names:
+
+```
+  DIRECTION
+    CHOSEN  V2-first (buy V2, sell V3)     gross   -12.07 bps  net   -17.07 bps
+            V3-first (buy V3, sell V2)     gross   -38.48 bps  net   -39.48 bps
+```
+
+Which direction wins **flips with the market** — the two blocks above were hours
+apart — so neither is hard-wired. Within one generation the planner still picks
+the best venue of that generation, and says so in a note when the overall best
+venue is one the plan cannot use.
 
 **On BSC testnet both legs are PancakeSwap**, because Uniswap V3 is not deployed
 there. So a testnet run proves the flash mechanism, not a cross-DEX edge. The
 contract itself is venue-agnostic — it takes routers as arguments — so on BNB
 Chain mainnet the same code runs PancakeSwap V2 against Uniswap V3, which is the
 pairing the brief asked for.
+
+## Proving the edge before risking anything — `arb survey` + `arb analyze`
+
+`arb survey` runs the planner in a loop and never signs or sends. Each iteration
+scans the venues, builds the plan `arb run` WOULD send, prices it exactly as
+`arb run` would (gas floor included), and appends one JSONL line — including both
+directions' gross and net bps, which direction was chosen, the buy/sell venues,
+the flash fee, the gas figure, and the notes explaining what would happen:
+
+```bash
+GAS_PRICE_GWEI=0.05 python main.py arb survey --network bsc --base WBNB \
+    --quote USDT --size 1 --iterations 5000 --interval 5 \
+    --duration 21600 --log logs/arb_survey.jsonl
+```
+
+Set `GAS_PRICE_GWEI` to the market price for evidence runs. The bot's default is
+2 gwei while BSC has been trading near 0.05; at the default the shortfall looks
+about 16 bps worse than the transaction would actually cost.
+
+`arb analyze` reads those logs — files only, no node, no wallet — and answers
+where the edge lives rather than whether one row was lucky:
+
+```
+  WHERE THE EDGE LIVES — by leg direction
+                                         rows   gross md     net md   net best     >0
+    v2_first                              620     -38.20     -57.10     -12.40   0.0%
+    v3_first                              580      -9.40     -10.20      +0.30   0.7%
+  by venue pair (buy -> sell)
+    Uniswap V3 0.30%  ->  PancakeSwap V2   210      -9.80     -10.40      +0.30   0.5%
+  over time (median net bps per hour, UTC)
+    ...
+  VERDICT (negative)
+```
+
+It groups by direction, venue pair, size and hour, and returns **negative**
+(nothing cleared its costs), **sporadic** (wins scattered around a negative
+median — the answer that must not be read as a green light) or **candidate** (an
+hour-bucket positive on its median, with enough rows behind it). Rows written
+before the survey logged a direction are reported as their own group rather than
+dropped or guessed at.
+
+`arb analyze --json` emits the same report for scripting.
 
 ## Configuration
 
@@ -1082,7 +1167,8 @@ trying/
 ├── arb/
 │   ├── compiler.py             compiles that file from Python via py-solc-x
 │   ├── deployer.py             gas estimate, affordability check, sign, revert decoding
-│   ├── executor.py             scan -> exact calldata; slippage floors; event decoding
+│   ├── executor.py             scan -> exact calldata; both leg directions; slippage floors
+│   ├── survey_report.py        reads the survey JSONL logs -> where the edge lives
 │   ├── signals.py              gas costing and the trade/no-trade decision
 │   └── wallet.py               encrypted testnet keystore; refuses non-ignored paths
 ├── build/                      compiled artifacts (regenerated; gitignored)
@@ -1091,7 +1177,8 @@ trying/
 ├── examples/
 │   └── quickstart.py           using DexPriceFetcher as a library
 └── tests/
-    └── test_math.py            84 offline tests — no network, no dependencies
+    ├── test_math.py            101 offline tests — no network, no dependencies
+    └── test_fork.py            9 tests against a BNB Chain mainnet fork (needs Foundry)
 ```
 
 `dex/types.py` exists so that `QuoteSnapshot` can be imported without `web3`

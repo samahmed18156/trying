@@ -138,6 +138,10 @@ contract FlashArb {
         int256 profit;
         uint256 balanceBefore;
         uint256 balanceAfter;
+        /// Which generation ran leg 1 (the buy). false = V2 first (the original
+        /// single-direction behaviour), true = V3 first. Recorded so a run can be
+        /// read back without having to infer it from the router addresses.
+        bool v3First;
     }
 
     event ArbitrageExecuted(
@@ -169,6 +173,14 @@ contract FlashArb {
     error V3RouterCallFailed();
     /// The V3 router returned success but not a decodable uint256.
     error V3RouterBadReturn(uint256 length);
+    /// `v3First` was set but leg 1's V3 pool is the pool the flash loan came
+    /// from. Not merely inefficient: flash() holds that pool's reentrancy lock
+    /// for the whole callback, so the swap would revert with "LOK".
+    error Leg1PoolIsFlashPool(address pool);
+    /// The address given as `v3Leg1Pool` is not a pool of (borrowToken,
+    /// intermediate) at `v3Params.fee`. Guards against a plan that names one
+    /// pool while the router would use another.
+    error V3Leg1PoolMismatch(address given);
 
     constructor() {
         owner = msg.sender;
@@ -209,6 +221,38 @@ contract FlashArb {
         /// does not. See the comment above the two structs - this varies per
         /// deployment and cannot be inferred from the chain.
         bool v3RouterUsesDeadline;
+
+        // ---- direction ----------------------------------------------------
+        //
+        // The round trip is quote -> base on leg 1 and base -> quote on leg 2,
+        // but WHICH GENERATION runs each leg is a market question, not a fixed
+        // design choice. Measured on BNB Chain mainnet, 2026-09-30:
+        //
+        //   V2 first (buy on V2, 25 bps; sell on V3, 1 bps) .... net -58 bps
+        //   V3 first (buy on V3, 1 bps;  sell on V2, 25 bps) ... net -10 bps
+        //
+        // a ~48 bps difference from leg order alone. Hard-coding one direction
+        // means paying that handicap on every trade, so both are supported and
+        // the caller picks per plan.
+        //
+        /// true  -> leg 1 buys on the V3 router, leg 2 sells on the V2 router
+        /// false -> leg 1 buys on the V2 router, leg 2 sells on the V3 router
+        bool v3First;
+
+        /// Required when `v3First`: the V3 pool leg 1 will swap through, i.e.
+        /// the pool for (borrowToken, intermediate, v3Params.fee). Checked
+        /// against the pool's own token0/token1/fee, and required to differ
+        /// from `pool`.
+        ///
+        /// The difference matters because `flash()` holds the LENDING pool's
+        /// reentrancy lock for the whole callback: a leg-1 swap routed into it
+        /// reverts with "LOK" before either leg settles. When leg 2 was the V3
+        /// leg that was the planner's problem to avoid; now that leg 1 can be
+        /// the V3 leg, the contract checks it, because a silent misconfiguration
+        /// here is indistinguishable from a broken pool. Ignored when
+        /// `v3First` is false (leg 2's pool is resolved by the router from
+        /// tokenIn/tokenOut/fee, which the planner already pins).
+        address v3Leg1Pool;
     }
 
     // -----------------------------------------------------------------------
@@ -218,7 +262,18 @@ contract FlashArb {
     function arbitrage(ArbParams calldata params) external onlyOwner returns (int256 profit) {
         if (params.flashAmount == 0) revert ZeroBorrow();
         if (params.v2Path.length < 2) revert EmptyPath();
-        if (params.v2Path[0] != params.borrowToken) revert PathEndpointsMismatch();
+        // Which END of the V2 path touches the borrow token depends on the
+        // direction: V2-first BUYS with the borrowed token, so the path starts
+        // there, while V3-first SELLS into it, so the path ends there. Checking
+        // only the V2-first shape here rejected every mirror plan with
+        // PathEndpointsMismatch before a single swap ran — the fork suite caught
+        // it. The callback re-checks this at execution time with the token
+        // addresses it actually derived; this copy exists so that a malformed
+        // plan fails before the flash loan rather than in the middle of it.
+        address v2BorrowSide = params.v3First
+            ? params.v2Path[params.v2Path.length - 1]
+            : params.v2Path[0];
+        if (v2BorrowSide != params.borrowToken) revert PathEndpointsMismatch();
 
         uint256 balanceBefore = _balanceOf(params.borrowToken, address(this));
 
@@ -246,6 +301,27 @@ contract FlashArb {
     // The flash callback — where both legs and the repay happen
     // -----------------------------------------------------------------------
     function pancakeV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external {
+        _flashBody(fee0, fee1, data);
+    }
+
+    /// @notice Uniswap V3's name for the same callback, same three arguments.
+    ///
+    /// Same body, same guard. It exists because the flash loan may come from
+    /// EITHER venue: the planner searches fee tiers on the V3 venue it is
+    /// trading through, and on BSC that can be Uniswap V3, whose pools call
+    /// `uniswapV3FlashCallback`. Without this entry point such a loan could not
+    /// be repaid — the pool's call would match no function and the whole
+    /// transaction would revert with empty returndata, which reads like a broken
+    /// pool rather than a missing function. The pools are otherwise identical:
+    /// the same (fee0, fee1, data) arguments, the same fee formula
+    /// `ceil(amount * pool.fee() / 1e6)`, and the same reentrancy lock.
+    function uniswapV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external {
+        _flashBody(fee0, fee1, data);
+    }
+
+    /// @dev Shared body of both callbacks. Private, so the only ways in are the
+    ///      two external entry points above, and they both start here.
+    function _flashBody(uint256 fee0, uint256 fee1, bytes calldata data) private {
         // Only valid while WE initiated the flash. This is the check that stops
         // anyone calling this function directly to make the contract move tokens.
         if (!_inFlash) revert BadCallback();
@@ -259,16 +335,55 @@ contract FlashArb {
         // pool for the duration of flash(), so this pins it exactly.
         if (msg.sender != params.pool) revert BadCallback();
 
+        // ---- which leg is which -------------------------------------------
+        //
+        // The plan is quote -> base -> quote. `v3First` decides which generation
+        // runs the buy (leg 1) and which runs the sell (leg 2). The two
+        // directions are mirror images, so the same two legs run in either
+        // order rather than duplicating the body.
+        bool v3First = params.v3First;
+        address intermediate;
+        if (v3First) {
+            // V3 buys base (leg 1), so the V2 path SELLS base: it must start at
+            // the intermediate token and end at the borrow token.
+            if (params.v2Path[params.v2Path.length - 1] != params.borrowToken) {
+                revert PathEndpointsMismatch();
+            }
+            intermediate = params.v2Path[0];
+            if (params.v3Params.tokenIn != params.borrowToken
+                || params.v3Params.tokenOut != intermediate) {
+                revert PathEndpointsMismatch();
+            }
+        } else {
+            // V2 buys base (leg 1): the path starts at the borrow token.
+            if (params.v2Path[0] != params.borrowToken) revert PathEndpointsMismatch();
+            intermediate = params.v2Path[params.v2Path.length - 1];
+        }
+
         Outcome memory o;
         o.pool = params.pool;
         o.borrowToken = params.borrowToken;
         o.borrowed = params.flashAmount;
         o.balanceBefore = balanceBefore;
+        o.v3First = v3First;
 
-        // ---- leg 1: borrowToken -> intermediateToken, on the V2 router -------
-        address intermediate = params.v2Path[params.v2Path.length - 1];
-        _approve(params.borrowToken, params.v2Router, params.flashAmount);
-        {
+        // ---- leg 1: borrowToken -> intermediateToken ------------------------
+        if (v3First) {
+            // The lending pool is locked for this whole callback, so a leg-1
+            // swap routed through it cannot work. Verified rather than assumed:
+            // the address must be a pool of the exact token pair and fee the
+            // router will use (a pool cannot be spoofed for a given
+            // token0/token1/fee key - the factory mints one per key), and it
+            // must not be the pool that lent us the tokens.
+            address leg1Pool = params.v3Leg1Pool;
+            if (leg1Pool == address(0)) revert ZeroAddress();
+            if (leg1Pool == params.pool) revert Leg1PoolIsFlashPool(leg1Pool);
+            _requirePool(leg1Pool, params.borrowToken, intermediate, params.v3Params.fee);
+
+            _approve(params.borrowToken, params.v3Router, params.flashAmount);
+            o.leg1Out = _swapV3(params, params.flashAmount);
+        } else {
+            _approve(params.borrowToken, params.v2Router, params.flashAmount);
             uint256[] memory amounts = IPancakeV2Router(params.v2Router).swapExactTokensForTokens(
                 params.flashAmount,
                 params.v2AmountOutMin,
@@ -279,42 +394,24 @@ contract FlashArb {
             o.leg1Out = amounts[amounts.length - 1];
         }
 
-        // ---- leg 2: intermediateToken -> borrowToken, on the V3 router -------
+        // ---- leg 2: intermediateToken -> borrowToken ------------------------
         // Use what actually arrived rather than trusting the caller's amountIn:
         // if leg 1 returned less than expected, this still sweeps exactly what we
         // hold instead of reverting on an allowance or balance shortfall.
         uint256 haveIntermediate = _balanceOf(intermediate, address(this));
-        _approve(intermediate, params.v3Router, haveIntermediate);
-        {
-            V3ParamsWithDeadline memory v3 = params.v3Params;
-            v3.amountIn = haveIntermediate;
-            v3.recipient = address(this);
-            v3.deadline = block.timestamp;
-
-            bytes memory payload = params.v3RouterUsesDeadline
-                ? abi.encodeWithSelector(SEL_EXACT_INPUT_SINGLE_WITH_DEADLINE, v3)
-                : abi.encodeWithSelector(
-                    SEL_EXACT_INPUT_SINGLE_NO_DEADLINE,
-                    V3ParamsNoDeadline(
-                        v3.tokenIn, v3.tokenOut, v3.fee, v3.recipient,
-                        v3.amountIn, v3.amountOutMinimum, v3.sqrtPriceLimitX96
-                    )
-                );
-
-            (bool ok, bytes memory ret) = params.v3Router.call(payload);
-            if (!ok) {
-                // Bubble the router's own reason up rather than replacing it with
-                // a generic one. INSUFFICIENT_OUTPUT_AMOUNT arriving intact is
-                // what tells the caller their slippage floor was too tight; an
-                // EMPTY returndata is the distinct signature of a selector the
-                // router does not implement, which points at v3RouterUsesDeadline.
-                if (ret.length == 0) revert V3RouterCallFailed();
-                assembly {
-                    revert(add(ret, 32), mload(ret))
-                }
-            }
-            if (ret.length < 32) revert V3RouterBadReturn(ret.length);
-            o.leg2Out = abi.decode(ret, (uint256));
+        if (v3First) {
+            _approve(intermediate, params.v2Router, haveIntermediate);
+            uint256[] memory back = IPancakeV2Router(params.v2Router).swapExactTokensForTokens(
+                haveIntermediate,
+                params.v2AmountOutMin,
+                params.v2Path,
+                address(this),
+                block.timestamp
+            );
+            o.leg2Out = back[back.length - 1];
+        } else {
+            _approve(intermediate, params.v3Router, haveIntermediate);
+            o.leg2Out = _swapV3(params, haveIntermediate);
         }
 
         // ---- repay the flash loan -------------------------------------------
@@ -401,6 +498,59 @@ contract FlashArb {
         return (a % b == 0) ? q : q + 1;
     }
 
+    /// @dev Run one `exactInputSingle` through the V3 router and return the
+    ///      amount received. Used by BOTH legs: leg 1 when `v3First` (swapping
+    ///      the borrowed tokens) and leg 2 otherwise (swapping what leg 1
+    ///      delivered). `recipient`, `deadline` and `amountIn` are overwritten
+    ///      here rather than trusted from the caller, so a plan cannot send the
+    ///      output elsewhere, let a stale transaction sit in the mempool, or
+    ///      claim to spend tokens it does not have.
+    function _swapV3(ArbParams memory params, uint256 amountIn) private returns (uint256) {
+        V3ParamsWithDeadline memory v3 = params.v3Params;
+        v3.amountIn = amountIn;
+        v3.recipient = address(this);
+        v3.deadline = block.timestamp;
+
+        bytes memory payload = params.v3RouterUsesDeadline
+            ? abi.encodeWithSelector(SEL_EXACT_INPUT_SINGLE_WITH_DEADLINE, v3)
+            : abi.encodeWithSelector(
+                SEL_EXACT_INPUT_SINGLE_NO_DEADLINE,
+                V3ParamsNoDeadline(
+                    v3.tokenIn, v3.tokenOut, v3.fee, v3.recipient,
+                    v3.amountIn, v3.amountOutMinimum, v3.sqrtPriceLimitX96
+                )
+            );
+
+        (bool ok, bytes memory ret) = params.v3Router.call(payload);
+        if (!ok) {
+            // Bubble the router's own reason up rather than replacing it with a
+            // generic one. INSUFFICIENT_OUTPUT_AMOUNT arriving intact is what
+            // tells the caller their slippage floor was too tight; an EMPTY
+            // returndata is the distinct signature of a selector the router does
+            // not implement, which points at v3RouterUsesDeadline.
+            if (ret.length == 0) revert V3RouterCallFailed();
+            assembly {
+                revert(add(ret, 32), mload(ret))
+            }
+        }
+        if (ret.length < 32) revert V3RouterBadReturn(ret.length);
+        return abi.decode(ret, (uint256));
+    }
+
+    /// @dev Check that `pool` really is the pool of (tokenA, tokenB) at `fee`.
+    ///      A factory mints exactly one pool per (token0, token1, fee) key, so a
+    ///      pool that reports this pair and this fee IS the one the router will
+    ///      route through - there is no way to satisfy the check with a
+    ///      different pool. Order-independent: the pool decides which token is
+    ///      token0, and neither side may be assumed.
+    function _requirePool(address pool, address tokenA, address tokenB, uint24 fee) private view {
+        if (IPancakeV3PoolFlash(pool).fee() != fee) revert V3Leg1PoolMismatch(pool);
+        address t0 = IPancakeV3PoolFlash(pool).token0();
+        address t1 = IPancakeV3PoolFlash(pool).token1();
+        bool pairMatches = (t0 == tokenA && t1 == tokenB) || (t0 == tokenB && t1 == tokenA);
+        if (!pairMatches) revert V3Leg1PoolMismatch(pool);
+    }
+
     function _balanceOf(address token, address who) private view returns (uint256) {
         (bool ok, bytes memory ret) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (who)));
         require(ok && ret.length >= 32, "balanceOf failed");
@@ -441,9 +591,14 @@ contract FlashArb {
 //         _flashBody(fee0, fee1, data);
 //     }
 //
-// and move the body of pancakeV3FlashCallback into a private `_flashBody`. Both
-// callbacks then share the logic and the same `_inFlash` guard. That is NOT done
-// here yet, because the leg-2 router interface would also need a Uniswap variant
-// and the Phase 2 target is BNB Chain testnet, where Uniswap V3 is not deployed.
-// Adding a second callback later does not change anything already deployed.
+// and share the body via a private `_flashBody`. That IS done as of
+// 2026-09-30: both entry points exist and both start at `_flashBody`, so the
+// `_inFlash` and `msg.sender == params.pool` guards apply identically to either.
+//
+// It became necessary when the planner learned to choose its flash pool from the
+// venue's own fee tiers - on BSC that can be Uniswap V3, whose pools call this
+// other selector. The legacy concern about the V3 router interface needing a
+// Uniswap variant turned out not to apply: `exactInputSingle` is already encoded
+// explicitly in both of its shapes and selected by flag, so the router side was
+// never venue-specific.
 // ===========================================================================

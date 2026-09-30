@@ -1450,7 +1450,7 @@ def _loaded_deployment(net_key: str, contract: str):
 
 
 def cmd_arb_plan(args) -> int:
-    from arb.executor import PlanError, plan_arbitrage
+    from arb.executor import PlanError, plan_best_direction, plan_arbitrage, v3_router_uses_deadline
     from config import get_venue, token_address, venues_for
     from dex.cross import scan_venues
     from dex.fetcher import ChainReader
@@ -1511,31 +1511,61 @@ def cmd_arb_plan(args) -> int:
     base_decimals = _decimals_on_chain(reader, base)
     uses_deadline = _v3_router_shape(provider.w3, res)
     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
-    # The real cost of leg 1's buy. See _v2_buy_cost_fn: the sell quote the scan
-    # reports is ~2x-fee cheaper than what buying actually costs.
+    # The real cost of leg 1's buy, for BOTH directions. See _v2_buy_cost_fn and
+    # _v3_buy_cost_fn: the sell quote the scan reports is ~2x-fee cheaper than
+    # what buying actually costs, whichever venue does the buying.
     buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
+    v3_buy_fn, _v3r = _v3_buy_cost_fn(reader, venues, base, quote)
 
     # Two passes, because the profit floor needs the gas cost and the gas cost
     # needs a plan to simulate. Pass 1 builds with no floor; its only job is to
     # be encodable so the exact call can be simulated. Pass 2 rebuilds from the
     # same scan with the floor priced in. plan_arbitrage is pure, so the rebuild
     # is deterministic and cheap.
+    v3_buy = v3_buy_fn(settings.trade_size_base) if v3_buy_fn else (None, None)
     plan_kwargs = dict(
         slippage_bps=args.slippage, min_profit_wei=args.min_profit,
         quote_decimals=quote_decimals, base_decimals=base_decimals,
         v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
         min_profit_buffer_bps=args.min_profit_buffer,
         v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
+        v3_buy_cost_wei=v3_buy[0],
     )
     try:
-        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
+        deadline_probe = (lambda r: bool(v3_router_uses_deadline(provider.w3, r))
+                          if r else True)
+        venue_pools = _pool_resolver_factory(reader, venues, base, quote)
+        any_venue = _any_venue_pool_for_fee(reader, venues, base, quote)
+        probe, _reports = plan_best_direction(
+            res, base, quote, pool_for_fee,
+            v3_uses_deadline_for=deadline_probe,
+            pool_for_fee_for_venue=venue_pools,
+            pool_for_fee_any_venue=any_venue, **plan_kwargs)
         gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
             provider, net, settings, res, probe, sender=None, contract_address=None)
-        plan = plan_arbitrage(res, base, quote, pool_for_fee,
-                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
+        plan, direction_reports = plan_best_direction(
+            res, base, quote, pool_for_fee,
+            v3_uses_deadline_for=deadline_probe,
+            pool_for_fee_for_venue=venue_pools,
+            pool_for_fee_any_venue=any_venue,
+            gas_cost_quote_wei=gas_quote, **plan_kwargs)
     except PlanError as exc:
         print(fmt.red(f"\n  {exc}"))
         return 4
+
+    # Print how BOTH directions priced before the plan itself: leg order is the
+    # single biggest lever (measured ~48 bps on BSC), so the choice must be
+    # visible rather than implicit in which venue the plan names.
+    print(fmt.cyan("\n  DIRECTION"))
+    for r in direction_reports:
+        if r.plan is None:
+            print(f"    {r.label:<30} {fmt.dim('not plannable: ' + r.error[:60])}")
+        else:
+            # The chooser returns the chosen report's own plan object, so identity
+            # is the comparison.
+            mark = fmt.green("CHOSEN ") if r.plan is plan else fmt.dim("       ")
+            print(f"    {mark} {r.label:<30} gross {r.plan.expected_gross_bps:>+8.2f} bps  "
+                  f"net {r.net_bps:>+8.2f} bps")
 
     print(fmt.cyan("\n  THE TRANSACTION THIS WOULD SEND"))
     for line in plan.describe():
@@ -1750,6 +1780,106 @@ def _v2_buy_cost_fn(reader, venues, base: str, quote: str):
     return cost
 
 
+def _v3_buy_cost_fn(reader, venues, base: str, quote: str):
+    """
+    A callable(size_base) -> quote wei: what buying `size` costs on the V3 venue.
+
+    The mirror of `_v2_buy_cost_fn`. Every venue's quote answers the SELL
+    question ("I send this much base, what comes back?"), so pricing a V3 buy off
+    `size x exec_price` understates it by about twice that pool's fee — the same
+    bug that was measured at 50.3 bps on PancakeSwap V2 and is now fixed for that
+    leg. This asks the pool the inverse question directly with an exact-output
+    quote against the real tick bitmap.
+
+    Returned as (callable, fee_tier) so the planner can be told which pool leg 1
+    will swap through: V3-first borrows from one pool and buys through another,
+    and the contract requires the two to differ.
+    """
+    from dex.fetcher import UniswapV3Reader
+
+    v3_venue = next((v for v in venues if v.version == "v3"), None)
+    if v3_venue is None:
+        return None, None
+    v3_reader = UniswapV3Reader(reader, venue=v3_venue)
+
+    def cost(size_base: float):
+        from dex import uniswap_v2_math as v2math
+        from dex.fetcher import ChainReader  # noqa: F401 - documented dependency
+
+        # The pool the cheapest V3 buy would use; buy_cost_raw picks the deepest
+        # pool for the pair at that tier, which is what the router will use.
+        decimals = int(reader.decimals(base))
+        raw, pool = v3_reader.buy_cost_raw(base, quote, v2math.to_raw(size_base, decimals))
+        return int(raw), pool
+
+    return cost, v3_reader
+
+
+def _pool_resolver_factory(reader, venues, base: str, quote: str):
+    """
+    venue_key -> (fee_pips -> V3 pool address), bound to that venue's factory.
+
+    Needed because one chain can host several V3 venues with DIFFERENT fee tiers:
+    PancakeSwap V3 on BSC has 100/500/2500/10000, Uniswap V3 has
+    100/500/3000/10000. Resolving every leg through "the first V3 venue" answers
+    "no such pool" for tiers the other venue actually trades, which silently
+    produced an EMPTY leg-1 pool on a V3-first plan — and the contract rejects an
+    empty one, because it has to prove leg 1's pool is not the pool that lent the
+    tokens. It also meant the flash-loan search never considered the right venue's
+    tiers.
+    """
+    from dex.fetcher import UniswapV3Reader
+
+    readers: Dict[str, object] = {}
+
+    def for_venue(venue_key: str):
+        if venue_key not in readers:
+            venue = next((v for v in venues if v.key == venue_key), None)
+            readers[venue_key] = (UniswapV3Reader(reader, venue=venue)
+                                  if venue is not None else None)
+        bound = readers[venue_key]
+        if bound is None:
+            return lambda fee: ""
+        return lambda fee: bound.pool_for_fee(base, quote, fee)
+
+    return for_venue
+
+
+def _any_venue_pool_for_fee(reader, venues, base: str, quote: str):
+    """
+    fee_pips -> the first venue's pool at that tier, looking across ALL V3 venues.
+
+    Used only for the flash-loan search. The lender does not have to be the venue
+    the trade runs on, and the cheapest loan at a tier the traded venue deploys
+    may be thin while another venue's pool of the same pair is deep — so the
+    search should see every pool of this pair, not just the traded venue's.
+    Restricting it to one venue is what left a V3-first plan without a lender on
+    a chain that hosts two V3 venues with different tier lists.
+    """
+    from dex.fetcher import UniswapV3Reader
+
+    v3_venues = [v for v in venues if getattr(v, "version", "") == "v3"]
+    readers = [UniswapV3Reader(reader, venue=v) for v in v3_venues]
+    cache: Dict[int, str] = {}
+
+    def pool_for_fee(fee_pips: int) -> str:
+        key = int(fee_pips)
+        if key not in cache:
+            found = ""
+            for bound in readers:
+                try:
+                    addr = bound.pool_for_fee(base, quote, key)
+                except Exception:
+                    addr = ""
+                if addr:
+                    found = addr
+                    break
+            cache[key] = found
+        return cache[key]
+
+    return pool_for_fee
+
+
 def _pool_quote_balance_fn(w3, quote_address: str):
     """
     A callable giving the quote-token balance held by any pool address.
@@ -1814,7 +1944,8 @@ def _decimals_on_chain(reader, token_address_: str) -> int:
 def cmd_arb_run(args) -> int:
     from arb.compiler import load_build
     from arb.deployer import DeployError, RevertedTx, build_tx, estimate_cost, send_and_wait
-    from arb.executor import PlanError, decode_outcome, plan_arbitrage
+    from arb.executor import (PlanError, decode_outcome, plan_arbitrage,
+                              plan_best_direction, v3_router_uses_deadline)
     from config import get_venue, token_address, venues_for
     from dex.cross import scan_venues
     from dex.fetcher import ChainReader, contract_factory
@@ -1857,6 +1988,7 @@ def cmd_arb_run(args) -> int:
     uses_deadline = _v3_router_shape(provider.w3, res)
     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
     buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
+    v3_buy_fn, _v3r = _v3_buy_cost_fn(reader, venues, base, quote)
 
     # Only --execute needs the private key; a dry run just needs the address.
     sender, account, wpath = _sender(args, need_key=bool(args.execute))
@@ -1865,23 +1997,44 @@ def cmd_arb_run(args) -> int:
     # exact call to simulate. Pass 1's plan exists only to be encoded; pass 2
     # is what gets printed and sent. See _gas_cost_quote_wei for the conversion
     # rules and what happens when the quote token is not the native asset.
+    v3_buy = v3_buy_fn(settings.trade_size_base) if v3_buy_fn else (None, None)
+    deadline_probe = (lambda r: bool(v3_router_uses_deadline(provider.w3, r))
+                      if r else True)
+    venue_pools = _pool_resolver_factory(reader, venues, base, quote)
+    any_venue = _any_venue_pool_for_fee(reader, venues, base, quote)
     plan_kwargs = dict(
         slippage_bps=args.slippage, min_profit_wei=args.min_profit,
         quote_decimals=quote_decimals, base_decimals=base_decimals,
         v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
         min_profit_buffer_bps=args.min_profit_buffer,
         v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
+        v3_buy_cost_wei=v3_buy[0],
     )
     try:
-        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
+        probe, _reports = plan_best_direction(
+            res, base, quote, pool_for_fee, v3_uses_deadline_for=deadline_probe,
+            pool_for_fee_for_venue=venue_pools,
+            pool_for_fee_any_venue=any_venue, **plan_kwargs)
         gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
             provider, net, settings, res, probe,
             sender=sender, contract_address=contract_address)
-        plan = plan_arbitrage(res, base, quote, pool_for_fee,
-                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
+        plan, direction_reports = plan_best_direction(
+            res, base, quote, pool_for_fee, v3_uses_deadline_for=deadline_probe,
+            pool_for_fee_for_venue=venue_pools,
+            pool_for_fee_any_venue=any_venue,
+            gas_cost_quote_wei=gas_quote, **plan_kwargs)
     except PlanError as exc:
         print(fmt.red(f"  {exc}"))
         return 4
+
+    print(fmt.cyan("  direction"))
+    for r in direction_reports:
+        if r.plan is None:
+            print(f"    {r.label:<30} {fmt.dim('not plannable: ' + r.error[:60])}")
+        else:
+            mark = fmt.green("CHOSEN ") if r.plan is plan else fmt.dim("       ")
+            print(f"    {mark} {r.label:<30} gross {r.plan.expected_gross_bps:>+8.2f} bps  "
+                  f"net {r.net_bps:>+8.2f} bps")
 
     print(fmt.cyan("  plan"))
     for line in plan.describe():
@@ -1990,7 +2143,7 @@ def cmd_arb_survey(args) -> int:
     import json as _json
     import time
 
-    from arb.executor import PlanError, plan_arbitrage
+    from arb.executor import PlanError, plan_best_direction, v3_router_uses_deadline
     from config import get_venue, token_address, venues_for
     from dex.cross import scan_venues
     from dex.fetcher import ChainReader
@@ -2053,15 +2206,21 @@ def cmd_arb_survey(args) -> int:
                 return _v3_reader_for(reader, v3_venue).pool_for_fee(base, quote, fee_pips)
 
             buy_cost = _v2_buy_cost_fn(reader, venues, base, quote)
-            plan = plan_arbitrage(
+            v3_buy_fn_s, _ = _v3_buy_cost_fn(reader, venues, base, quote)
+            v3_buy_s = v3_buy_fn_s(settings.trade_size_base) if v3_buy_fn_s else (None, None)
+            plan, reports = plan_best_direction(
                 res, base, quote, pool_for_fee,
+                v3_uses_deadline_for=(lambda r: bool(v3_router_uses_deadline(provider.w3, r))
+                                      if r else True),
+                pool_for_fee_for_venue=_pool_resolver_factory(reader, venues, base, quote),
+                pool_for_fee_any_venue=_any_venue_pool_for_fee(reader, venues, base, quote),
                 slippage_bps=args.slippage, min_profit_wei=args.min_profit,
                 quote_decimals=_decimals_on_chain(reader, quote),
                 base_decimals=_decimals_on_chain(reader, base),
-                v3_uses_deadline=_v3_router_shape(provider.w3, res),
                 flash_pool_quote_balance=_pool_quote_balance_fn(provider.w3, quote),
                 min_profit_buffer_bps=args.min_profit_buffer,
                 v2_buy_cost_wei=buy_cost(settings.trade_size_base) if buy_cost else None,
+                v3_buy_cost_wei=v3_buy_s[0],
             )
             # No contract and no sender here, so gas is priced from the fixed
             # unit estimate x the live gas price — the same arithmetic the
@@ -2083,6 +2242,13 @@ def cmd_arb_survey(args) -> int:
                 if plan.flash_amount else 0.0
             clears = net_wei >= max(plan.min_profit_floor, args.min_profit)
 
+            row["direction"] = "v3_first" if plan.v3_first else "v2_first"
+            row["directions"] = {
+                r.direction: ({"gross_bps": round(r.plan.expected_gross_bps, 2),
+                               "net_bps": round(r.net_bps, 2)} if r.plan is not None
+                              else {"error": r.error[:120]})
+                for r in reports
+            }
             row.update({
                 "buy": plan.buy_label, "sell": plan.sell_label,
                 "buy_exec": plan.buy_exec, "sell_exec": plan.sell_exec,
@@ -2101,7 +2267,7 @@ def cmd_arb_survey(args) -> int:
             mark = fmt.green("CLEARS") if clears else fmt.dim("below ")
             print(f"  [{i:>3}] blk {row.get('block', '?'):>10}  {mark}  "
                   f"gross {row['gross_bps']:>+8.2f} bps  net {net_bps:>+8.2f} bps  "
-                  f"({plan.buy_label} -> {plan.sell_label})")
+                  f"[{row['direction']}] ({plan.buy_label} -> {plan.sell_label})")
         except PlanError as exc:
             row["plan_error"] = str(exc)
             print(f"  [{i:>3}] no plan: {exc}")
@@ -2130,6 +2296,50 @@ def cmd_arb_survey(args) -> int:
             print(fmt.yellow("    No iteration beat its own costs. Executing this loop "
                              "for real would be buying gas, not edge."))
     print(f"    log          {log_path}  ({len(rows)} rows appended)")
+    return 0
+
+
+def cmd_arb_analyze(args) -> int:
+    """
+    Summarise the survey logs: which direction, venue pair and size the money is
+    in, and whether it persists over time.
+
+    Reads files only - no network, no wallet, no keys. It is safe to run against
+    logs that a survey is still appending to: each row is a complete JSON object
+    on its own line, so a partially written final line is skipped rather than
+    corrupting the read.
+    """
+    import glob as _glob
+    import json as _json
+    from pathlib import Path
+
+    from arb.survey_report import analyze, load_rows, render
+
+    if args.logs:
+        paths = [Path(p) for p in args.logs]
+    else:
+        found = sorted(_glob.glob("logs/*survey*.jsonl")) or \
+            sorted(_glob.glob("logs/*.jsonl"))
+        paths = [Path(p) for p in found]
+
+    rows = load_rows(paths)
+    if not rows:
+        print(fmt.red("  no survey rows found."))
+        print(fmt.dim("    looked in: "
+                      + (", ".join(str(p) for p in paths) if paths else "logs/*.jsonl")))
+        print(fmt.dim("    start one with:  python main.py arb survey --network bsc "
+                      "--base WBNB --quote USDT --size 1"))
+        return 2
+
+    report = analyze(rows, file_count=len(paths))
+    if args.json_out:
+        print(_json.dumps(report, indent=2, default=str))
+        return 0
+
+    print(fmt.banner("ARB  ·  survey analysis"))
+    for line in render(report):
+        print(line)
+    print()
     return 0
 
 
@@ -2460,6 +2670,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--log", default="logs/arb_survey.jsonl",
                     help="JSONL file to append results to (default logs/arb_survey.jsonl)")
     ap.set_defaults(func=cmd_arb_survey)
+
+    ap = asub.add_parser("analyze",
+                         help="read the survey logs and say where the edge lives "
+                              "(direction, venue pair, size, and whether it persists)")
+    ap.add_argument("--logs", nargs="*", default=None,
+                    help="JSONL files (default: every logs/*survey*.jsonl)")
+    ap.add_argument("--json", dest="json_out", action="store_true",
+                    help="emit the report as JSON instead of text")
+    ap.set_defaults(func=cmd_arb_analyze)
 
     ap = asub.add_parser("status", help="check the deployment and what it holds")
     common(ap)

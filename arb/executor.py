@@ -71,6 +71,14 @@ class ArbPlan:
     # empty data and no explanation.
     v3_uses_deadline: bool = True
 
+    # Which generation runs leg 1 (the buy). False = the original V2-first
+    # direction; True = V3-first. Leg order is worth ~48 bps on BSC (measured),
+    # so it is chosen per scan by plan_best_direction rather than fixed.
+    v3_first: bool = False
+    # The V3 pool leg 1 swaps through when v3_first, validated on chain by the
+    # contract for (pair, fee) and required to differ from the lending pool.
+    v3_leg1_pool: str = ""
+
     # Human-readable context, not sent on chain.
     buy_label: str = ""
     sell_label: str = ""
@@ -126,21 +134,44 @@ class ArbPlan:
             self.v3_params,
             self.min_profit,
             self.v3_uses_deadline,
+            self.v3_first,
+            self.v3_leg1_pool or "0x0000000000000000000000000000000000000000",
         ),)
 
     def describe(self) -> List[str]:
-        """Lines for the CLI, in the order the transaction will do things."""
+        """
+        Lines for the CLI, in the order the transaction will do things.
+
+        Written for BOTH directions: leg 1 is whichever generation buys, so the
+        labels are derived from `v3_first` rather than hard-coded. Printing "leg
+        2 V3" for a V3-first plan would describe a transaction that is not the
+        one about to be sent — and this output is the last thing read before
+        signing.
+        """
+        v3_leg = "1" if self.v3_first else "2"
+        v2_leg = "2" if self.v3_first else "1"
+        v3_min = self.v3_amount_out_min
+        v2_min = self.v2_amount_out_min
         out = [
+            f"direction  {'V3-first: buy on V3, sell on V2' if self.v3_first else 'V2-first: buy on V2, sell on V3'}",
             f"borrow   {self.flash_amount:,} wei of the quote token from {self.pool}",
             f"         a V3 pool at fee tier {self.flash_fee_pips}, deliberately NOT the "
-            f"pool leg 2 swaps through (that one is locked for the whole flash)",
-            f"leg 1    V2 {self.buy_label or 'router'}  {self.v2_router}",
-            f"         path {' -> '.join(self.v2_path)}",
-            f"         minimum out {self.v2_amount_out_min:,} wei",
-            f"leg 2    V3 {self.sell_label or 'router'}  {self.v3_router}  fee {self.v3_fee}",
+            f"pool the V3 leg swaps through (that one is locked for the whole flash)",
+            f"leg {v3_leg}    V3 {self.buy_label if self.v3_first else self.sell_label}  "
+            f"{self.v3_router}  fee {self.v3_fee}",
             f"         router ABI {'8-field exactInputSingle (with deadline)' if self.v3_uses_deadline else '7-field exactInputSingle (no deadline)'}",
             f"         {self.v3_token_in} -> {self.v3_token_out}",
-            f"         minimum out {self.v3_amount_out_min:,} wei",
+            f"         minimum out {v3_min:,} wei",
+            f"leg {v2_leg}    V2 {self.sell_label if self.v3_first else self.buy_label}  "
+            f"{self.v2_router}",
+            f"         path {' -> '.join(self.v2_path)}",
+            f"         minimum out {v2_min:,} wei",
+        ]
+        if self.v3_first:
+            out.insert(3,
+                       f"         leg-1 pool {self.v3_leg1_pool} — validated on chain for "
+                       f"(pair, fee) and required to differ from the lending pool")
+        out += [
             f"repay    borrowed + flash fee (fee estimated at {self.expected_flash_fee:,} wei)",
             f"require  profit >= {self.min_profit:,} wei or revert the whole transaction",
         ]
@@ -359,10 +390,14 @@ def best_leg(res: CrossScanResult, version: str, side: str) -> Optional[VenueQuo
     raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
 
 
-# Every tier PancakeSwap V3 deploys. Cheapest first is what matters: the flash
-# fee is the pool's own tier, so a 0.01% pool lends 5x more cheaply than a 0.05%
-# one for exactly the same capital.
-DEFAULT_FLASH_FEE_TIERS: Tuple[int, ...] = (100, 500, 2500, 10000)
+# Every tier the V3 venues on this chain deploy. Cheapest first is what matters:
+# the flash fee is the pool's own tier, so a 0.01% pool lends 5x more cheaply
+# than a 0.05% one for exactly the same capital.
+#
+# 3000 is Uniswap V3's 0.30% tier and 2500 is PancakeSwap V3's 0.25%; the two
+# venues do NOT share a tier list, so the union is searched and any tier a given
+# venue does not deploy resolves to no address and is skipped with a reason.
+DEFAULT_FLASH_FEE_TIERS: Tuple[int, ...] = (100, 500, 2500, 3000, 10000)
 
 
 def choose_flash_pool(
@@ -441,6 +476,136 @@ def choose_flash_pool(
     )
 
 
+def select_legs(res: CrossScanResult, buy_version: str = "v2",
+                sell_version: str = "v3") -> Tuple[VenueQuote, VenueQuote]:
+    """
+    Pick (buy, sell) for one direction, raising PlanError if either is missing.
+
+    Same selection `plan_arbitrage` performs, exposed so a caller can inspect the
+    chosen venues BEFORE planning — specifically, so it can probe the V3 router of
+    the venue THIS direction will actually use. The two directions need not pick
+    the same V3 venue (one wants the cheapest buy, the other the dearest sell),
+    and routers differ per venue, so probing once and reusing the answer for both
+    can send a router call with the wrong ABI shape.
+    """
+    buy = best_leg(res, buy_version, "buy")
+    sell = best_leg(res, sell_version, "sell")
+    if buy is None or sell is None:
+        missing = [v for v, q in ((buy_version, buy), (sell_version, sell)) if q is None]
+        present = sorted({q.version.upper() for q in res.usable})
+        raise PlanError(
+            f"no usable {'/'.join(missing).upper()} leg to build a route from. "
+            f"Usable legs on this scan: {present or 'none'}. "
+            f"This needs a {buy_version.upper()} venue to buy on and a "
+            f"{sell_version.upper()} venue to sell on. "
+            + (f"Every leg was rejected on depth — try a smaller --size or a higher "
+               f"--max-impact." if not res.usable else
+               f"Add the missing generation with --venues, or lower --max-impact.")
+        )
+    return buy, sell
+
+
+@dataclass
+class DirectionReport:
+    """One candidate direction and how it priced, for the CLI to print."""
+
+    direction: str                 # "v2_first" | "v3_first"
+    plan: Optional["ArbPlan"] = None
+    error: str = ""
+    net_bps: float = 0.0           # gross minus the flash fee, share of the loan
+
+    @property
+    def label(self) -> str:
+        return ("V3-first (buy V3, sell V2)" if self.direction == "v3_first"
+                else "V2-first (buy V2, sell V3)")
+
+
+def plan_best_direction(
+    res: CrossScanResult,
+    base_address: str,
+    quote_address: str,
+    v3_pool_for_fee,
+    v3_uses_deadline_for: Optional[Callable[[str], bool]] = None,
+    pool_for_fee_for_venue: Optional[Callable[[str], Callable[[int], Optional[str]]]] = None,
+    pool_for_fee_any_venue: Optional[Callable[[int], Optional[str]]] = None,
+    **kwargs,
+) -> Tuple[ArbPlan, List[DirectionReport]]:
+    """
+    Build BOTH leg directions and return the better one, plus both for reporting.
+
+    Leg order is not a detail: measured on BNB Chain mainnet on 2026-09-30 the
+    two directions differed by ~48 bps (V2-first -58 bps, V3-first -10 bps) purely
+    because each leg pays its own venue's fee — buying through a 25 bps V2 pool
+    and selling into a 1 bps V3 pool is a different trade from the mirror, even
+    though both are "WBNB/USDT on PancakeSwap". Whichever is better depends on
+    where the price dislocation is, so it is measured per scan, not assumed.
+
+    Comparison is by net (gross minus the flash fee), because the two directions
+    can borrow from pools at different fee tiers and therefore pay different
+    loans.
+
+    `v3_uses_deadline_for(router)` is called with the V3 router each direction
+    selects, so the router-ABI probe follows the venue actually used.
+
+    `pool_for_fee_for_venue(venue_key)` returns a fee -> pool resolver bound to
+    ONE venue, and is preferred over the generic `v3_pool_for_fee`. A single
+    chain can have several V3 venues with DIFFERENT fee tiers - on BSC,
+    PancakeSwap V3 offers 100/500/2500/10000 while Uniswap V3 offers
+    100/500/3000/10000 - so a resolver bound to "the first V3 venue" answers
+    "no such pool" for a tier the leg actually trades on. That left leg 1's pool
+    address empty on a V3-first plan, and the contract refuses an empty one
+    (`ZeroAddress`) because it must prove the leg-1 pool is not the pool it
+    borrowed from.
+    """
+    reports: List[DirectionReport] = []
+    for direction in ("v2_first", "v3_first"):
+        v3_first = direction == "v3_first"
+        buy_version, sell_version = ("v3", "v2") if v3_first else ("v2", "v3")
+        direction_kwargs = dict(kwargs)
+        # Forward these EXPLICITLY. They are named parameters of this function,
+        # so they are NOT part of **kwargs - and plan_arbitrage is the one that
+        # rebinds per direction, from the venue of whichever leg is the V3 one.
+        # Leaving them behind here meant each direction silently used the generic
+        # resolver, which is bound to a single venue: the V3-first plan then had
+        # an EMPTY leg-1 pool (its Uniswap 0.30% tier is invisible to a
+        # Pancake-bound resolver) and the contract refused the plan with
+        # ZeroAddress before any swap ran.
+        if pool_for_fee_for_venue is not None:
+            direction_kwargs["pool_for_fee_for_venue"] = pool_for_fee_for_venue
+        if pool_for_fee_any_venue is not None:
+            direction_kwargs["pool_for_fee_any_venue"] = pool_for_fee_any_venue
+        direction_pool_for_fee = v3_pool_for_fee
+        if v3_uses_deadline_for is not None:
+            try:
+                buy_leg, sell_leg = select_legs(res, buy_version, sell_version)
+                # Whichever leg is the V3 one carries that venue's router, and
+                # the router-ABI probe must follow it: the two venues on BSC need
+                # different `exactInputSingle` shapes.
+                v3_router = (buy_leg.router_address if v3_first
+                             else sell_leg.router_address) or ""
+                direction_kwargs["v3_uses_deadline"] = bool(v3_uses_deadline_for(v3_router))
+            except PlanError:
+                pass                     # the direction will fail below with a reason
+        try:
+            plan = plan_arbitrage(res, base_address, quote_address, direction_pool_for_fee,
+                                  buy_version=buy_version, sell_version=sell_version,
+                                  **direction_kwargs)
+        except PlanError as exc:
+            reports.append(DirectionReport(direction=direction, error=str(exc)))
+            continue
+        net_bps = 0.0
+        if plan.flash_amount:
+            net_bps = plan.expected_gross_bps - (
+                plan.expected_flash_fee / plan.flash_amount * BPS)
+        reports.append(DirectionReport(direction=direction, plan=plan, net_bps=net_bps))
+
+    usable = [r for r in reports if r.plan is not None]
+    if not usable:
+        detail = "; ".join(f"{r.label}: {r.error}" for r in reports)
+        raise PlanError(f"neither leg direction can be planned — {detail}")
+    return max(usable, key=lambda r: r.net_bps).plan, reports
+
+
 def plan_arbitrage(
     res: CrossScanResult,
     base_address: str,
@@ -459,6 +624,9 @@ def plan_arbitrage(
     gas_cost_quote_wei: int = 0,
     min_profit_buffer_bps: float = 2500.0,
     v2_buy_cost_wei: Optional[int] = None,
+    v3_buy_cost_wei: Optional[int] = None,
+    pool_for_fee_for_venue: Optional[Callable[[str], Callable[[int], Optional[str]]]] = None,
+    pool_for_fee_any_venue: Optional[Callable[[int], Optional[str]]] = None,
 ) -> ArbPlan:
     """
     Build an ArbPlan from a completed cross scan.
@@ -466,6 +634,18 @@ def plan_arbitrage(
     `v3_pool_for_fee(fee_pips)` resolves a V3 pool address for a fee tier. It is
     a callable so this module needs no reader and no network, and so the caller
     decides how pools are looked up.
+
+    `pool_for_fee_for_venue(venue_key)` gives a resolver bound to ONE venue and
+    takes precedence for the V3 leg's own pool, because the leg must be resolved
+    through the factory of the venue it trades on: BSC runs both PancakeSwap V3
+    (100/500/2500/10000) and Uniswap V3 (100/500/3000/10000), and a resolver
+    bound to the wrong one reports "no pool" for a tier that exists.
+
+    `pool_for_fee_any_venue` is used only to find the pool that LENDS the flash
+    loan. The lender does not have to be the venue we trade on - any V3 pool of
+    this pair holding enough of the borrow token can lend, and the cheapest tier
+    is usually not the one we swap through. Both venues' pools call a callback
+    this contract implements, so crossing venues here is safe.
 
     WHICH LEGS GET USED, and why this does not just take `res.buy_leg`:
 
@@ -550,24 +730,30 @@ def plan_arbitrage(
     # profitable reverted on chain with CannotRepay. That is the whole reason
     # `v2_buy_cost_wei` exists: the caller passes the exact getAmountIn cost,
     # computed from live reserves, and the gross edge is measured against it.
-    if v2_buy_cost_wei is not None and v2_buy_cost_wei > 0:
-        borrow_wei = int(v2_buy_cost_wei)
+    v3_first = buy_version == "v3"
+    buy_cost_wei = v3_buy_cost_wei if v3_first else v2_buy_cost_wei
+    buy_cost_source = ("leg 1's real buy cost (exact-output quote on the V3 pool)"
+                       if v3_first else
+                       "leg 1's real buy cost (getAmountIn on the pair's reserves)")
+    if buy_cost_wei is not None and buy_cost_wei > 0:
+        borrow_wei = int(buy_cost_wei)
         approx_borrow = to_wei(size * buy.exec_price, quote_decimals)
         if borrow_wei > approx_borrow:
             diff_bps = (borrow_wei - approx_borrow) / borrow_wei * BPS
             notes.append(
-                f"the loan is sized from leg 1's real buy cost (getAmountIn on the "
-                f"pair's reserves): {borrow_wei:,} wei, which is {diff_bps:,.1f} bps MORE "
-                f"than the venue's sell quote ({approx_borrow:,} wei) implies. Buying "
-                f"costs more than selling pays — that spread is the fee paid twice."
+                f"the loan is sized from {buy_cost_source}: {borrow_wei:,} wei, which is "
+                f"{diff_bps:,.1f} bps MORE than the venue's sell quote "
+                f"({approx_borrow:,} wei) implies. Buying costs more than selling pays "
+                f"— that spread is the fee paid twice."
             )
     else:
         borrow_wei = to_wei(size * buy.exec_price, quote_decimals)
         notes.append(
-            "the loan is sized from the buy venue's SELL quote, not its real buy "
-            "cost. That understates the price of buying by about twice that venue's "
-            "fee, so the edge below is optimistic by the same amount — pass the "
-            "venue's getAmountIn cost to plan_arbitrage to correct it."
+            f"the loan is sized from the buy venue's SELL quote, not its real buy "
+            f"cost. That understates the price of buying by about twice that venue's "
+            f"fee, so the edge below is optimistic by the same amount — pass the "
+            f"{'exact-output V3 quote' if v3_first else 'getAmountIn V2 cost'} to "
+            f"plan_arbitrage to correct it."
         )
     back_wei = to_wei(size * sell.exec_price, quote_decimals)
     if borrow_wei <= 0:
@@ -578,13 +764,31 @@ def plan_arbitrage(
 
     # Which pool lends the loan must be settled BEFORE the fee is known, because
     # PancakeSwap V3 charges the flash fee at the LENDING pool's own swap tier.
-    # Taking that tier from the sell leg assumes the lending pool and leg 2's pool
-    # are the same pool, and they cannot be: leg 2 swaps inside flash()'s
-    # callback, while the lending pool is holding its reentrancy lock.
-    leg2_pool = v3_pool_for_fee(sell.fee_pips) or ""
+    # Taking that tier from the V3 leg assumes the lending pool and the V3 leg's
+    # pool are the same pool, and they cannot be: the V3 swap runs inside
+    # flash()'s callback, while the lending pool is holding its reentrancy lock.
+    # That is true whichever leg is the V3 one, so the exclusions follow the
+    # direction: V3-first means leg 1's pool is the locked one.
+    v3_leg = buy if v3_first else sell
+
+    # Resolve the V3 leg through ITS OWN venue's factory when the caller can
+    # tell us which venue that is. A single chain can run several V3 venues with
+    # different fee tiers - on BSC, PancakeSwap V3 quotes 100/500/2500/10000 and
+    # Uniswap V3 quotes 100/500/3000/10000 - so a resolver bound to "the first V3
+    # venue" answers "no such pool" for a tier the leg actually trades on. That
+    # produced an EMPTY leg-1 pool on a V3-first plan (the tier-3000 Uniswap pool
+    # was invisible to a Pancake-bound resolver), and the contract refuses an
+    # empty one because it must prove leg 1's pool is not the lending pool.
+    leg_pool_for_fee = v3_pool_for_fee
+    if pool_for_fee_for_venue is not None:
+        bound = pool_for_fee_for_venue(v3_leg.venue_key)
+        if bound is not None:
+            leg_pool_for_fee = bound
+
+    v3_leg_pool = leg_pool_for_fee(v3_leg.fee_pips) or ""
     pool, flash_tier, flash_bal = choose_flash_pool(
-        [leg2_pool, sell.pool_address or ""],
-        v3_pool_for_fee,
+        [v3_leg_pool, v3_leg.pool_address or ""],
+        pool_for_fee_any_venue or leg_pool_for_fee,
         borrow_wei,
         flash_pool_quote_balance,
         flash_fee_tiers,
@@ -605,11 +809,16 @@ def plan_arbitrage(
     # its own output token's decimals and expressed in that token:
     #   leg 1 buys base with the borrowed quote -> floor is in BASE
     #   leg 2 sells that base back into quote   -> floor is in QUOTE
-    # The borrow was sized as `size * buy.exec_price` quote, so leg 1 is expected
-    # to hand back almost exactly `size` base; that is the number to floor, not
-    # the quote spent to get it.
-    v2_min = output_floor(size, slippage_bps, base_decimals)
-    v3_min = output_floor(size * sell.exec_price, slippage_bps, quote_decimals)
+    # The borrow was sized to buy `size` base, so leg 1 is expected to hand back
+    # almost exactly `size` base; that is the number to floor, not the quote spent
+    # to get it. In the mirror direction the roles swap: the V3 leg is the buy
+    # (floor in BASE) and the V2 leg is the sell (floor in QUOTE).
+    if v3_first:
+        v3_min = output_floor(size, slippage_bps, base_decimals)
+        v2_min = output_floor(size * sell.exec_price, slippage_bps, quote_decimals)
+    else:
+        v2_min = output_floor(size, slippage_bps, base_decimals)
+        v3_min = output_floor(size * sell.exec_price, slippage_bps, quote_decimals)
 
     gross_wei = back_wei - borrow_wei
     gross_bps = gross_wei / borrow_wei * BPS
@@ -669,13 +878,14 @@ def plan_arbitrage(
             f"way nothing moves but gas."
         )
 
-    if leg2_pool and pool.lower() != leg2_pool.lower():
+    if v3_leg_pool and pool.lower() != v3_leg_pool.lower():
         notes.append(
             f"the flash loan comes from a different pool ({pool}, tier {flash_tier}) "
-            f"than the one leg 2 swaps through ({leg2_pool}, tier {sell.fee_pips}). "
-            f"That is required, not a compromise: flash() holds the lending pool's "
-            f"reentrancy lock across the whole callback, so a swap routed back into "
-            f"it reverts with 'LOK' before either leg can settle."
+            f"than the one the V3 leg ({'leg 1' if v3_first else 'leg 2'}) swaps "
+            f"through ({v3_leg_pool}, tier {v3_leg.fee_pips}). That is required, not a "
+            f"compromise: flash() holds the lending pool's reentrancy lock across the "
+            f"whole callback, so a swap routed back into it reverts with 'LOK' before "
+            f"either leg can settle."
         )
     if flash_bal is not None:
         notes.append(
@@ -683,8 +893,13 @@ def plan_arbitrage(
             f"this {borrow_wei:,} wei loan"
         )
 
-    v2_router = buy.router_address or ""
-    v3_router = sell.router_address or ""
+    # Which venue's router each leg uses follows the DIRECTION, not the buy/sell
+    # role: in mirror mode the V3 leg is the BUY. Reading these off `buy` and
+    # `sell` positionally (the original assumption) put the V2 router into
+    # v3_router on a V3-first plan - an exactInputSingle call to a router that
+    # has no such function, reverting with empty data and no explanation.
+    v3_router = v3_leg.router_address or ""
+    v2_router = (sell if v3_first else buy).router_address or ""
     if not v2_router or not v3_router:
         raise PlanError(
             f"a chosen venue has no router address configured "
@@ -698,16 +913,19 @@ def plan_arbitrage(
     return ArbPlan(
         borrow_token=quote_address,
         intermediate_token=base_address,
+        v3_first=v3_first,
+        v3_leg1_pool=checksum(v3_leg_pool) if (v3_first and v3_leg_pool) else "",
         pool=checksum(pool),
         flash_amount=borrow_wei,
         flash_fee_pips=int(flash_tier),
         v2_router=checksum(v2_router),
-        v2_path=[quote_address, base_address],
+        v2_path=([base_address, quote_address] if v3_first
+                 else [quote_address, base_address]),
         v2_amount_out_min=v2_min,
         v3_router=checksum(v3_router),
-        v3_token_in=base_address,
-        v3_token_out=quote_address,
-        v3_fee=sell.fee_pips,
+        v3_token_in=quote_address if v3_first else base_address,
+        v3_token_out=base_address if v3_first else quote_address,
+        v3_fee=buy.fee_pips if v3_first else sell.fee_pips,
         v3_amount_out_min=v3_min,
         min_profit=effective_min_profit,
         min_profit_floor=min_profit_floor,

@@ -10,6 +10,16 @@ edge is negative and nothing should be sent at all.
 
 Written 2026-09-29. Re-read whenever the survey's median net bps turns positive.
 
+**Addendum 2026-09-30 (leg direction).** The contract now executes either leg
+order and the planner picks per scan — worth ~48 bps between the two, which is
+larger than the whole shortfall being chased. It does not change this memo's
+decision; if anything it sharpens it. A thinner edge means a front-runner taking
+the trade costs proportionally more of it, and the direction that wins is now
+visible in the SURVEY row's `direction` field, so there is a
+record of which shape was being attempted when it was taken. The submission rule
+is unchanged: private relay for anything competitive, public only for deploy,
+withdraw and funding.
+
 ---
 
 ## What the contract already protects

@@ -2438,16 +2438,45 @@ def plan_calldata_encoding_survives_a_roundtrip():
     # unpacked: passing it whole makes web3 try to encode a list as an address.
     data = obj.encode_abi(abi_element_identifier="arbitrage", args=list(plan.call_args))
 
-    expected = "0x" + __import__("eth_utils").keccak(
-        text="arbitrage((address,address,uint256,address,address[],uint256,address,"
-             "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256,bool))"
-    )[:4].hex()
-    check(data[:10] == expected, f"selector {data[:10]} != {expected}")
+    # The expected selector and the decode signature are both DERIVED from the
+    # compiled ABI rather than written out by hand. A hand-typed signature is a
+    # copy of the struct that can silently disagree with it - the previous
+    # version of this test hard-coded the pre-direction signature, which is a
+    # fine way to detect ABI drift and a terrible way to then fix it, since the
+    # fix is another hand-typed string that can be wrong in the same way.
+    fn_abi = next(e for e in compiled.abi
+                  if e.get("type") == "function" and e.get("name") == "arbitrage")
 
-    sig = ("(address,address,uint256,address,address[],uint256,address,"
-           "(address,address,uint24,address,uint256,uint256,uint256,uint160),uint256,bool)")
-    (decoded,) = abi_decode([sig], bytes.fromhex(data[10:]))
-    pool, borrow, amount, v2r, path, v2min, v3r, v3p, minprofit, uses_deadline = decoded
+    def _type_of(item: dict) -> str:
+        t = item["type"]
+        if t == "tuple":
+            return "(" + ",".join(_type_of(c) for c in item["components"]) + ")"
+        if t.startswith("tuple["):
+            return ("(" + ",".join(_type_of(c) for c in item["components"]) + ")"
+                    + t[len("tuple"):])
+        return t
+
+    # Two different strings are needed here and they are easy to swap:
+    #
+    #   selector  = keccak("arbitrage" + "(" + args + ")")  -> one parenthesised
+    #               parameter list, so `args` = the struct type
+    #   decode    = the STRUCT type alone. Calldata for a function taking one
+    #               dynamic tuple starts with the offset word for that tuple, and
+    #               eth_abi consumes exactly that when the type is the dynamic
+    #               tuple itself - wrapping it again makes it read the offset as
+    #               the first field and fail on the next pointer.
+    struct_type = _type_of(fn_abi["inputs"][0])
+    selector_sig = "(" + struct_type + ")"
+    expected = "0x" + __import__("eth_utils").keccak(
+        text="arbitrage" + selector_sig)[:4].hex()
+    check(data[:10] == expected,
+          f"planner encoded {data[:10]}, the compiled ABI says {expected} - "
+          f"call_args and the struct have drifted apart")
+
+    (decoded,) = abi_decode([struct_type], bytes.fromhex(data[10:]))
+    check(len(decoded) == 12, f"expected 12 struct fields, decoded {len(decoded)}")
+    (pool, borrow, amount, v2r, path, v2min, v3r, v3p,
+     minprofit, uses_deadline, v3_first, v3_leg1_pool) = decoded
     eq = lambda a, b: str(a).lower() == str(b).lower()
     check(eq(pool, plan.pool), "pool did not survive encoding")
     check(eq(borrow, plan.borrow_token), "borrowToken did not survive encoding")
@@ -3583,6 +3612,228 @@ def the_loan_is_sized_from_the_real_buy_cost_not_a_sell_quote():
           f"a 0.5% dearer loan should cut ~50 bps from the gross edge, drop was {drop:.1f}")
     check(any("buy cost" in n for n in corrected.notes),
           "the correction must be visible in the notes")
+
+
+@case
+def survey_analysis_separates_directions_and_survives_old_rows():
+    """
+    The analyzer has to group by the thing the survey exists to measure, and it
+    has to do something explicit with rows written before the survey logged a
+    direction at all: reporting them as their own group. Dropping them would hide
+    evidence, and assigning them a direction would invent it.
+    """
+    from arb.survey_report import analyze
+
+    def row(ts, direction, gross, net, buy="PancakeSwap V2", sell="Uniswap V3 0.30%"):
+        r = {"ts": ts, "gross_bps": gross, "net_bps": net, "size_base": 1.0,
+             "buy": buy, "sell": sell, "pair": "WBNB/USDT", "clears_floor": net > 0}
+        if direction:
+            r["direction"] = direction
+        return r
+
+    rows = [row(1000, "v2_first", -50.0, -60.0),
+            row(1001, "v2_first", -40.0, -50.0),
+            row(1002, "v3_first", -10.0, -12.0),
+            row(1003, "v3_first", -8.0, -10.0),
+            row(2000, None, -30.0, -35.0)]          # written before directions existed
+    report = analyze(rows, file_count=1)
+
+    dirs = report["by_direction"]
+    check(set(dirs) == {"v2_first", "v3_first", "unknown (pre-2026-09-30 rows)"},
+          f"every group must appear, got {sorted(dirs)}")
+    check(dirs["v2_first"]["net_median"] == -55.0, f"v2 median {dirs['v2_first']}")
+    check(dirs["v3_first"]["net_median"] == -11.0, f"v3 median {dirs['v3_first']}")
+    # The old row must carry its own numbers, not be silently absorbed.
+    check(dirs["unknown (pre-2026-09-30 rows)"]["rows"] == 1, "old row must be kept")
+    check(report["graded"] == 5, "all five rows are graded on net bps")
+
+    # Venue pairs group separately even within one direction: the same two
+    # venues in the other order is a different trade.
+    venue_keys = set(report["by_venue"])
+    check(len(venue_keys) == 1, f"one venue pair here, got {venue_keys}")
+
+
+@case
+def survey_verdict_refuses_a_sparse_win():
+    """
+    A handful of positive rows around a negative centre is what "not yet" looks
+    like, and the verdict must say so. This is the check that stops a survey from
+    being read as a green light because one iteration got lucky.
+    """
+    from arb.survey_report import analyze
+
+    def row(ts, net, direction="v3_first"):
+        return {"ts": ts, "net_bps": net, "gross_bps": net + 2.0, "direction": direction,
+                "size_base": 1.0, "buy": "Uniswap V3 0.30%", "sell": "PancakeSwap V2",
+                "pair": "WBNB/USDT", "clears_floor": net > 0}
+
+    # 4 lucky rows early, then a long negative stretch: median negative.
+    rows = [row(1000 + i, 5.0) for i in range(4)]
+    rows += [row(2000 + i, -30.0) for i in range(40)]
+    report = analyze(rows, file_count=1)
+    check(report["verdict"]["state"] == "sporadic",
+          f"a sparse win must not read as a candidate, got {report['verdict']}")
+
+    # And the mirror case: every row positive, sustained -> candidate.
+    rows2 = [row(3000 + i, 6.0) for i in range(40)]
+    report2 = analyze(rows2, file_count=1)
+    check(report2["verdict"]["state"] == "candidate",
+          f"a sustained positive must be reported, got {report2['verdict']}")
+
+    # No positive rows at all -> the plain answer.
+    rows3 = [row(4000 + i, -20.0) for i in range(12)]
+    check(analyze(rows3, file_count=1)["verdict"]["state"] == "negative",
+          "an all-negative log must be called negative")
+
+
+@case
+def the_direction_chooser_picks_the_better_leg_order():
+    """
+    Leg order is worth ~48 bps on BSC (measured), so the planner must price both
+    directions and take the better one rather than assuming V2-first.
+    """
+    from arb.executor import plan_best_direction
+
+    # V3 venue priced CHEAP (760) and V2 priced DEAR (765): buying on V3 and
+    # selling on V2 is the profitable shape here.
+    res, pool_for_fee = _fake_scan(buy_exec=765.0, sell_exec=760.0)
+    plan, reports = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20,
+                                        pool_for_fee)
+    check(len(reports) == 2, f"both directions must be reported, got {len(reports)}")
+    check(plan.v3_first, "the chooser must pick V3-first when that direction prices better")
+    check(plan.expected_gross_bps > 0,
+          f"fixture should be profitable V3-first, got {plan.expected_gross_bps:.1f} bps")
+
+    # And the mirror: V2 cheap, V3 dear -> V2-first wins.
+    res2, pool_for_fee2 = _fake_scan(buy_exec=760.0, sell_exec=765.0)
+    plan2, _ = plan_best_direction(res2, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee2)
+    check(not plan2.v3_first, "the chooser must pick V2-first when that prices better")
+
+
+@case
+def the_chooser_forwards_the_venue_aware_resolvers():
+    """
+    In which the two named resolvers must reach plan_arbitrage PER DIRECTION.
+
+    They are named parameters of plan_best_direction, so they are not part of
+    **kwargs, and forgetting to forward them is invisible here: the plan still
+    builds, it just uses the generic single-venue resolver. On BSC that produced
+    a V3-first plan with an EMPTY leg-1 pool (Uniswap's 0.30% tier does not exist
+    on the Pancake-bound resolver) and the contract refused it with ZeroAddress
+    on the fork. This asserts the leg-1 pool is filled, which only the
+    venue-aware path can do.
+    """
+    from arb.executor import plan_best_direction
+
+    res, generic = _fake_scan(buy_exec=765.0, sell_exec=760.0)
+
+    # The generic resolver knows the V2 venue's tiers only (100/500/2500/10000);
+    # the leg's own venue knows 3000 as well. V3-first trades tier 3000, so only
+    # the venue-aware resolver can answer.
+    venue_pools = {"pancakeswap_v3": {2500: "0x" + "55" * 20}}
+    leg_venue = "uniswap_v3"
+    # 3000 is the tier the V3 leg trades (leg 1, when V3-first) and 10000 is a
+    # second tier the venue deploys, so something can still LEND the flash loan:
+    # the leg's own pool is locked for the whole callback and can never lend.
+    venue_pools[leg_venue] = {3000: "0x" + "77" * 20, 10000: "0x" + "88" * 20}
+
+    def for_venue(key):
+        table = venue_pools.get(key, {})
+        return lambda fee: table.get(int(fee), "")
+
+    # V3-first buys on the V3 quote, so that is the leg whose venue decides which
+    # factory resolves its pool - set it to a tier only that venue deploys.
+    v3_quote = next(q for q in res.quotes if q.version == "v3")
+    v3_quote.fee_pips = 3000
+    v3_quote.venue_key = leg_venue
+    plan, _ = plan_best_direction(
+        res, "0x" + "BB" * 20, "0x" + "EE" * 20, lambda fee: "",
+        pool_for_fee_for_venue=for_venue,
+        pool_for_fee_any_venue=lambda fee: venue_pools[leg_venue].get(int(fee), ""))
+    check(plan.v3_first, "fixture must plan V3-first")
+    from arb.executor import checksum as _checksum
+    check(plan.v3_leg1_pool == _checksum("0x" + "77" * 20),
+          f"the venue-aware resolver must supply leg 1's pool, got "
+          f"{plan.v3_leg1_pool!r}")
+
+
+@case
+def the_chooser_survives_one_direction_being_unplannable():
+    """One dead direction must not take the other down with it."""
+    from arb.executor import plan_best_direction
+    from dex.cross import CrossScanResult, VenueQuote
+
+    v2 = VenueQuote(venue_key="pancakeswap_v2", venue_name="PancakeSwap V2",
+                    version="v2", fee_pips=25, fee_bps=25.0, ok=True,
+                    exec_price=760.0, router_address="0x" + "AA" * 20,
+                    pool_address="0x" + "BB" * 20)
+    v3 = VenueQuote(venue_key="pancakeswap_v3", venue_name="PancakeSwap V3",
+                    version="v3", fee_pips=100, fee_bps=1.0, ok=True,
+                    exec_price=765.0, router_address="0x" + "CC" * 20,
+                    pool_address="0x" + "11" * 20)
+    res = CrossScanResult(network="bsc", base_symbol="WBNB", quote_symbol="USDT",
+                          trade_size_base=1.0, max_impact_bps=50.0,
+                          quotes=[v2, v3], buy_leg=v2, sell_leg=v3)
+    pools = {100: "0x" + "11" * 20, 500: "0x" + "22" * 20,
+             2500: "0x" + "33" * 20, 10000: "0x" + "44" * 20}
+    plan, reports = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20,
+                                        lambda f: pools.get(int(f), ""))
+    check(plan is not None, "a plannable direction exists and must be returned")
+    check(any(r.plan is None for r in reports) or len(reports) == 2,
+          "both directions should be attempted and reported")
+
+
+@case
+def v3_first_plans_mirror_the_paths_tokens_and_floors():
+    """
+    In mirror mode every leg-carrying field flips: the V2 path sells base, the
+    V3 tokens buy it, and each slippage floor stays denominated in the token
+    THAT leg pays out. Getting one of these wrong hands the contract a plan that
+    cannot execute - or worse, one that executes the wrong pair.
+    """
+    from arb.executor import plan_best_direction, checksum
+
+    res, pool_for_fee = _fake_scan(buy_exec=765.0, sell_exec=760.0)
+    plan, _ = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee)
+
+    base, quote = checksum("0x" + "BB" * 20), checksum("0x" + "EE" * 20)
+    check(plan.v3_first, "this fixture must plan V3-first")
+    check(plan.v2_path == [base, quote],
+          f"mirror V2 path must start at base and end at quote, got {plan.v2_path}")
+    check(plan.v3_token_in == quote and plan.v3_token_out == base,
+          f"mirror V3 leg must buy base with quote, got "
+          f"{plan.v3_token_in} -> {plan.v3_token_out}")
+    check(plan.v3_leg1_pool, "a V3-first plan must name leg 1's pool")
+
+    # Floors: leg 1 is the V3 buy (floor in BASE wei), leg 2 the V2 sell (QUOTE).
+    check(plan.v3_amount_out_min == int(1.0 * 10 ** 18 * 0.99),
+          f"leg-1 floor must be ~1 base minus slippage, got {plan.v3_amount_out_min}")
+    # In mirror mode leg 2 is the V2 SELL, so its floor comes from the V2 venue's
+    # exec price (765 in this fixture), not from leg 1's V3 buy price (760).
+    check(abs(plan.v2_amount_out_min - int(765.0 * 10 ** 18 * 0.99)) < 10 ** 15,
+          f"leg-2 floor must be the V2 sell proceeds minus slippage, "
+          f"got {plan.v2_amount_out_min}")
+
+    # Routers must not be crossed: the V3 router is the V3 venue's.
+    check(plan.v3_router == checksum("0x" + "CC" * 20),
+          f"V3 router is wrong: {plan.v3_router}")
+    check(plan.v2_router == checksum("0x" + "AA" * 20),
+          f"V2 router is wrong: {plan.v2_router}")
+
+
+@case
+def v2_first_plans_keep_the_original_shape():
+    """The proven direction must not drift while mirror support is added."""
+    from arb.executor import plan_best_direction, checksum
+
+    res, pool_for_fee = _fake_scan(buy_exec=760.0, sell_exec=765.0)
+    plan, _ = plan_best_direction(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee)
+    base, quote = checksum("0x" + "BB" * 20), checksum("0x" + "EE" * 20)
+    check(not plan.v3_first, "this fixture must plan V2-first")
+    check(plan.v2_path == [quote, base], f"got {plan.v2_path}")
+    check(plan.v3_token_in == base and plan.v3_token_out == quote,
+          f"V3 leg must sell base for quote, got {plan.v3_token_in} -> {plan.v3_token_out}")
+    check(plan.v3_leg1_pool == "", "leg-1 pool is only meaningful in mirror mode")
 
 
 @case

@@ -343,13 +343,49 @@ def _scan(provider, net):
     return res, reader
 
 
-def _plan_from(provider, net, res, reader):
-    """Build the exact plan `arb run` would send, floor included."""
+def _pool_resolver_for(reader, venues, base: str, quote: str):
+    """venue_key -> (fee -> pool), as the CLI builds it. See main._pool_resolver_factory."""
+    from dex.fetcher import UniswapV3Reader
+
+    readers: dict = {}
+
+    def for_venue(venue_key: str):
+        if venue_key not in readers:
+            venue = next((v for v in venues if v.key == venue_key), None)
+            readers[venue_key] = (UniswapV3Reader(reader, venue=venue)
+                                  if venue is not None else None)
+        bound = readers[venue_key]
+        if bound is None:
+            return lambda fee: ""
+        return lambda fee: bound.pool_for_fee(base, quote, fee)
+
+    return for_venue
+
+
+def _direction_versions(direction: str):
+    if direction == "v3_first":
+        return "v3", "v2"
+    if direction == "v2_first":
+        return "v2", "v3"
+    return None, None          # auto: let the chooser decide
+
+
+def _plan_from(provider, net, res, reader, direction: str = "auto",
+               lender_venue: str = ""):
+    """
+    Build the exact plan `arb run` would send, floor included.
+
+    Mirrors production for BOTH directions: the buy cost is priced with the same
+    exact-output quote for a V3 leg and getAmountIn for a V2 leg, pool resolution
+    is venue-aware, and `direction="auto"` runs the same chooser the CLI does.
+    A fork test that plans differently from the bot tests nothing about the bot.
+    """
     from abis import ERC20_ABI
     from arb.deployer import gas_price_wei
-    from arb.executor import plan_arbitrage, v3_router_uses_deadline
+    from arb.executor import plan_arbitrage, plan_best_direction, v3_router_uses_deadline
     from config import token_address, venues_for
-    from dex.fetcher import UniswapV3Reader
+    from dex import uniswap_v2_math as v2math
+    from dex.fetcher import UniswapV2Reader, UniswapV3Reader
 
     w3 = provider.w3
     base = token_address(net, "WBNB")
@@ -362,6 +398,21 @@ def _plan_from(provider, net, res, reader):
             return ""
         return UniswapV3Reader(reader, venue=v3_venue).pool_for_fee(base, quote, fee_pips)
 
+    venue_pools = _pool_resolver_for(reader, venues, base, quote)
+
+    # The lender may come from any V3 venue's pool of this pair, so the search
+    # resolver walks them all - the same way main._any_venue_pool_for_fee does.
+    def any_venue_pool_for_fee(fee_pips: int) -> str:
+        for v in venues:
+            if getattr(v, "version", "") != "v3":
+                continue
+            addr = venue_pools(v.key)(fee_pips)
+            if addr:
+                return addr
+        return ""
+
+    assert any_venue_pool_for_fee.__name__ == "any_venue_pool_for_fee"
+
     token = w3.eth.contract(address=Web3.to_checksum_address(quote), abi=ERC20_ABI)
     cache: dict = {}
 
@@ -371,20 +422,13 @@ def _plan_from(provider, net, res, reader):
             cache[key] = int(token.functions.balanceOf(pool).call())
         return cache[key]
 
-    sell = next((q for q in res.usable if q.version == "v3"), None)
-    assert sell is not None and sell.router_address, "no usable V3 leg on the fork"
-
     # The floor's gas figure, converted to the quote token the way the CLI does:
-    # units x price = native wei; x USDT-per-WBNB (the sell price IS that, and
-    # WBNB is BNB) = USDT wei.
-    gas_quote = int(Decimal(GAS_UNITS * gas_price_wei(w3)) * Decimal(str(sell.exec_price)))
+    # units x price = native wei; x USDT-per-WBNB (WBNB is BNB) = USDT wei.
+    v3_quote = next((q for q in res.usable if q.version == "v3"), None)
+    assert v3_quote is not None and v3_quote.router_address, "no usable V3 leg on the fork"
+    gas_quote = int(Decimal(GAS_UNITS * gas_price_wei(w3)) * Decimal(str(v3_quote.exec_price)))
 
-    # Leg 1's real buy cost, exactly as the CLI computes it: getAmountIn on the
-    # pair's live reserves. Mirroring production here is the point — a fork test
-    # that plans differently from the bot tests nothing about the bot.
-    from dex import uniswap_v2_math as v2math
-    from dex.fetcher import UniswapV2Reader
-
+    # Leg 1's real buy cost for BOTH possible legs.
     v2_venue = next(v for v in venues if v.version == "v2")
     pair_reader = UniswapV2Reader(reader, venue=v2_venue)
     pair = pair_reader.pair_address(base, quote)
@@ -392,20 +436,55 @@ def _plan_from(provider, net, res, reader):
     reserve_base, reserve_quote = reserves.reserves_for(base)
     base_dec = (reserves.decimals0 if base.lower() == reserves.token0.lower()
                 else reserves.decimals1)
-    buy_cost = int(v2math.get_amount_in(v2math.to_raw(SIZE_BASE, base_dec),
-                                        reserve_quote, reserve_base,
-                                        pair_reader.fee_num, pair_reader.fee_den))
+    v2_buy_cost = int(v2math.get_amount_in(v2math.to_raw(SIZE_BASE, base_dec),
+                                           reserve_quote, reserve_base,
+                                           pair_reader.fee_num, pair_reader.fee_den))
 
-    plan = plan_arbitrage(
-        res, base, quote, pool_for_fee,
+    v3_buy_cost = None
+    if v3_venue is not None:
+        try:
+            v3_reader = UniswapV3Reader(reader, venue=v3_venue)
+            raw, _pool = v3_reader.buy_cost_raw(
+                base, quote, v2math.to_raw(SIZE_BASE, int(reader.decimals(base))))
+            v3_buy_cost = int(raw)
+        except Exception:            # a V3 venue that cannot be quoted exact-out
+            v3_buy_cost = None
+
+    # A lender from ONE venue, when a test wants to force which venue's pool
+    # lends the loan. That is how the Uniswap V3 flash callback gets exercised:
+    # both venues' pools of this pair call a callback this contract implements,
+    # and only a forced choice proves the second one works.
+    if lender_venue:
+        any_lender = venue_pools(lender_venue)
+    else:
+        any_lender = any_venue_pool_for_fee
+
+    kwargs = dict(
         slippage_bps=100.0, min_profit_wei=0,
         quote_decimals=int(reader.decimals(quote)),
         base_decimals=int(reader.decimals(base)),
-        v3_uses_deadline=v3_router_uses_deadline(w3, sell.router_address),
         flash_pool_quote_balance=quote_balance_of,
         gas_cost_quote_wei=gas_quote,
-        v2_buy_cost_wei=buy_cost,
+        v2_buy_cost_wei=v2_buy_cost,
+        v3_buy_cost_wei=v3_buy_cost,
     )
+    buy_version, sell_version = _direction_versions(direction)
+    if buy_version is None:
+        plan, _reports = plan_best_direction(
+            res, base, quote, pool_for_fee,
+            v3_uses_deadline_for=lambda r: v3_router_uses_deadline(w3, r) if r else True,
+            pool_for_fee_for_venue=venue_pools,
+            pool_for_fee_any_venue=any_lender, **kwargs)
+    else:
+        v3_router = (next((q for q in res.usable if q.version == "v3"), None)
+                     .router_address)
+        plan = plan_arbitrage(
+            res, base, quote, pool_for_fee,
+            buy_version=buy_version, sell_version=sell_version,
+            v3_uses_deadline=v3_router_uses_deadline(w3, v3_router),
+            pool_for_fee_for_venue=venue_pools,
+            pool_for_fee_any_venue=any_lender,
+            **kwargs)
     return plan, pool_for_fee
 
 
@@ -453,9 +532,17 @@ def _reserves_slot(w3, pair: str) -> int:
     )
 
 
-def _apply_skew(w3, pair: str, slot: int, factor: float) -> Tuple[int, int, int]:
+def _apply_skew(w3, pair: str, slot: int, factor: float,
+                field: str = "quote") -> Tuple[int, int, int]:
     """
-    Scale a pair's stored input-token reserve, and return (r0, r1, new_r0).
+    Scale ONE of a pair's stored reserves, and return (r0, r1, new_value).
+
+    `field="quote"` scales reserve0 (the quote token's side) and makes the BASE
+    token cheaper on this pair: buying base here becomes the profitable leg, so
+    the V2-FIRST direction has an edge. `field="base"` scales reserve1 and makes
+    base dearer: selling base here pays more, which is the V3-FIRST (mirror)
+    direction's edge. Between them the two fields let either leg order be tested
+    on real pools instead of only the one the market happens to offer.
 
     This must be re-applied before every trade that consumes it: V2's swap()
     ends with `_update(balance0, balance1, ...)`, which writes the pair's REAL
@@ -466,71 +553,158 @@ def _apply_skew(w3, pair: str, slot: int, factor: float) -> Tuple[int, int, int]
     """
     r0, r1, ts = _decoded_reserves(w3, pair, slot)
     assert r0 > 0 and r1 > 0, "pair has empty reserves; nothing to skew"
-    new_r0 = int(r0 * factor)
-    packed = new_r0 | (r1 << 112) | (ts << 224)
+    new_r0 = int(r0 * factor) if field == "quote" else r0
+    new_r1 = int(r1 * factor) if field == "base" else r1
+    packed = new_r0 | (new_r1 << 112) | (ts << 224)
     resp = w3.provider.make_request(
         "anvil_setStorageAt", [Web3.to_checksum_address(pair), hex(slot), hex(packed)])
     assert "error" not in resp or not resp["error"], \
         f"anvil refused the storage write: {resp}"
     after = _decoded_reserves(w3, pair, slot)
-    assert after[0] == new_r0 and after[1] == r1, "the storage write did not take effect"
-    return r0, r1, new_r0
+    assert after[0] == new_r0 and after[1] == new_r1, "the storage write did not take effect"
+    return r0, r1, (new_r0 if field == "quote" else new_r1)
+
+
+def _write_reserves(w3, pair: str, slot: int, r0: int, r1: int) -> None:
+    """Write a pair's stored reserves back, with a fresh timestamp."""
+    packed = int(r0) | (int(r1) << 112) | (int(time.time()) << 224)
+    resp = w3.provider.make_request(
+        "anvil_setStorageAt", [Web3.to_checksum_address(pair), hex(slot), hex(packed)])
+    assert "error" not in resp or not resp["error"], \
+        f"anvil refused the restore: {resp}"
+    back = _decoded_reserves(w3, pair, slot)
+    assert back[0] == int(r0) and back[1] == int(r1), "the restore did not take effect"
 
 
 class Skewed:
     """A plan whose edge comes from a skewed pair, plus how to re-apply it."""
 
-    def __init__(self, plan, res, skew, resolver, pair, slot):
+    def __init__(self, plan, res, skew, resolver, pair, slot, field="quote",
+                 restore=None, venue_pools=None):
         self.plan = plan
         self.res = res
         self.skew = skew
         self.resolver = resolver
+        # venue_key -> (fee -> pool), so a test can resolve a leg through the
+        # factory of the venue it actually trades on.
+        self.venue_pools = venue_pools
         self.pair = pair
         self.slot = slot
+        self.field = field
+        # The pair's stored reserves as they were before this fixture wrote to
+        # them, so teardown can put them back.
+        self.restore = restore or (0, 0)
 
 
-@pytest.fixture(scope="module")
-def skewed_plan(provider, forked_net, live_plan):
+def _build_skewed(provider, net, res0, field: str, direction: str,
+                  lender_venue: str = "") -> "Skewed":
     """
-    A plan built against a V2 pair whose price has been deliberately skewed.
+    Skew the WBNB/USDT pair's stored reserves, then build the plan for ONE
+    direction against that state.
 
-    The pair's stored USDT reserve is scaled by SKEW_FACTOR (default 0.98), which
-    makes WBNB ~2% cheaper there than the market while leaving the V3 leg priced
-    by the real market — i.e. a guaranteed, repeatable arbitrage. The write is a
-    single storage slot on a throwaway fork; the contract, routers, pools and
-    token balances are all real mainnet ones.
-
-    The k-invariant check inside V2's swap() is satisfied because it compares
-    the ACTUAL balances (which stay large) against the STORED reserves (which
-    shrink): the manufactured price is unfavourable to the pool in the same
-    direction that makes the k check pass more easily.
+    Order matters and is the whole point: the write happens FIRST and the plan is
+    built from a fresh scan of the skewed state, because a plan built before the
+    write prices a market that no longer exists. Sharing one plan across tests
+    while re-skewing per test is the same mistake one level up - the second test
+    then trades against a floor derived from the first test's reserves.
     """
     w3 = provider.w3
-    plan0, res0, _ = live_plan
     v2 = next((q for q in res0.usable if q.version == "v2"), None)
     assert v2 is not None and v2.pool_address, "no usable V2 leg to skew"
 
     slot = _reserves_slot(w3, v2.pool_address)
-    skew = _apply_skew(w3, v2.pool_address, slot, SKEW_FACTOR)
+    before = _decoded_reserves(w3, v2.pool_address, slot)
+    skew = _apply_skew(w3, v2.pool_address, slot, SKEW_FACTOR, field=field)
 
-    # Re-scan so the plan prices the skewed state exactly as production would.
-    res, reader = _scan(provider, forked_net)
-    plan, resolver = _plan_from(provider, forked_net, res, reader)
-    return Skewed(plan, res, skew, resolver, v2.pool_address, slot)
+    # Re-scan so the plan prices the skewed state exactly as production would,
+    # and PIN the direction: these fixtures exist to exercise a specific leg
+    # order, and letting the chooser pick would silently swap what is under test
+    # whenever the market moves.
+    res, reader = _scan(provider, net)
+    plan, resolver = _plan_from(provider, net, res, reader, direction=direction,
+                                lender_venue=lender_venue)
+    from config import token_address, venues_for
+
+    resolvers = _pool_resolver_for(reader, venues_for(net.key),
+                                   token_address(net, "WBNB"),
+                                   token_address(net, "USDT"))
+    return Skewed(plan, res, skew, resolver, v2.pool_address, slot, field=field,
+                  restore=(before[0], before[1]), venue_pools=resolvers)
 
 
 @pytest.fixture
-def fresh_skew(provider, skewed_plan):
+def skewed_plan(provider, forked_net, live_plan):
     """
-    The skewed plan, with the skew re-applied for THIS test.
+    A V2-FIRST plan built against a V2 pair whose price has been deliberately
+    skewed (the shape the original single-direction contract was written for).
 
-    Function-scoped on purpose: any trade through the pair syncs its reserves
-    back to reality (see _apply_skew), so a module-scoped fixture would hand
-    later tests a plan whose price no longer exists.
+    The pair's stored USDT reserve is scaled by SKEW_FACTOR (default 0.98), which
+    makes WBNB ~2% cheaper there than the market while leaving the V3 leg priced
+    by the real market - i.e. a guaranteed, repeatable arbitrage. The write is a
+    single storage slot on a throwaway fork; the contract, routers, pools and
+    token balances are all real mainnet ones.
+
+    The k-invariant check inside V2's swap() is satisfied because it compares the
+    ACTUAL balances (which stay large) against the STORED reserves (which
+    shrink): the manufactured price is unfavourable to the pool in the same
+    direction that makes the k check pass more easily.
+
+    Function-scoped, and the pair is handed back exactly as it was found. Both
+    halves are load-bearing: a trade through the pair syncs its stored reserves
+    back to reality, so a module-scoped plan would hand later tests a price that
+    no longer exists, and a leaked write would leave the next fixture skewing an
+    already-skewed pair (0.98 x on both sides cancels out entirely, leaving a
+    plan with no edge whose legs fail on their own slippage floors).
     """
-    w3 = provider.w3
-    _apply_skew(w3, skewed_plan.pair, skewed_plan.slot, SKEW_FACTOR)
-    return skewed_plan
+    built = _build_skewed(provider, forked_net, live_plan[1], "quote", "v2_first")
+    assert not built.plan.v3_first, "this fixture must produce a V2-first plan"
+    try:
+        yield built
+    finally:
+        _write_reserves(provider.w3, built.pair, built.slot, *built.restore)
+
+
+@pytest.fixture
+def mirror_plan(provider, forked_net, live_plan):
+    """
+    A V3-FIRST plan with a manufactured edge: the pair's stored BASE reserve is
+    scaled down, so V2 pays MORE per WBNB than the market does and buying on V3
+    to sell on V2 is profitable.
+
+    This is the direction added on 2026-09-30, specifically because the two leg
+    orders differed by ~48 bps on live BSC. It also exercises the Uniswap V3
+    flash path when the lender ends up being a Uniswap pool, which is what the
+    venue-aware pool resolver now allows and what `uniswapV3FlashCallback` exists
+    for.
+    """
+    built = _build_skewed(provider, forked_net, live_plan[1], "base", "v3_first")
+    assert built.plan.v3_first, "this fixture must produce a V3-first plan"
+    try:
+        yield built
+    finally:
+        _write_reserves(provider.w3, built.pair, built.slot, *built.restore)
+
+
+def _v3_pool_of_plan(plan, res, venue_pools) -> str:
+    """
+    The V3 pool the plan's V3 leg will actually swap through, resolved the same
+    way the plan was.
+
+    Not `plan.v3_leg1_pool`: that is only populated for V3-FIRST plans, because
+    in the other direction the pool is whatever the router derives from
+    (tokenIn, tokenOut, fee) - the planner pinned the fee, not the address. And
+    not the generic resolver either: it is bound to ONE venue, and the V3 leg can
+    easily be on the other one (Uniswap 0.30% has no Pancake equivalent), which
+    answers "no pool" for the tier the plan actually trades.
+    """
+    if plan.v3_first and plan.v3_leg1_pool:
+        return plan.v3_leg1_pool
+    venue_key = next((q.venue_key for q in res.usable
+                      if q.version == "v3" and q.router_address
+                      and q.router_address.lower() == plan.v3_router.lower()), None)
+    if venue_key is None:
+        return ""
+    return venue_pools(venue_key)(plan.v3_fee) or ""
 
 
 def _usdt_balance_of(w3, token_address_: str, who: str) -> int:
@@ -570,6 +744,28 @@ def _run_trade(w3, contract, plan, sender: str):
         "waiting for the forked transaction to mine")
     outcome = decode_outcome(receipt.logs, contract.abi, contract.address)
     return receipt, outcome
+
+
+@pytest.fixture
+def univ3_lender_plan(provider, forked_net, live_plan):
+    """
+    A V3-first plan forced to borrow from the UNISWAP V3 pool, not Pancake's.
+
+    This exists because the flash pool stopped being implicitly the Pancake pool
+    on 2026-09-30: the planner now searches fee tiers across every V3 venue of
+    the pair, and whichever pool lends must call a callback this contract
+    implements. Uniswap V3 pools call `uniswapV3FlashCallback`; Pancake's call
+    `pancakeV3FlashCallback`. Before the second entry point existed, borrowing
+    from a Uniswap pool reverted with EMPTY returndata - which reads like a
+    broken pool, not a missing function - so this test is the difference between
+    "the planner may choose it" and "the contract can survive it".
+    """
+    built = _build_skewed(provider, forked_net, live_plan[1], "base", "v3_first",
+                          lender_venue="uniswap_v3")
+    try:
+        yield built
+    finally:
+        _write_reserves(provider.w3, built.pair, built.slot, *built.restore)
 
 
 # --------------------------------------------------------------------------
@@ -630,10 +826,10 @@ def test_live_plan_either_profits_or_reverts_cleanly(provider, live_plan, deploy
 # --------------------------------------------------------------------------
 # 2. a real round trip, on real pools, with a manufactured edge
 # --------------------------------------------------------------------------
-def test_manufactured_edge_profits_though_real_pools(provider, fresh_skew, deployed):
+def test_manufactured_edge_profits_though_real_pools(provider, skewed_plan, deployed):
     contract, abi, acct, addr = deployed
-    plan, res, skew, resolver = fresh_skew.plan, fresh_skew.res, \
-        fresh_skew.skew, fresh_skew.resolver
+    plan, res, skew, resolver = skewed_plan.plan, skewed_plan.res, \
+        skewed_plan.skew, skewed_plan.resolver
     w3 = provider.w3
     r0, r1, new_r0 = skew
 
@@ -669,11 +865,116 @@ def test_manufactured_edge_profits_though_real_pools(provider, fresh_skew, deplo
 
 
 # --------------------------------------------------------------------------
+# 2b. the MIRROR direction (V3-first) profits on real pools
+# --------------------------------------------------------------------------
+def test_mirror_direction_profits_though_real_pools(provider, mirror_plan, deployed):
+    """
+    The direction that did not exist before 2026-09-30.
+
+    Leg 1 buys on the V3 router and leg 2 sells on the V2 router - the mirror of
+    the original design, and worth ~48 bps on live BSC because each leg pays its
+    own venue's fee. Proving it here means: the struct's new fields reach the
+    contract, the direction dispatch in the callback works, the V3 leg-1 pool
+    validation passes against a real pool, and the V2 sell leg settles.
+
+    It also exercises `uniswapV3FlashCallback` whenever the lender is a Uniswap
+    pool, which the venue-aware pool resolver now permits.
+    """
+    contract, abi, acct, addr = deployed
+    plan, res, skew, resolver = (mirror_plan.plan, mirror_plan.res,
+                                 mirror_plan.skew, mirror_plan.resolver)
+    w3 = provider.w3
+
+    assert plan.v3_first, "fixture must be V3-first"
+    assert plan.v3_leg1_pool, "a V3-first plan must name leg 1's pool for the contract"
+    assert plan.v3_leg1_pool.lower() != plan.pool.lower(), (
+        "leg 1's pool must differ from the lending pool; flash() holds that pool's lock"
+    )
+    assert plan.expected_gross_bps > 0, (
+        f"the skew was meant to create an edge; the plan sees "
+        f"{plan.expected_gross_bps:.1f} bps"
+    )
+
+    before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
+    receipt, outcome = _run_trade(w3, contract, plan, acct)
+    assert receipt.status == 1, "the V3-first arbitrage reverted on real mainnet pools"
+    assert outcome is not None, "no ArbitrageExecuted event was emitted"
+    assert bool(outcome.get("outcome.v3First", False)) is True, (
+        "the event must record the direction that ran"
+    )
+
+    profit = int(outcome["outcome.profit"])
+    assert profit > 0, f"mirror round trip did not profit: {profit} wei"
+    assert profit >= plan.min_profit, (
+        f"profit {profit} below the plan's own floor {plan.min_profit}"
+    )
+    assert _usdt_balance_of(w3, plan.borrow_token, addr) == before_usdt + profit
+
+
+# --------------------------------------------------------------------------
+# 2bb. a flash loan from a UNISWAP V3 pool repays through the second callback
+# --------------------------------------------------------------------------
+def test_univ3_lender_repays_through_uniswap_callback(provider, univ3_lender_plan,
+                                                      deployed):
+    contract, abi, acct, addr = deployed
+    plan = univ3_lender_plan.plan
+    w3 = provider.w3
+
+    univ3_pool = univ3_lender_plan.venue_pools("uniswap_v3")(plan.flash_fee_pips)
+    assert univ3_pool, "no Uniswap V3 pool at the plan's tier; fixture is wrong"
+    assert plan.pool.lower() == univ3_pool.lower(), (
+        f"the fixture must force a Uniswap V3 lender; the plan borrows from "
+        f"{plan.pool} instead"
+    )
+
+    before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
+    receipt, outcome = _run_trade(w3, contract, plan, acct)
+
+    assert receipt.status == 1, (
+        "the trade reverted when the flash loan came from a Uniswap V3 pool - "
+        "check that uniswapV3FlashCallback reaches the same body as Pancake's"
+    )
+    assert outcome is not None, "no ArbitrageExecuted event was emitted"
+    profit = int(outcome["outcome.profit"])
+    assert profit > 0, f"round trip did not profit: {profit} wei"
+    assert _usdt_balance_of(w3, plan.borrow_token, addr) == before_usdt + profit
+
+
+# --------------------------------------------------------------------------
+# 2c. a leg-1 pool equal to the lending pool is refused by the contract
+# --------------------------------------------------------------------------
+def test_leg1_pool_equal_to_flash_pool_is_refused(provider, mirror_plan, deployed):
+    """
+    In mirror mode the V3 swap is leg 1, so a plan naming the LENDING pool as
+    leg 1's pool would swap into a pool that is locked for the whole callback.
+
+    Two layers stop it: the planner excludes the lending pool when choosing legs,
+    and the contract now validates leg 1's pool explicitly. This asserts the
+    CONTRACT's layer, because that is the one that holds when a hand-built plan
+    is sent - and the failure it produces (`Leg1PoolIsFlashPool`) is legible,
+    where the underlying 'LOK' from the router is not.
+    """
+    contract, abi, acct, addr = deployed
+    plan = mirror_plan.plan
+    w3 = provider.w3
+
+    trapped = dataclasses.replace(plan, pool=plan.v3_leg1_pool)
+    selector = "0x" + keccak(text="Leg1PoolIsFlashPool(address)")[:4].hex()
+
+    with pytest.raises(Exception) as excinfo:      # noqa: PT011 - asserted below
+        _retry(lambda: contract.functions.arbitrage(*trapped.call_args)
+               .call({"from": acct}), "simulating a trapped leg-1 pool")
+    assert selector.lower() in str(excinfo.value).lower(), (
+        f"expected Leg1PoolIsFlashPool ({selector}), got: {excinfo.value}"
+    )
+
+
+# --------------------------------------------------------------------------
 # 3. an unreachable floor reverts and moves nothing
 # --------------------------------------------------------------------------
-def test_impossible_min_profit_reverts_without_moving_tokens(provider, fresh_skew, deployed):
+def test_impossible_min_profit_reverts_without_moving_tokens(provider, skewed_plan, deployed):
     contract, abi, acct, addr = deployed
-    plan = fresh_skew.plan
+    plan = skewed_plan.plan
     w3 = provider.w3
 
     before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
@@ -694,7 +995,7 @@ def test_impossible_min_profit_reverts_without_moving_tokens(provider, fresh_ske
 # --------------------------------------------------------------------------
 # 4. the LOK trap stays closed
 # --------------------------------------------------------------------------
-def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, deployed):
+def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, skewed_plan, deployed):
     """
     The flash loan must not come from the pool leg 2 swaps through: flash()
     holds that pool's lock for the whole callback, so the swap inside it reverts
@@ -702,7 +1003,7 @@ def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, dep
     choose_flash_pool avoiding it is load-bearing rather than defensive.
     """
     contract, abi, acct, addr = deployed
-    plan, resolver = fresh_skew.plan, fresh_skew.resolver
+    plan, resolver = skewed_plan.plan, skewed_plan.resolver
     w3 = provider.w3
 
     # The pool leg 2 actually swaps through is the one the PLANNER resolved for
@@ -710,8 +1011,9 @@ def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, dep
     # different tier much of the time, and the trapped plan then fails for an
     # unrelated reason (it borrowed from an arbitrary pool) instead of
     # demonstrating LOK — which is exactly what happened while writing this.
-    leg2_pool = resolver(plan.v3_fee)
-    assert leg2_pool, f"could not resolve a pool for tier {plan.v3_fee}"
+    leg2_pool = _v3_pool_of_plan(plan, skewed_plan.res, skewed_plan.venue_pools)
+    assert leg2_pool, (f"could not resolve the plan's V3 pool for tier {plan.v3_fee} "
+                       f"on router {plan.v3_router}")
     assert leg2_pool.lower() != plan.pool.lower(), (
         "the flash pool and leg 2's pool must differ; otherwise this tests nothing"
     )
@@ -731,9 +1033,9 @@ def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, dep
 # --------------------------------------------------------------------------
 # 5. withdrawals are owner-only, and move the real amount
 # --------------------------------------------------------------------------
-def test_withdraw_is_owner_only_then_moves_exactly_that_amount(provider, fresh_skew, deployed):
+def test_withdraw_is_owner_only_then_moves_exactly_that_amount(provider, skewed_plan, deployed):
     contract, abi, acct, addr = deployed
-    plan = fresh_skew.plan
+    plan = skewed_plan.plan
     w3 = provider.w3
 
     if _usdt_balance_of(w3, plan.borrow_token, addr) == 0:
@@ -766,7 +1068,7 @@ def test_withdraw_is_owner_only_then_moves_exactly_that_amount(provider, fresh_s
 # --------------------------------------------------------------------------
 # 6. the contract's fee preview agrees with the planner, to the wei
 # --------------------------------------------------------------------------
-def test_preview_flash_fee_matches_the_planner(provider, fresh_skew, deployed):
+def test_preview_flash_fee_matches_the_planner(provider, skewed_plan, deployed):
     """
     The planner computes ceil(amount * tier / 1e6) off-chain and the pool
     charges its own figure on-chain. If they ever disagree the plan is
@@ -774,10 +1076,11 @@ def test_preview_flash_fee_matches_the_planner(provider, fresh_skew, deployed):
     pool — and compare.
     """
     contract, abi, acct, addr = deployed
-    plan = fresh_skew.plan
+    plan = skewed_plan.plan
 
     fee0, fee1 = contract.functions.previewFlashFee(plan.pool, plan.flash_amount).call()
     assert fee0 == fee1 == plan.expected_flash_fee, (
         f"planner says the flash fee is {plan.expected_flash_fee} wei, the pool says "
         f"{fee0}/{fee1} wei — the plan is pricing its own loan wrong"
     )
+
