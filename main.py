@@ -19,6 +19,7 @@ Add --json to scan/watch/info for machine-readable output.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import logging
 import pathlib
@@ -771,8 +772,21 @@ def cmd_verify(args) -> int:
     return 0
 
 def cmd_selftest(args) -> int:
+    """
+    Both offline suites. They are separate modules because they test different
+    things — `test_math` the swap maths, `test_market` the index and batching —
+    but one command, because "run the tests" should not be two commands an
+    operator has to remember in the right order.
+    """
     from tests.test_math import run_all
+
     failures = run_all(verbose=not args.quiet)
+
+    from tests.test_market import run_all as run_market
+
+    failures += run_market(verbose=not args.quiet)
+    if not args.quiet and not failures:
+        print("\nsuites: maths + market")
     return 1 if failures else 0
 
 
@@ -2130,6 +2144,211 @@ def cmd_arb_run(args) -> int:
     return 0
 
 
+@dataclass
+class PairScanOptions:
+    """
+    Everything the per-pair deep scan needs, so the survey and the market-wide
+    scan cannot drift apart.
+
+    Two commands, one implementation: the survey asks "is there an edge in
+    ETH/USDT right now" on a timer, `arb market` asks the same question of every
+    comparable pair the index holds. A second copy of this logic would be a
+    second place for the cost model to be wrong.
+    """
+
+    size: float = 1.0
+    max_impact: Optional[float] = None
+    slippage: float = 100.0
+    min_profit: int = 0
+    min_profit_buffer: float = 2500.0
+    deepest_only: bool = False
+
+    def scaled(self, size: float) -> "PairScanOptions":
+        """The same options at another probe size (dataclasses.replace is shallow)."""
+        import dataclasses
+
+        return dataclasses.replace(self, size=float(size))
+
+
+# The smallest probe a scan will descend to, in base units. Below this a "price"
+# is a rounding artefact rather than a market, so a pair that only quotes under it
+# is reported as unquotable rather than quoted at a meaningless size.
+MIN_PROBE_BASE = 1e-6
+
+# How many decades the descent may try. Each step costs a full re-quote of the
+# pair, so this is a real budget: measured on BSC, a family that ends up
+# unplannable took ~70 s per row with the descent uncapped. Four decades is
+# enough to separate "too thin for this size" from "not a pair at all".
+MAX_PROBE_REDUCTIONS = 4
+
+
+def _too_big_for_pool(exc: Exception) -> bool:
+    """
+    True when the failure means "this trade does not fit", not "no route exists".
+
+    At market scale the difference is the whole game: a thin long-tail pool
+    holding 0.4 of a token cannot absorb a 1-unit probe, and reporting that as an
+    error would hide a pair that is perfectly quotable at a smaller size. The
+    messages come from the pool maths and the flash-loan sizing, which is why
+    they are matched by text rather than by exception type.
+    """
+    text = str(exc).lower()
+    return any(needle in text for needle in (
+        "exceeds pool reserves", "insufficient liquidity", "amount exceeds",
+        "exceeds the pool", "output exceeds", "not enough liquidity",
+    ))
+
+
+def scan_pair_once(provider, net, settings, base: str, quote: str,
+                   base_symbol: str, quote_symbol: str, venues: list,
+                   opts: PairScanOptions, reader=None) -> dict:
+    """
+    Quote one token pair across every venue and plan the best executable route.
+
+    Returns the evidence row: both directions' gross and net bps, the venue pair,
+    the gas it would cost, and whether the trade clears its own costs. It reads
+    the chain and does arithmetic on the answers; it does not sign or send, and
+    there is no code path here that could — the row is the deliverable.
+
+    THE PROBE SIZE ADAPTS, AND THE ROW SAYS SO
+    ------------------------------------------
+    One fixed size does not work across a whole market. A single unit is a
+    rounding error against a real USDT/WBNB pool and larger than the entire
+    reserves of a long-tail token that only ever saw a $200 listing — and the
+    long tail is where the dislocations are. Measured on the first market scan of
+    the PancakeSwap token list: 5 of 8 pairs failed, every one of them with
+    "exceeds pool reserves" or "insufficient liquidity", and every one quotable
+    at a size that fits.
+
+    So when a failure means "does not fit", the scan descends by decades and
+    tries again, and `size_base_used` goes into the row. That number is itself a
+    finding: it says how much of a trade the pair can absorb, which is worth more
+    than a price quoted at a size the pool cannot fill.
+    """
+    from arb.executor import PlanError
+    from dex.fetcher import PoolNotFound
+
+    sizes = [float(opts.size)]
+    while True:
+        size = sizes[-1]
+        try:
+            row = _scan_pair_at_size(provider, net, settings, base, quote,
+                                     base_symbol, quote_symbol, venues,
+                                     opts.scaled(size), reader)
+        except (ValueError, PoolNotFound, PlanError, ArithmeticError) as exc:
+            fits_smaller = (size / 10 >= MIN_PROBE_BASE
+                            and len(sizes) - 1 < MAX_PROBE_REDUCTIONS)
+            if _too_big_for_pool(exc) and fits_smaller:
+                sizes.append(size / 10)
+                continue
+            if _too_big_for_pool(exc) and len(sizes) > 1:
+                # Say what was tried. "insufficient liquidity" on its own reads
+                # like a bug in the scanner; with the sizes attached it reads as
+                # the finding it is — this pool is too thin to quote at all.
+                tried = ", ".join(f"{s:g}" for s in sizes)
+                raise ValueError(
+                    f"too thin to quote at any tried size ({tried} of the base "
+                    f"token): {exc}") from exc
+            raise
+        row["size_base_used"] = size
+        if len(sizes) > 1:
+            row["size_note"] = (f"{opts.size:g} does not fit this pair; quoted at "
+                                f"{size:g} instead ({len(sizes) - 1} reduction(s))")
+        return row
+
+
+def _scan_pair_at_size(provider, net, settings, base: str, quote: str,
+                       base_symbol: str, quote_symbol: str, venues: list,
+                       opts: PairScanOptions, reader=None) -> dict:
+    """One scan at one size. `scan_pair_once` owns the size descent."""
+    # Imported here, not borrowed from the caller: this function is called by two
+    # different commands and must not depend on what either imported for itself.
+    from decimal import Decimal
+
+    from arb.deployer import gas_price_wei as _gas_price_wei
+    from arb.executor import plan_best_direction, v3_router_uses_deadline
+    from dex.cross import scan_venues
+    from dex.fetcher import ChainReader
+
+    reader = reader or ChainReader(provider, net)
+    res = scan_venues(
+        provider, net, base, quote, base_symbol, quote_symbol,
+        opts.size, venues, reader=reader,
+        max_impact_bps=(opts.max_impact if opts.max_impact is not None
+                        else settings.max_impact_bps),
+        all_tiers=not opts.deepest_only,
+    )
+    row: dict = {}
+    row["block"] = res.block_number
+    row["legs_usable"] = len(res.usable)
+    row["mid_spread_usable_bps"] = round(res.mid_spread_usable_bps, 2)
+
+    v3_venue = next((v for v in venues if v.version == "v3"), None)
+
+    def pool_for_fee(fee_pips: int) -> str:
+        if v3_venue is None:
+            return ""
+        return _v3_reader_for(reader, v3_venue).pool_for_fee(base, quote, fee_pips)
+
+    buy_cost = _v2_buy_cost_fn(reader, venues, base, quote)
+    v3_buy_fn_s, _ = _v3_buy_cost_fn(reader, venues, base, quote)
+    v3_buy_s = v3_buy_fn_s(opts.size) if v3_buy_fn_s else (None, None)
+    plan, reports = plan_best_direction(
+        res, base, quote, pool_for_fee,
+        v3_uses_deadline_for=(lambda r: bool(v3_router_uses_deadline(provider.w3, r))
+                              if r else True),
+        pool_for_fee_for_venue=_pool_resolver_factory(reader, venues, base, quote),
+        pool_for_fee_any_venue=_any_venue_pool_for_fee(reader, venues, base, quote),
+        slippage_bps=opts.slippage, min_profit_wei=opts.min_profit,
+        quote_decimals=_decimals_on_chain(reader, quote),
+        base_decimals=_decimals_on_chain(reader, base),
+        flash_pool_quote_balance=_pool_quote_balance_fn(provider.w3, quote),
+        min_profit_buffer_bps=opts.min_profit_buffer,
+        v2_buy_cost_wei=buy_cost(opts.size) if buy_cost else None,
+        v3_buy_cost_wei=v3_buy_s[0],
+    )
+    # No contract and no sender here, so gas is priced from the fixed unit
+    # estimate x the live gas price — the same arithmetic the floor uses, minus
+    # the simulation.
+    gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
+        provider, net, settings, res, plan, sender=None, contract_address=None)
+
+    row["gas_price_used_wei"] = _gas_price_wei(provider.w3)
+    try:
+        row["gas_price_market_wei"] = int(provider.w3.eth.gas_price)
+    except Exception:  # noqa: BLE001
+        pass
+    gross_wei = int(Decimal(plan.flash_amount)
+                    * Decimal(str(plan.expected_gross_bps)) / Decimal(10_000))
+    net_wei = gross_wei - plan.expected_flash_fee - gas_quote
+    net_bps = float(Decimal(net_wei) / Decimal(plan.flash_amount) * Decimal(10_000)) \
+        if plan.flash_amount else 0.0
+    clears = net_wei >= max(plan.min_profit_floor, opts.min_profit)
+
+    row["direction"] = "v3_first" if plan.v3_first else "v2_first"
+    row["directions"] = {
+        r.direction: ({"gross_bps": round(r.plan.expected_gross_bps, 2),
+                       "net_bps": round(r.net_bps, 2)} if r.plan is not None
+                      else {"error": r.error[:120]})
+        for r in reports
+    }
+    row.update({
+        "buy": plan.buy_label, "sell": plan.sell_label,
+        "buy_exec": plan.buy_exec, "sell_exec": plan.sell_exec,
+        "gross_bps": round(plan.expected_gross_bps, 2),
+        "flash_fee_wei": plan.expected_flash_fee,
+        "gas_quote_wei": gas_quote, "gas_units": gas_units,
+        "floor_wei": plan.min_profit_floor,
+        "net_wei": net_wei, "net_bps": round(net_bps, 2),
+        "clears_floor": clears,
+        "expected_revert": "EXPECTED TO REVERT" in " ".join(plan.notes),
+        "notes": plan.notes,
+    })
+    if gas_note:
+        row["gas_note"] = gas_note
+    return row
+
+
 def cmd_arb_survey(args) -> int:
     """
     Dry-run the planner in a loop, logging every iteration's all-in economics.
@@ -2179,6 +2398,15 @@ def cmd_arb_survey(args) -> int:
     print(f"  log      {log_path}")
     print(fmt.dim("  this command never signs or sends anything"))
 
+    opts = PairScanOptions(
+        size=settings.trade_size_base,
+        max_impact=args.max_impact,
+        slippage=args.slippage,
+        min_profit=args.min_profit,
+        min_profit_buffer=args.min_profit_buffer,
+        deepest_only=args.deepest_only,
+    )
+
     rows = []
     started = time.time()
     net_bps_seen = []
@@ -2191,83 +2419,10 @@ def cmd_arb_survey(args) -> int:
                "network": net.key, "pair": f"{base_symbol}/{quote_symbol}",
                "size_base": settings.trade_size_base}
         try:
-            reader = ChainReader(provider, net)
-            res = scan_venues(
-                provider, net, base, quote, base_symbol, quote_symbol,
-                settings.trade_size_base, venues, reader=reader,
-                max_impact_bps=(args.max_impact if args.max_impact is not None
-                                else settings.max_impact_bps),
-                all_tiers=not args.deepest_only,
-            )
-            row["block"] = res.block_number
-            row["legs_usable"] = len(res.usable)
-            row["mid_spread_usable_bps"] = round(res.mid_spread_usable_bps, 2)
-
-            v3_venue = next((v for v in venues if v.version == "v3"), None)
-
-            def pool_for_fee(fee_pips: int) -> str:
-                if v3_venue is None:
-                    return ""
-                return _v3_reader_for(reader, v3_venue).pool_for_fee(base, quote, fee_pips)
-
-            buy_cost = _v2_buy_cost_fn(reader, venues, base, quote)
-            v3_buy_fn_s, _ = _v3_buy_cost_fn(reader, venues, base, quote)
-            v3_buy_s = v3_buy_fn_s(settings.trade_size_base) if v3_buy_fn_s else (None, None)
-            plan, reports = plan_best_direction(
-                res, base, quote, pool_for_fee,
-                v3_uses_deadline_for=(lambda r: bool(v3_router_uses_deadline(provider.w3, r))
-                                      if r else True),
-                pool_for_fee_for_venue=_pool_resolver_factory(reader, venues, base, quote),
-                pool_for_fee_any_venue=_any_venue_pool_for_fee(reader, venues, base, quote),
-                slippage_bps=args.slippage, min_profit_wei=args.min_profit,
-                quote_decimals=_decimals_on_chain(reader, quote),
-                base_decimals=_decimals_on_chain(reader, base),
-                flash_pool_quote_balance=_pool_quote_balance_fn(provider.w3, quote),
-                min_profit_buffer_bps=args.min_profit_buffer,
-                v2_buy_cost_wei=buy_cost(settings.trade_size_base) if buy_cost else None,
-                v3_buy_cost_wei=v3_buy_s[0],
-            )
-            # No contract and no sender here, so gas is priced from the fixed
-            # unit estimate x the live gas price — the same arithmetic the
-            # floor uses, minus the simulation.
-            gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
-                provider, net, settings, res, plan, sender=None, contract_address=None)
-
-            from arb.deployer import gas_price_wei as _gas_price_wei
-            from decimal import Decimal
-            row["gas_price_used_wei"] = _gas_price_wei(provider.w3)
-            try:
-                row["gas_price_market_wei"] = int(provider.w3.eth.gas_price)
-            except Exception:  # noqa: BLE001
-                pass
-            gross_wei = int(Decimal(plan.flash_amount)
-                            * Decimal(str(plan.expected_gross_bps)) / Decimal(10_000))
-            net_wei = gross_wei - plan.expected_flash_fee - gas_quote
-            net_bps = float(Decimal(net_wei) / Decimal(plan.flash_amount) * Decimal(10_000)) \
-                if plan.flash_amount else 0.0
-            clears = net_wei >= max(plan.min_profit_floor, args.min_profit)
-
-            row["direction"] = "v3_first" if plan.v3_first else "v2_first"
-            row["directions"] = {
-                r.direction: ({"gross_bps": round(r.plan.expected_gross_bps, 2),
-                               "net_bps": round(r.net_bps, 2)} if r.plan is not None
-                              else {"error": r.error[:120]})
-                for r in reports
-            }
-            row.update({
-                "buy": plan.buy_label, "sell": plan.sell_label,
-                "buy_exec": plan.buy_exec, "sell_exec": plan.sell_exec,
-                "gross_bps": round(plan.expected_gross_bps, 2),
-                "flash_fee_wei": plan.expected_flash_fee,
-                "gas_quote_wei": gas_quote, "gas_units": gas_units,
-                "floor_wei": plan.min_profit_floor,
-                "net_wei": net_wei, "net_bps": round(net_bps, 2),
-                "clears_floor": clears,
-                "expected_revert": "EXPECTED TO REVERT" in " ".join(plan.notes),
-                "notes": plan.notes,
-            })
-            if gas_note:
-                row["gas_note"] = gas_note
+            row.update(scan_pair_once(
+                provider, net, settings, base, quote, base_symbol, quote_symbol,
+                venues, opts, reader=ChainReader(provider, net)))
+            net_bps = row["net_bps"]
             net_bps_seen.append(net_bps)
             mark = fmt.green("CLEARS") if clears else fmt.dim("below ")
             print(f"  [{i:>3}] blk {row.get('block', '?'):>10}  {mark}  "
@@ -2301,6 +2456,175 @@ def cmd_arb_survey(args) -> int:
             print(fmt.yellow("    No iteration beat its own costs. Executing this loop "
                              "for real would be buying gas, not edge."))
     print(f"    log          {log_path}  ({len(rows)} rows appended)")
+    return 0
+
+
+def cmd_arb_market(args) -> int:
+    """
+    Deep-scan every comparable pair in the index — the market, not one symbol.
+
+    WHERE THIS SITS
+    ---------------
+    `arb index` answers "which pairs exist and which are worth looking at"; this
+    answers "which of them is mispriced right now". The division matters because
+    they cost very different things: building the index is a walk over millions
+    of pairs that is done rarely and kept, while this is a handful of quotes per
+    pair and is only worth doing on pairs that can actually be traded.
+
+    A pair reaches this list only if the index holds at least two pools for it on
+    at least two venues. That filter is what makes market-wide scanning possible
+    at all: the index holds hundreds of pools that are the only pool for their
+    token pair, and no amount of quoting will turn one pool into an arbitrage.
+
+    Nothing here signs or sends. Each row is evidence written to a JSONL log, and
+    `arb analyze` reads those same rows — so a market scan and a single-pair
+    survey end up in one comparable set of numbers.
+    """
+    from pathlib import Path
+
+    from arb.executor import PlanError
+    from dex.fetcher import ChainReader
+    from dex.market_index import MarketIndex
+
+    settings = Settings()
+    _apply_overrides(args, settings)
+    net, provider = _connect(settings)
+    # Same venue selection the survey uses, so a market row and a survey row are
+    # quoting the same set of places.
+    from config import get_venue, venues_for
+
+    venues = ([get_venue(net.key, v.strip()) for v in args.venues.split(",") if v.strip()]
+              if args.venues else venues_for(net.key))
+
+    index = MarketIndex(Path(args.index_path))
+    counts = index.counts()
+    if not counts["pairs"]:
+        print(fmt.red("  the index is empty — build one first:"))
+        print(f"    python main.py arb index build --network {net.key}")
+        return 2
+
+    stale = index.db.execute(
+        "SELECT COUNT(*) FROM pairs WHERE mid IS NULL").fetchone()[0]
+    if stale and not getattr(args, "refresh", False):
+        print(fmt.dim(f"  {stale:,} indexed pool(s) have no price yet — run with "
+                      f"--refresh (or `arb index refresh`) before reading mids"))
+
+    if getattr(args, "refresh", False):
+        from dex.market_index import load_token_metadata, refresh_mids
+
+        print(fmt.dim("  refreshing the hot set before scanning"))
+        load_token_metadata(provider.w3, index, limit=args.token_limit)
+        refresh_mids(provider.w3, index, limit=args.hot_limit)
+
+    families = index.families(limit=args.pairs, min_pools=args.min_pools,
+                              min_venues=args.min_venues,
+                              require_mixed=not args.any_shape)
+    if not args.any_shape:
+        # Say how many were set aside, and why: a scan list that silently drops
+        # most of the market reads like the market is empty.
+        loose = index.families(limit=10 ** 6, min_pools=args.min_pools,
+                               min_venues=args.min_venues)
+        dropped = len(loose) - len(index.families(limit=10 ** 6,
+                                                  min_pools=args.min_pools,
+                                                  min_venues=args.min_venues,
+                                                  require_mixed=True))
+        if dropped:
+            print(fmt.dim(f"  {dropped:,} comparable pair(s) set aside: this contract "
+                          f"needs one V2 leg and one V3 leg, and those have only "
+                          f"V3 pools (a V3+V3 pair is not executable here)"))
+    symbols = index.symbols_map()
+    if not families:
+        print(fmt.yellow("  no pair in the index is quoted on two venues yet."))
+        print(fmt.dim("    the index needs more coverage: run `arb index build` "
+                      "or `arb index discover` with more tokens."))
+        return 2
+
+    opts = PairScanOptions(
+        size=settings.trade_size_base,
+        max_impact=args.max_impact,
+        slippage=args.slippage,
+        min_profit=args.min_profit,
+        min_profit_buffer=args.min_profit_buffer,
+        deepest_only=args.deepest_only,
+    )
+
+    log_path = Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(fmt.banner(f"ARB  ·  market scan on {net.name}"))
+    print(f"  index    {counts['pairs']:,} pools, {counts['v2']:,} V2 · "
+          f"{counts['v3']:,} V3  ({counts['tokens']:,} tokens labelled)")
+    print(f"  families {len(families)} pair(s) quoted on "
+          f"{args.min_venues}+ venue(s), at least {args.min_pools} pool(s)")
+    print(f"  size     {settings.trade_size_base:g} of the base token per probe")
+    print(f"  log      {log_path}")
+    print(fmt.dim("  this command never signs or sends anything"))
+
+    reader = ChainReader(provider, net)
+    results = []
+    unplanned: List[tuple] = []
+    positives = 0
+    started = time.time()
+    for n, (token_a, token_b, pools) in enumerate(families, start=1):
+        sym_a = symbols.get(token_a, token_a[:10])
+        sym_b = symbols.get(token_b, token_b[:10])
+        row = {"ts": round(time.time(), 3), "network": net.key,
+               "pair": f"{sym_a}/{sym_b}", "token_a": token_a, "token_b": token_b,
+               "size_base": settings.trade_size_base,
+               "index_pools": [{"venue": p.venue, "kind": p.kind, "fee": p.fee_pips,
+                                "address": p.address} for p in pools]}
+        try:
+            # The pair's own symbols are what a report should show; the index's
+            # labels are a fallback for a token whose symbol() reverts.
+            row.update(scan_pair_once(provider, net, settings, token_a, token_b,
+                                      sym_a, sym_b, venues, opts, reader=reader))
+            results.append(row)
+            net_bps = row["net_bps"]
+            if net_bps > 0:
+                positives += 1
+            mark = fmt.green("CLEARS") if row.get("clears_floor") else fmt.dim("below ")
+            fit = f"  [fitted to {row['size_base_used']:g}]" if row.get("size_note") else ""
+            print(f"  [{n:>3}/{len(families)}] {sym_a:>10}/{sym_b:<10} {mark}  "
+                  f"gross {row['gross_bps']:>+8.2f} bps  net {net_bps:>+8.2f} bps  "
+                  f"[{row['direction']}] ({row['buy']} -> {row['sell']}){fit}")
+        except PlanError as exc:
+            row["plan_error"] = str(exc)
+            unplanned.append((f"{sym_a}/{sym_b}", f"no plan: {str(exc)[:70]}"))
+            print(f"  [{n:>3}/{len(families)}] {sym_a:>10}/{sym_b:<10} "
+                  f"no plan: {str(exc)[:60]}")
+        except Exception as exc:  # noqa: BLE001 - one bad pair must not kill the sweep
+            row["error"] = f"{type(exc).__name__}: {exc}"
+            unplanned.append((f"{sym_a}/{sym_b}",
+                              f"{type(exc).__name__}: {str(exc)[:60]}"))
+            print(f"  [{n:>3}/{len(families)}] {sym_a:>10}/{sym_b:<10} "
+                  f"{type(exc).__name__}: {str(exc)[:60]}")
+        row["elapsed_s"] = round(time.time() - row["ts"], 3)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, default=str) + "\n")
+
+    print(fmt.cyan("\n  SUMMARY"))
+    print(f"    scanned      {len(results)} quoted, {len(unplanned)} not, "
+          f"of {len(families)} pair(s) in {time.time() - started:,.0f}s")
+    if results:
+        nets = sorted(r["net_bps"] for r in results)
+        med = nets[len(nets) // 2]
+        best = max(results, key=lambda r: r["net_bps"])
+        print(f"    net bps      best {nets[-1]:+.2f}   median {med:+.2f}   "
+              f"worst {nets[0]:+.2f}")
+        print(f"    positive     {positives} of {len(nets)} pair(s) beat their own costs")
+        print(f"    best pair    {best['pair']} {best['net_bps']:+.2f} bps "
+              f"[{best['direction']}] ({best['buy']} -> {best['sell']})")
+        reduced = [r for r in results if r.get("size_note")]
+        if reduced:
+            print(f"    size-fitted  {len(reduced)} pair(s) could not absorb the full "
+                  f"probe and were quoted smaller (see size_base_used)")
+    if unplanned:
+        print(f"    unplanned    {len(unplanned)} pair(s) produced no route at any "
+              f"size (each logged with its reason)")
+        if not positives:
+            print(fmt.yellow("    No pair in this slice beat its costs. That is the "
+                             "market's answer, not a bug — it is what the gate is "
+                             "for."))
+    print(f"    log          {log_path}  ({len(families)} rows appended)")
     return 0
 
 
@@ -2611,6 +2935,277 @@ def cmd_arb_preflight(args) -> int:
     # NO-GO for a trade still exits 0 for a deploy/status workflow, but a caller
     # scripting decisions wants the difference, so FAIL is exit 1.
     return 1 if status == FAIL else 0
+
+
+def _try_token(net, symbol: str):
+    """Config token lookup that returns None instead of raising KeyError."""
+    from config import token_address
+
+    try:
+        return token_address(net, symbol)
+    except KeyError:
+        return None
+
+
+def cmd_arb_index(args) -> int:
+    """
+    Build and inspect the local market index — the hot set of pairs across every
+    venue on a chain, so a scan can cover a market instead of a pair.
+
+    Subcommands mirror the lifecycle: `build` sweeps a factory and filters dust,
+    `refresh` re-reads the hot set, `stats` shows what is held, `hot` lists what a
+    scan would actually look at.
+    """
+    from pathlib import Path
+    from typing import List
+
+    import time
+
+    from config import get_venue, token_address, venues_for
+    from dex.market_index import (DEFAULT_ANCHORS, MarketIndex, SweepAborted,
+                                  discover_pairs_by_key, load_token_metadata,
+                                  read_token_list, refresh_mids, sweep_v2_factory)
+
+    settings = Settings()
+    _apply_overrides(args, settings)
+    net, provider = _connect(settings)
+    path = Path(args.index_path)
+    index = MarketIndex(path)
+    w3 = provider.w3
+
+    all_venues = venues_for(net.key)
+    if getattr(args, "venues", None):
+        wanted = {v.strip() for v in args.venues.split(",") if v.strip()}
+        unknown = wanted - {v.key for v in all_venues}
+        if unknown:
+            print(fmt.red(f"  unknown venue(s): {', '.join(sorted(unknown))}"))
+            return 2
+        args.venues_list = wanted
+    else:
+        args.venues_list = {v.key for v in all_venues}
+
+    def run_discovery(token_pool, venues):
+        """
+        Ask every venue about every (token, anchor) key.
+
+        This is the cheap half of coverage: the factories answer "does this pair
+        exist?" directly, so a token can be checked against every venue and fee
+        tier in a few batched requests instead of millions of reads.
+        """
+        anchor_syms = getattr(args, "anchors", None)
+        if isinstance(anchor_syms, str):
+            anchor_syms = [a.strip() for a in anchor_syms.split(",") if a.strip()]
+        anchors = []
+        for sym in (anchor_syms or DEFAULT_ANCHORS):
+            got = _try_token(net, sym)
+            if got:
+                anchors.append(got)
+            else:
+                print(fmt.dim(f"    (anchor {sym} is not configured on {net.key})"))
+        if not anchors:
+            print(fmt.red("    no anchors configured — nothing to discover"))
+            return
+        token_pool = [t for t in token_pool if t]
+        print(fmt.cyan(f"\n  key discovery: {len(token_pool):,} tokens x "
+                       f"{len(anchors)} anchors x fee tiers"))
+        for venue in venues:
+            if not venue.factory:
+                continue
+            rep = discover_pairs_by_key(w3, index, venue, token_pool, anchors,
+                                        min_reserve_wei=args.min_reserve,
+                                        batch_size=args.batch,
+                                        workers=args.workers)
+            print(f"    {venue.key:<16} {rep.summary()}")
+
+    what = args.index_command
+    if what == "stats":
+        counts = index.counts()
+        print(fmt.banner(f"ARB  ·  index on {net.name}"))
+        print(f"  file     {path}  ({path.stat().st_size / 1e6:.1f} MB)")
+        print(f"  pairs    {counts['pairs']:,}  (v2 {counts['v2']:,} · v3 {counts['v3']:,})")
+        print(f"  tokens   {counts['tokens']:,}")
+        for venue in venues_for(net.key):
+            total = index.get_meta(f"total:{venue.key}")
+            if total is None:
+                continue
+            order = index.get_meta(f"order:{venue.key}") or "oldest"
+            if order == "newest":
+                pos = index.get_meta(f"next:{venue.key}", total) or 0
+                covered = max(0, total - pos)
+                note = f"newest-first, {covered / total * 100:.1f}% covered" if total else ""
+            else:
+                pos = index.get_meta(f"cursor:{venue.key}", 0) or 0
+                covered = pos
+                note = f"{pos / total * 100:.1f}% covered" if total else ""
+            print(f"  sweep    {venue.key:<16} {covered:,} / {total:,} pairs  ({note})")
+            checked = index.get_meta(f"checked_at:{venue.key}")
+            if checked:
+                age = int(time.time()) - int(checked)
+                print(f"           {'':<16} last swept {age // 60} min ago")
+        by_kind = index.db.execute(
+            "SELECT venue, kind, COUNT(*) FROM pairs GROUP BY venue, kind "
+            "ORDER BY 3 DESC").fetchall()
+        if by_kind:
+            print(fmt.cyan("\n  by venue"))
+            for venue_key, kind, n in by_kind:
+                print(f"    {venue_key:<20} {kind:<4} {n:,} pairs")
+        if counts["pairs"]:
+            top = index.hot_pairs(limit=5)
+            syms = index.symbols_map()
+            print(fmt.cyan("\n  deepest pairs held"))
+            for row in top:
+                sym0 = syms.get(row.token0, row.token0[:10])
+                sym1 = syms.get(row.token1, row.token1[:10])
+                mid = f"{row.mid:.6g}" if row.mid else "?"
+                print(f"    {row.venue:<20} {row.kind:<4} {sym0:>12}/{sym1:<12} "
+                      f"mid {mid:>12}  {row.address}")
+        print()
+        return 0
+
+    if what == "hot":
+        rows = index.hot_pairs(limit=args.limit, kind=args.kind)
+        print(fmt.banner(f"ARB  ·  hot set on {net.name}"))
+        for row in rows:
+            print(f"  {row.venue:<16} {row.kind:<3} {row.address}  "
+                  f"r0={row.reserve0:,}  r1={row.reserve1:,}")
+        print(f"\n  {len(rows)} pairs shown")
+        return 0
+
+    if what == "build":
+        # Which factories to sweep. V2 is enumerable; V3 is not, and is handled
+        # by discovery below.
+        v2_venues = [v for v in venues_for(net.key)
+                     if v.version == "v2" and v.factory and v.key in args.venues_list]
+        if not v2_venues:
+            print(fmt.red("  no V2 venues to sweep on this chain "
+                          "(V3 factories cannot be enumerated — use `refresh`)"))
+        for venue in v2_venues:
+            print(fmt.cyan(f"\n  sweeping {venue.name} ({venue.key})"))
+            # A full sweep of this factory is millions of pairs and tens of
+            # minutes, so it reports where it is and what it will cost. Silence
+            # for half an hour is indistinguishable from a hang.
+            last = [0.0]
+
+            def progress(rep, cursor, total, _last=last, _key=venue.key):
+                if args.quiet_progress:
+                    return
+                now = time.time()
+                if now - _last[0] < 5.0 and cursor < total:
+                    return
+                _last[0] = now
+                rate = rep.scanned / max(now - rep.started, 1e-9)
+                # COVERAGE, not cursor position. A newest-first walk counts down
+                # from the top of the factory, so the cursor is the number of
+                # pairs REMAINING — printing it as a percentage would show 95%
+                # next to "just started" and "nearly done" on the same run.
+                remaining = total - total * rep.coverage
+                eta = remaining / rate / 60 if rate else 0.0
+                print(f"    {_key}: {rep.coverage * 100:5.1f}% covered "
+                      f"({rep.scanned:,} pairs read), {rate:,.0f} pairs/s, "
+                      f"kept {rep.kept:,}, ETA {eta:.1f} min", flush=True)
+
+            try:
+                rep = sweep_v2_factory(w3, index, venue.factory, venue.key,
+                                       min_reserve_wei=args.min_reserve,
+                                       batch_size=args.batch, max_pairs=args.max_pairs,
+                                       rescan=args.rescan, workers=args.workers,
+                                       progress=progress, order=args.order)
+            except SweepAborted as exc:
+                print(fmt.red(f"    stopped: {exc}"))
+                return 4
+            print(f"    {rep.summary()}")
+            print(f"    {rep.requests:,} request(s) for {rep.scanned * 2:,} pair reads"
+                  + (f", {rep.failures:,} failed" if rep.failures else ""))
+            print(f"    {rep.progress()}")
+            if rep.coverage < 1.0:
+                print(fmt.dim("    this is a slice of the market, not all of it — "
+                              "run the same command again to continue"))
+
+        # Stage 2: key discovery. Whatever tokens the walk turned up get asked
+        # about on EVERY venue, so a token found in one V2 pair also gets its V3
+        # pools and its other anchor pairs. This is where a token becomes
+        # "covered" rather than merely "seen".
+        known = list(index._all_indexed_tokens())[:args.token_limit]
+        if known:
+            load_token_metadata(w3, index, limit=args.token_limit,
+                                batch_size=args.batch, workers=args.workers)
+        if not args.no_discovery:
+            token_pool = list(dict.fromkeys(
+                known + [t for sym in DEFAULT_ANCHORS
+                         for t in [_try_token(net, sym)] if t]))[:args.token_limit]
+            run_discovery(token_pool, [v for v in all_venues
+                                       if v.factory and v.key in args.venues_list])
+
+        load_token_metadata(w3, index, limit=args.token_limit, batch_size=args.batch,
+                            workers=args.workers)
+        counts = index.counts()
+        print(fmt.cyan("\n  INDEX"))
+        print(f"    pairs {counts['pairs']:,}  (v2 {counts['v2']:,} · v3 {counts['v3']:,})")
+        print(f"    tokens {counts['tokens']:,}")
+        print(f"    file  {path}  ({path.stat().st_size / 1e6:.1f} MB)")
+        return 0
+
+    if what == "discover":
+        # No walk: just ask the factories about a token list. Seconds instead of
+        # hours, and the path to use with a token list from anywhere — a
+        # tokenlist file, an exchange's list, or the tokens in this index.
+        tokens: List[str] = []
+        for sym in (args.tokens or "").split(","):
+            sym = sym.strip()
+            if not sym:
+                continue
+            if sym.startswith("0x"):
+                tokens.append(sym)
+            else:
+                got = _try_token(net, sym)
+                if got:
+                    tokens.append(got)
+                else:
+                    print(fmt.dim(f"    (unknown token {sym} skipped)"))
+        if args.token_file:
+            raw = Path(args.token_file).read_text()
+            tokens += [t.strip() for t in raw.replace(",", " ").split()
+                       if t.strip().startswith("0x")]
+        if args.token_list:
+            # A tokenlist carries symbols and decimals, so taking them from the
+            # file saves a symbol() and decimals() round trip per token — and a
+            # list of a few thousand tokens is exactly where that matters.
+            listed = read_token_list(args.token_list, chain_id=getattr(net, "chain_id", None))
+            if not listed:
+                print(fmt.red(f"    no usable tokens in {args.token_list} "
+                              f"for chain {getattr(net, 'chain_id', '?')}"))
+            tokens += [t[0] for t in listed]
+            index.upsert_tokens(listed)
+            print(fmt.dim(f"    {len(listed):,} token(s) read from {args.token_list}"))
+        if not tokens:
+            tokens = list(index._all_indexed_tokens())[:args.token_limit]
+            print(fmt.dim(f"    (no --tokens given: using the {len(tokens):,} token(s) "
+                          f"already in the index)"))
+        tokens = list(dict.fromkeys(tokens + [
+            t for sym in DEFAULT_ANCHORS for t in [_try_token(net, sym)] if t]))
+        print(fmt.banner(f"ARB  ·  index discover  ·  {net.name}"))
+        run_discovery(tokens, [v for v in all_venues
+                               if v.factory and v.key in args.venues_list])
+        # Label what was just found. A pool whose tokens have no symbols is a row
+        # of hex in every later report, which is how a real market ends up
+        # looking like noise.
+        load_token_metadata(w3, index, limit=args.token_limit, batch_size=args.batch,
+                            workers=args.workers)
+        counts = index.counts()
+        print(fmt.cyan("\n  INDEX"))
+        print(f"    pairs {counts['pairs']:,}  "
+              f"(v2 {counts['v2']:,} · v3 {counts['v3']:,})")
+        print(f"    tokens {counts['tokens']:,}")
+        return 0
+
+    if what == "refresh":
+        updated = refresh_mids(w3, index, limit=args.limit, batch_size=args.batch,
+                               workers=getattr(args, "workers", 1))
+        print(fmt.green(f"  refreshed {updated:,} pair(s) in the hot set"))
+        return 0
+
+    print(fmt.red(f"  unknown index subcommand {what!r}"))
+    return 2
 
 
 def cmd_arb_status(args) -> int:
@@ -2941,6 +3536,36 @@ def build_parser() -> argparse.ArgumentParser:
                     help="JSONL file to append results to (default logs/arb_survey.jsonl)")
     ap.set_defaults(func=cmd_arb_survey)
 
+    ap = asub.add_parser("market",
+                         help="deep-scan every comparable pair in the index — the "
+                              "whole market instead of one symbol")
+    common(ap)
+    ap.add_argument("--venues", help="comma-separated venue keys (default: all)")
+    ap.add_argument("--pairs", type=int, default=25,
+                    help="how many families to scan, deepest first (default 25)")
+    ap.add_argument("--min-pools", type=int, default=2,
+                    help="a family needs at least this many pools (default 2)")
+    ap.add_argument("--min-venues", type=int, default=2,
+                    help="...across at least this many venues (default 2)")
+    ap.add_argument("--any-shape", action="store_true",
+                    help="scan pairs that have no V2 leg too (they cannot be "
+                         "executed by this contract, but they are still priced)")
+    ap.add_argument("--refresh", action="store_true",
+                    help="re-read reserves and mids for the hot set first")
+    ap.add_argument("--hot-limit", type=int, default=200,
+                    help="pairs per kind to refresh (default 200)")
+    ap.add_argument("--token-limit", type=int, default=2000)
+    ap.add_argument("--max-impact", type=float, dest="max_impact", default=None)
+    ap.add_argument("--deepest-only", action="store_true")
+    ap.add_argument("--slippage", type=float, default=100.0)
+    ap.add_argument("--min-profit", type=int, dest="min_profit", default=0)
+    ap.add_argument("--min-profit-buffer", type=float, dest="min_profit_buffer",
+                    default=2500.0, metavar="BPS")
+    ap.add_argument("--index-path", default="state/market_index.sqlite")
+    ap.add_argument("--log", default="logs/arb_market.jsonl",
+                    help="JSONL file to append results to (default logs/arb_market.jsonl)")
+    ap.set_defaults(func=cmd_arb_market)
+
     ap = asub.add_parser("analyze",
                          help="read the survey logs and say where the edge lives "
                               "(direction, venue pair, size, and whether it persists)")
@@ -2949,6 +3574,78 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--json", dest="json_out", action="store_true",
                     help="emit the report as JSON instead of text")
     ap.set_defaults(func=cmd_arb_analyze)
+
+    ap = asub.add_parser("index",
+                         help="build a local index of every pair on a chain "
+                              "(hot set), so scans can cover a market")
+    isub = ap.add_subparsers(dest="index_command", required=True)
+    ip = isub.add_parser("build", help="sweep a V2 factory and discover V3 pools")
+    ip.add_argument("--network", choices=_NETWORK_CHOICES, help="chain to index")
+    ip.add_argument("--venues", help="comma-separated venue keys (default: all)")
+    ip.add_argument("--batch", type=int, default=3000,
+                    help="calls per multicall request (default 3000; latency is "
+                         "nearly flat in batch size, so bigger is cheaper)")
+    ip.add_argument("--min-reserve", type=int, default=10 ** 15,
+                    help="keep only pairs holding at least this many wei of BOTH "
+                         "tokens (default 1e15 — a dust filter, not a trade filter)")
+    ip.add_argument("--max-pairs", type=int, default=0,
+                    help="stop after this many pairs (0 = all; useful to test)")
+    ip.add_argument("--token-limit", type=int, default=4000,
+                    help="how many tokens to use for V3 pool discovery")
+    ip.add_argument("--index-path", default="state/market_index.sqlite")
+    ip.add_argument("--rescan", action="store_true",
+                    help="start the sweep from pair 0 instead of resuming")
+    ip.add_argument("--no-v3", action="store_true", help="skip V3 pool discovery")
+    ip.add_argument("--no-discovery", action="store_true",
+                    help="skip the key-discovery stage after the walk")
+    ip.add_argument("--workers", type=int, default=1,
+                    help="requests in flight (default 1; >1 only if the RPC allows)")
+    ip.add_argument("--order", choices=["newest", "oldest"], default="newest",
+                    help="which end of the factory to walk (default newest: the "
+                         "active pairs are the ones created last, and a public "
+                         "RPC is too slow to reach them from the other end)")
+    ip.add_argument("--quiet-progress", action="store_true",
+                    help="print only the summary, not a line every few seconds")
+    ip.set_defaults(func=cmd_arb_index)
+
+    ip = isub.add_parser("discover",
+                         help="ask every venue about (token, anchor) keys — seconds "
+                              "instead of hours, and the way to cover a token list")
+    ip.add_argument("--network", choices=_NETWORK_CHOICES)
+    ip.add_argument("--venues", help="comma-separated venue keys (default: all)")
+    ip.add_argument("--tokens", help="comma-separated token addresses or config symbols")
+    ip.add_argument("--token-file", help="file of token addresses (whitespace or comma separated)")
+    ip.add_argument("--token-list", metavar="JSON",
+                    help="a standard tokenlist JSON (the file every DEX publishes); "
+                         "symbols and decimals come from the list itself")
+    ip.add_argument("--anchors", help="comma-separated anchor symbols "
+                                      "(default: WBNB,USDT,BUSD,USDC,BTCB,ETH)")
+    ip.add_argument("--batch", type=int, default=3000)
+    ip.add_argument("--workers", type=int, default=1)
+    ip.add_argument("--min-reserve", type=int, default=10 ** 15)
+    ip.add_argument("--token-limit", type=int, default=4000)
+    ip.add_argument("--index-path", default="state/market_index.sqlite")
+    ip.set_defaults(func=cmd_arb_index)
+
+    ip = isub.add_parser("refresh", help="re-read reserves and mids for the hot set")
+    ip.add_argument("--network", choices=_NETWORK_CHOICES)
+    ip.add_argument("--limit", type=int, default=400, help="pairs of each kind")
+    ip.add_argument("--batch", type=int, default=3000)
+    ip.add_argument("--workers", type=int, default=1)
+    ip.add_argument("--index-path", default="state/market_index.sqlite")
+    ip.set_defaults(func=cmd_arb_index)
+
+    ip = isub.add_parser("stats", help="what the index holds")
+    ip.add_argument("--network", choices=_NETWORK_CHOICES)
+    ip.add_argument("--index-path", default="state/market_index.sqlite")
+    ip.set_defaults(func=cmd_arb_index)
+
+    ip = isub.add_parser("hot", help="list the pairs a scan would look at")
+    ip.add_argument("--network", choices=_NETWORK_CHOICES)
+    ip.add_argument("--limit", type=int, default=50)
+    ip.add_argument("--kind", choices=["v2", "v3"])
+    ip.add_argument("--index-path", default="state/market_index.sqlite")
+    ip.set_defaults(func=cmd_arb_index)
 
     ap = asub.add_parser("preflight",
                          help="check everything real execution depends on "

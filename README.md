@@ -452,6 +452,16 @@ python main.py arb survey --network bsc --base WBNB --quote USDT --size 1
                                                      # iteration to logs/arb_survey.jsonl
 python main.py arb analyze                           # read those logs: which direction, venue
                                                      # pair and size the edge is in — files only
+python main.py arb index discover --network bsc      # ask every venue about every
+                                                     # (token, anchor) pair: seconds,
+                                                     # not hours — covers a token list
+python main.py arb index build --network bsc         # walk a V2 factory and keep the
+                                                     # liquid pairs (resumable, hours)
+python main.py arb index stats --network bsc         # what is indexed, how much of
+                                                     # the market, how fresh
+python main.py arb market --network bsc --pairs 25 --refresh
+                                                     # deep-scan every pair quoted on
+                                                     # two venues, log the evidence
 python main.py arb preflight --network bsc --private https://bsc.blockrazor.xyz
                                                      # every check that real money depends on:
                                                      # market gate, deployment freshness, wallet,
@@ -465,6 +475,12 @@ python main.py selftest                              # offline test suite
 
 Useful flags: `--min-edge`, `--max-slippage`, `--gas-units`, `--no-gas`,
 `--source cmc|coinbase|kraken|auto`, `-v` for debug logging.
+
+Covering the whole market instead of one symbol is `arb index` + `arb market`:
+the index holds every liquid pool the chain has (built by walking the factory,
+or in seconds by asking it about a token list), and the scan iterates the pairs
+that are quoted on more than one venue. Design, measurements and limits:
+[`docs/market-index.md`](docs/market-index.md).
 
 `--venue` names one DEX for any command, e.g. `--venue pancakeswap_v3`.
 `--network bsc` and `--network bsc_testnet` are both supported. On testnet use

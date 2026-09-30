@@ -1,0 +1,68 @@
+COVER-THE-WHOLE-MARKET — what to push, 2026-09-30
+=================================================
+
+WHAT YOU ARE PUSHING
+  GitHub master is  8475764  ("NEW")
+  The bundle adds four commits on top:
+    73fd831  Cover the market, not one pair: full-market index + market-wide scan
+    c6de4fb  Fix two things a fresh machine would hit
+    1043f58  Make the long tail scannable: token lists, adaptive probe, executable families
+    2c33f2e  Docs: what the long tail changed
+
+  New files:  dex/market_index.py   dex/multicall.py
+              tests/test_market.py  docs/market-index.md
+  Changed:    main.py  README.md  .gitignore
+
+  Offline suites:  104/104 maths + 32/32 market = 136 tests, all green
+  (verified in a clean clone of GitHub with the bundle pulled on top).
+  Nothing in this commit sends a transaction; a test asserts it.
+
+THE BUNDLE
+  /home/user/trying-market-2026-09-30.bundle
+  Fast-forward over 8475764. Verified by cloning GitHub fresh and pulling it.
+
+PUSH IT  (one line at a time)
+  cd /home/user/trying
+  git remote -v
+  git fetch /path/to/trying-market-2026-09-30.bundle master:market-work
+  git checkout master
+  git merge --ff-only market-work
+  git push origin master
+  python main.py selftest
+
+  If `git remote -v` is empty on that machine:
+  git remote add origin https://github.com/samahmed18156/trying.git
+
+WHAT IT DOES NOW
+  python main.py arb index discover --network bsc --token-file tokens.txt
+  python main.py arb index build --network bsc --order newest --batch 6000 --workers 2
+  python main.py arb index stats --network bsc
+  python main.py arb market --network bsc --pairs 25 --refresh
+  python main.py arb analyze
+
+MEASURED, LIVE, TODAY
+  * 1 single read            5 reads/s
+  * Multicall3, 6,000 calls  ~10,000 reads/s        (latency is flat in batch size,
+                                                     so a sweep costs REQUESTS)
+  * same endpoint, same day: 0.65 s per 6,000-call request in the morning,
+                             12 s in the afternoon. Plan for the afternoon.
+  * key discovery (seconds): 73 requests, 65 s -> 1,406 liquid pools across
+                             Pancake V2, Pancake V3 and Uniswap V3
+  * index now:               3,000+ pools, 1,500 tokens labelled
+  * 986-token PancakeSwap tokenlist -> 4,132 liquid pools in 66 seconds,
+                             index 5,800 -> 10,408 pools, 7,032 tokens
+  * scan list:               839 comparable pairs, 617 executable by this
+                             contract (needs one V2 leg and one V3 leg)
+  * best route found:        USDT/USDC at -3.68 bps net (v3_first, Uniswap V3
+                             0.30% -> Pancake V2) — closest to clearing yet
+  * nothing cleared costs. Gate 1 is still SHUT. That is the market's answer.
+
+STILL OPEN (unchanged, not started)
+  * Gate 2: deploy FlashArb on BSC mainnet (~$0.06 of BNB)
+  * Gate 3: 0.1 USDT micro-drill through the private relay, then size up
+
+NOTE
+  The walk keeps running in this sandbox while it lives; a full pass of
+  PancakeSwap V2 is ~9 hours at today's throttled speed. It is resumable, so
+  the same command continues where it stopped. `state/market_index.sqlite` is
+  now gitignored on purpose: it is a rebuildable cache, not evidence.

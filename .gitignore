@@ -18,6 +18,13 @@ keystore/
 # the explorer), and losing it means every command needs --address again.
 !state/
 
+# The market index, however, is a rebuildable cache of public chain state: a few
+# MB of pool addresses and reserves that are re-derived in minutes by
+# `arb index discover`. Committing it would put a binary blob in every diff that
+# nobody can review and nothing needs.
+state/*.sqlite
+state/*.sqlite-journal
+
 # Runtime output
 logs/
 *.jsonl
