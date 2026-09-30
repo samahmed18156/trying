@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from dex.multicall import (Call, Multicall3, call_all_pairs, call_balance_of,
+from dex.multicall import (Multicall3, call_all_pairs, call_balance_of,
                            call_decimals, call_get_pair, call_get_pool,
                            call_get_reserves, call_slot0, call_symbol,
                            call_token0, call_token1, decode_address,

@@ -46,3 +46,7 @@ build/
 .vscode/
 .idea/
 .DS_Store
+
+# One-off maintenance scripts written during a session are not source.
+fix_lint.py
+patch*.py

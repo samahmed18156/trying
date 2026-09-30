@@ -3,17 +3,15 @@ COVER-THE-WHOLE-MARKET — what to push, 2026-09-30
 
 WHAT YOU ARE PUSHING
   GitHub master is  8475764  ("NEW")
-  The bundle adds four commits on top:
-    73fd831  Cover the market, not one pair: full-market index + market-wide scan
-    c6de4fb  Fix two things a fresh machine would hit
-    1043f58  Make the long tail scannable: token lists, adaptive probe, executable families
-    2c33f2e  Docs: what the long tail changed
+  The bundle adds two commits on top of 152b43a:
+    ce87811  Fix the survey's NameError, and stop it hiding
+    68f24dc  Ignore one-off maintenance scripts
 
   New files:  dex/market_index.py   dex/multicall.py
               tests/test_market.py  docs/market-index.md
   Changed:    main.py  README.md  .gitignore
 
-  Offline suites:  104/104 maths + 32/32 market = 136 tests, all green
+  Offline suites:  104/104 maths + 34/34 market = 138 tests, all green
   (verified in a clean clone of GitHub with the bundle pulled on top).
   Nothing in this commit sends a transaction; a test asserts it.
 
@@ -32,6 +30,16 @@ PUSH IT  (one line at a time)
 
   If `git remote -v` is empty on that machine:
   git remote add origin https://github.com/samahmed18156/trying.git
+
+WHAT THIS FIXES
+  The survey's print line referred to `plan` and `clears`, variables that stopped
+  existing when the per-pair scan became a function. The survey catches per-iteration
+  errors, so instead of crashing it logged "NameError: name 'clears' is not defined"
+  on every row — a broken scan that reads like a working one. Verified live after
+  the fix: WBNB/USDT, gross -15.64 / net -32.62 bps, v2_first.
+  Also cleared the rest of the lint errors in main.py (11 dead imports, 2 f-strings)
+  and added a test that runs pyflakes and fails on any undefined name, so this
+  class of bug cannot hide behind a catch-all again.
 
 WHAT IT DOES NOW
   python main.py arb index discover --network bsc --token-file tokens.txt

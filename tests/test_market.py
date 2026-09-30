@@ -29,7 +29,7 @@ import pathlib
 import sys
 import tempfile
 import traceback
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -936,6 +936,87 @@ def a_published_tokenlist_is_read_as_is_and_filtered_by_chain():
 
 
 @case
+def one_bad_edit_cannot_hide_behind_a_catch_all_handler():
+    """
+    The bug this suite nearly shipped: the survey's print line kept referring to
+    `plan` and `clears` after the per-pair scan was lifted into a function. Bad
+    enough on its own — but the survey catches exceptions per iteration, so
+    instead of crashing it wrote rows saying "NameError: name 'clears' is not
+    defined", which looks exactly like a scan that is working.
+
+    So the formatter is tested directly with the row a scan really produces, and
+    pyflakes is asked for undefined names across the modules that matter. Lint as
+    a test is not decoration here: a NameError in a caught path is invisible
+    otherwise.
+    """
+    try:
+        import main
+    except Exception as exc:                    # noqa: BLE001
+        raise SkipTest("main.py needs its runtime dependencies",
+                       f"install them to run this test ({exc})") from exc
+
+    # The row shape scan_pair_once returns, as the market scan captured it.
+    row = {"block": 124882883, "gross_bps": -8.75, "net_bps": -9.75,
+           "direction": "v2_first", "buy": "PancakeSwap V2",
+           "sell": "Uniswap V3 0.01%", "clears_floor": False,
+           "size_base_used": 0.1, "size_note": "1 does not fit"}
+    line = main.format_scan_line(row, prefix="  [  1] ")
+    check("PancakeSwap V2 -> Uniswap V3 0.01%" in line, f"route in the line: {line}")
+    check("-9.75" in line and "below" in line, f"the numbers and verdict: {line}")
+    check("fitted to 0.1" in line, f"the size note: {line}")
+
+    clearing = dict(row, clears_floor=True, size_note=None)
+    check("CLEARS" in main.format_scan_line(clearing), "a clearing row says so")
+
+    # A row missing optional pieces must still print: the survey logs rows from
+    # failed iterations too, and those have no direction or prices.
+    check(main.format_scan_line({}) != "", "an empty row prints something")
+
+
+@case
+def no_module_has_an_undefined_name():
+    """
+    Static check over the code that runs unattended. pyflakes is a dev tool, not
+    a runtime dependency, so this skips rather than fails when it is absent — but
+    when it is present it catches the one class of bug a unit test cannot see:
+    a name that only exists on a path nothing exercised.
+    """
+    try:
+        from pyflakes import api as pyflakes_api
+        from pyflakes import reporter as pyflakes_reporter
+    except ImportError as exc:                  # noqa: BLE001
+        raise SkipTest("pyflakes is not installed",
+                       "python -m pip install pyflakes") from exc
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    targets = ["main.py", "dex/multicall.py", "dex/market_index.py",
+               "tests/test_market.py"]
+    problems: List[str] = []
+
+    class Collect(pyflakes_reporter.Reporter):
+        def __init__(self):
+            super().__init__(sys.stdout, sys.stderr)
+
+        def unexpectedError(self, filename, msg):
+            problems.append(f"{filename}: {msg}")
+
+        def syntaxError(self, filename, msg, lineno, offset, text):
+            problems.append(f"{filename}:{lineno}: syntax error: {msg}")
+
+        def flake(self, message):
+            # Only the errors that can crash at runtime. Style and unused-import
+            # noise is not worth failing a build over, and would train everyone
+            # to ignore this test.
+            if "undefined name" in str(message):
+                problems.append(f"{message.filename}:{message.lineno}: {message.message % message.message_args}")
+
+    for rel in targets:
+        pyflakes_api.checkPath(str(root / rel), Collect())
+
+    check(not problems, "undefined names found:\n    " + "\n    ".join(problems))
+
+
+@case
 def the_read_path_cannot_send_a_transaction():
     """
     The indexer reads the market and writes a file. That is the whole contract,
@@ -969,8 +1050,6 @@ def the_cli_exposes_index_build_refresh_stats_and_hot():
     except Exception as exc:                    # noqa: BLE001
         raise SkipTest("main.py needs its runtime dependencies",
                        f"install them to run this test ({exc})") from exc
-
-    from main import build_parser
 
     parser = build_parser()
     args = parser.parse_args(["arb", "index", "build", "--network", "bsc",

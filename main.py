@@ -48,7 +48,7 @@ if TYPE_CHECKING:  # annotations only — never imported at runtime
 # instructions instead of a stack trace.
 fmt = None
 NETWORKS = None
-Settings = None
+Settings = None  # noqa: F811 - rebound from config by _load_deps() below
 fee_to_bps = None
 fee_to_percent = None
 get_network = None
@@ -253,7 +253,6 @@ def render_compact(result: ScanResult, iteration: int) -> None:
 # commands
 # --------------------------------------------------------------------------
 def cmd_info(args) -> int:
-    from dex_price_fetcher import DexPriceFetcher
     settings = _apply_overrides(args, Settings())
     net = get_network(settings.network)
 
@@ -267,7 +266,7 @@ def cmd_info(args) -> int:
           f"{settings.max_slippage_bps} bps, gas "
           f"{'on' if settings.include_gas_cost else 'off'} ({settings.gas_units_per_swap:,} units)")
     print(f"  index source   {settings.index_source}")
-    print(f"  rpc endpoints  " + ", ".join(net.rpc_urls))
+    print("  rpc endpoints  " + ", ".join(net.rpc_urls))
     print(fmt.cyan("\n  tokens"))
     for sym, addr in sorted(net.tokens.items()):
         print(f"    {sym:<8} {addr}")
@@ -953,7 +952,6 @@ def cmd_cross(args) -> int:
     from config import get_network, get_venue, token_address, venues_for
     from dex.cross import scan_venues
     from dex.fetcher import ChainReader
-    from dex_price_fetcher import DexPriceFetcher
     from rpc import NodeProvider
 
     settings = Settings()
@@ -1163,7 +1161,7 @@ def cmd_wallet_new(args) -> int:
 
 
 def cmd_wallet_show(args) -> int:
-    from arb.wallet import WalletError, default_wallet_path, is_gitignored, wallet_address
+    from arb.wallet import default_wallet_path, is_gitignored, wallet_address
 
     path = args.path or default_wallet_path()
     print(fmt.banner("WALLET  ·  show"))
@@ -1181,7 +1179,7 @@ def cmd_wallet_show(args) -> int:
 
 
 def cmd_wallet_balance(args) -> int:
-    from arb.wallet import WalletError, default_wallet_path, native_balance, wallet_address
+    from arb.wallet import default_wallet_path, native_balance, wallet_address
     from config import get_network
     from rpc import NodeProvider
 
@@ -1354,7 +1352,7 @@ def cmd_arb_compile(args) -> int:
     else:
         print(fmt.green("  warnings   none"))
 
-    print(f"  selectors:")
+    print("  selectors:")
     for sel, sig in sorted(c.selector_map.items()):
         print(fmt.dim(f"    {sel}  {sig[:76]}"))
     path = save_build(c)
@@ -1363,7 +1361,6 @@ def cmd_arb_compile(args) -> int:
 
 
 def cmd_arb_deploy(args) -> int:
-    import json as _json
 
     from arb.compiler import CompileError, load_build
     from arb.deployer import DeployError, deploy_contract
@@ -1464,12 +1461,13 @@ def _loaded_deployment(net_key: str, contract: str):
 
 
 def cmd_arb_plan(args) -> int:
-    from arb.executor import PlanError, plan_best_direction, plan_arbitrage, v3_router_uses_deadline
-    from config import get_venue, token_address, venues_for
+    from arb.executor import PlanError, plan_best_direction, v3_router_uses_deadline
+    from config import venues_for
     from dex.cross import scan_venues
     from dex.fetcher import ChainReader
 
     settings = Settings()
+    from config import get_venue
     _apply_overrides(args, settings)
     net, provider = _connect(settings)
 
@@ -1671,6 +1669,7 @@ def _quote_is_wrapped_native(quote_symbol: str, native_symbol: str) -> bool:
     the config knows, and refuses to guess for anything else.
     """
     from config import index_symbol
+
     return index_symbol(quote_symbol) == native_symbol.upper()
 
 
@@ -1731,7 +1730,6 @@ def _native_price_in_quote(res) -> float:
     a guess, because the caller turns this into a profit floor and an invented
     rate would under- or over-price it silently.
     """
-    from config import index_symbol
     if not _symbol_is_native(res.base_symbol, res.network):
         return 0.0
     for q in (res.sell_leg, res.buy_leg):
@@ -1963,7 +1961,7 @@ def _decimals_on_chain(reader, token_address_: str) -> int:
 def cmd_arb_run(args) -> int:
     from arb.compiler import load_build
     from arb.deployer import DeployError, RevertedTx, build_tx, estimate_cost, send_and_wait
-    from arb.executor import (PlanError, decode_outcome, plan_arbitrage,
+    from arb.executor import (PlanError, decode_outcome,
                               plan_best_direction, v3_router_uses_deadline)
     from config import get_venue, token_address, venues_for
     from dex.cross import scan_venues
@@ -2349,6 +2347,31 @@ def _scan_pair_at_size(provider, net, settings, base: str, quote: str,
     return row
 
 
+def format_scan_line(row: dict, prefix: str = "  ") -> str:
+    """
+    One scan result as one printable line.
+
+    Shared by the survey and the market scan because both print the same evidence
+    and both used to build the string by hand. When the per-pair scan was lifted
+    out of the survey loop, the string was left behind referring to `plan` and
+    `clears` — variables that no longer existed in that scope. Nothing crashed at
+    import time or in the tests: the survey simply caught the NameError in its
+    per-iteration handler and appended rows saying "NameError: name 'clears' is
+    not defined", which is exactly what a broken scan looks like on a log it
+    wrote itself. One formatter, one place, and a test that calls it with a
+    synthetic row.
+    """
+    mark = "CLEARS" if row.get("clears_floor") else "below "
+    fitted = (f"  [fitted to {row['size_base_used']:g}]"
+              if row.get("size_note") else "")
+    block = row.get("block")
+    where = f"blk {block:>10}  " if block is not None else ""
+    return (f"{prefix}{where}{mark:<6}  gross {row.get('gross_bps', 0):>+8.2f} bps  "
+            f"net {row.get('net_bps', 0):>+8.2f} bps  "
+            f"[{row.get('direction', '?')}] "
+            f"({row.get('buy', '?')} -> {row.get('sell', '?')}){fitted}")
+
+
 def cmd_arb_survey(args) -> int:
     """
     Dry-run the planner in a loop, logging every iteration's all-in economics.
@@ -2367,9 +2390,8 @@ def cmd_arb_survey(args) -> int:
     import json as _json
     import time
 
-    from arb.executor import PlanError, plan_best_direction, v3_router_uses_deadline
+    from arb.executor import PlanError
     from config import get_venue, token_address, venues_for
-    from dex.cross import scan_venues
     from dex.fetcher import ChainReader
 
     settings = Settings()
@@ -2424,10 +2446,8 @@ def cmd_arb_survey(args) -> int:
                 venues, opts, reader=ChainReader(provider, net)))
             net_bps = row["net_bps"]
             net_bps_seen.append(net_bps)
-            mark = fmt.green("CLEARS") if clears else fmt.dim("below ")
-            print(f"  [{i:>3}] blk {row.get('block', '?'):>10}  {mark}  "
-                  f"gross {row['gross_bps']:>+8.2f} bps  net {net_bps:>+8.2f} bps  "
-                  f"[{row['direction']}] ({plan.buy_label} -> {plan.sell_label})")
+            line = format_scan_line(row, prefix=f"  [{i:>3}] ")
+            print(fmt.green(line) if row.get("clears_floor") else line)
         except PlanError as exc:
             row["plan_error"] = str(exc)
             print(f"  [{i:>3}] no plan: {exc}")
@@ -2581,11 +2601,9 @@ def cmd_arb_market(args) -> int:
             net_bps = row["net_bps"]
             if net_bps > 0:
                 positives += 1
-            mark = fmt.green("CLEARS") if row.get("clears_floor") else fmt.dim("below ")
-            fit = f"  [fitted to {row['size_base_used']:g}]" if row.get("size_note") else ""
-            print(f"  [{n:>3}/{len(families)}] {sym_a:>10}/{sym_b:<10} {mark}  "
-                  f"gross {row['gross_bps']:>+8.2f} bps  net {net_bps:>+8.2f} bps  "
-                  f"[{row['direction']}] ({row['buy']} -> {row['sell']}){fit}")
+            label = f"{sym_a:>10}/{sym_b:<10} "
+            line = format_scan_line(row, prefix=f"  [{n:>3}/{len(families)}] {label}")
+            print(fmt.green(line) if row.get("clears_floor") else line)
         except PlanError as exc:
             row["plan_error"] = str(exc)
             unplanned.append((f"{sym_a}/{sym_b}", f"no plan: {str(exc)[:70]}"))
@@ -2687,12 +2705,11 @@ def cmd_arb_preflight(args) -> int:
 
     from arb.compiler import CompileError, load_build
     from arb.deployer import gas_price_wei
-    from arb.executor import checksum
     from arb.preflight import (Check, FAIL, PASS, SKIP, WARN, base_fee_headroom,
                                expected_entrypoints, gas_affordability, gas_price_sanity,
                                gate_one, missing_entrypoints, rollout, sort_for_display)
     from config import token_address, venues_for
-    from dex.fetcher import ChainReader, UniswapV3Reader, contract_factory
+    from dex.fetcher import ChainReader, UniswapV3Reader
 
     settings = Settings()
     _apply_overrides(args, settings)
@@ -2961,7 +2978,7 @@ def cmd_arb_index(args) -> int:
 
     import time
 
-    from config import get_venue, token_address, venues_for
+    from config import venues_for
     from dex.market_index import (DEFAULT_ANCHORS, MarketIndex, SweepAborted,
                                   discover_pairs_by_key, load_token_metadata,
                                   read_token_list, refresh_mids, sweep_v2_factory)
