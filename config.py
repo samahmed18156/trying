@@ -260,6 +260,12 @@ VENUES: Dict[tuple, Venue] = {
     ("ethereum", "uniswap_v3"): Venue(
         key="uniswap_v3", dex="uniswap", version="v3", name="Uniswap V3",
         factory="0x1F98431c8aD98523631AE4a59f267346ea31F984",
+        # SwapRouter (the original one, not SwapRouter02). Verified on chain:
+        # factory() returns the factory above and the bytecode contains the
+        # 8-field exactInputSingle selector, so `v3_router_uses_deadline`
+        # resolves to True. Without this address the executor refuses any plan
+        # whose sell leg lands here — which is how its absence was found.
+        router="0xE592427A0AEce92De3Edee1F18E0157C05861564",
         quoter="0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
         fee_tiers=_UNI_V3_TIERS, fee_tier_preference=_UNI_V3_PREF,
     ),
@@ -300,6 +306,13 @@ VENUES: Dict[tuple, Venue] = {
     ("bsc", "uniswap_v3"): Venue(
         key="uniswap_v3", dex="uniswap", version="v3", name="Uniswap V3",
         factory="0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
+        # SwapRouter02 on BNB Chain. Verified on chain: factory() returns the
+        # factory above, and the bytecode carries the 7-field exactInputSingle
+        # (0x04e45aaf) and NOT the 8-field one — SwapRouter02 dropped the
+        # deadline parameter. `arb plan` on BSC mainnet failed with
+        # "v3=MISSING" before this was added, which is exactly the class of gap
+        # that only shows up the first time a chain is traded for real.
+        router="0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",
         fee_tiers=_UNI_V3_TIERS, fee_tier_preference=_UNI_V3_PREF,
     ),
     # ---- Base -------------------------------------------------------------
@@ -312,6 +325,9 @@ VENUES: Dict[tuple, Venue] = {
     ("base", "uniswap_v3"): Venue(
         key="uniswap_v3", dex="uniswap", version="v3", name="Uniswap V3",
         factory="0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+        # SwapRouter02, same shape as BSC's (7-field, no deadline). Verified on
+        # chain against the factory above.
+        router="0x2626664c2603336E57B271c5C0b26F421741e481",
         quoter="0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
         fee_tiers=_UNI_V3_TIERS, fee_tier_preference=_UNI_V3_PREF,
     ),

@@ -99,18 +99,29 @@ def requires(*modules: str):
                     hint="python -m pip install -r requirements.txt")
             skipped.__name__ = fn.__name__
             skipped.__doc__ = fn.__doc__
-            return test(skipped)
-        return test(fn)
+            return case(skipped)
+        return case(fn)
 
-    # NOTE: `requires` registers the test itself, so it REPLACES `@test` rather
+    # NOTE: `requires` registers the test itself, so it REPLACES `@case` rather
     # than stacking on top of it. Writing both registers the same name twice -
     # once runnable and once skipped - which shows up as a phantom failure next
     # to a skip for the identical test.
     return decorate
 
 
-def test(fn: Callable[[], None]):
-    """Decorator registering a test."""
+def case(fn: Callable[[], None]):
+    """
+    Decorator registering a test.
+
+    Deliberately NOT named `test`: pytest collects every module-level function
+    whose name starts with `test`, so a decorator called `test` became a
+    collected item in its own right — one with a required `fn` argument, which
+    pytest reported as `fixture 'fn' not found`. That turned every `pytest
+    tests/` run into "1 passed, 1 error" regardless of whether any maths was
+    wrong, and an error line next to a pass is exactly how a real failure later
+    gets ignored. The whole suite is run instead by the single `test_*`
+    function at the bottom of this file.
+    """
     TESTS.append((fn.__name__, fn))
     return fn
 
@@ -121,7 +132,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = []
 # --------------------------------------------------------------------------
 # TickMath
 # --------------------------------------------------------------------------
-@test
+@case
 def tick_math_known_vectors():
     check(v3.get_sqrt_ratio_at_tick(0) == v3.Q96, "tick 0 must be exactly 2**96 (price 1.0)")
     check(v3.get_sqrt_ratio_at_tick(v3.MIN_TICK) == v3.MIN_SQRT_RATIO,
@@ -136,7 +147,7 @@ def tick_math_known_vectors():
     check(approx(price, 1 / 1.0001, 1e-9), f"tick -1 got {price!r}")
 
 
-@test
+@case
 def tick_math_round_trip():
     for tick in (0, 1, -1, 100, -100, 12345, -98765, 200_000, -200_000,
                  v3.MIN_TICK + 1, v3.MAX_TICK - 1):
@@ -145,7 +156,7 @@ def tick_math_round_trip():
         check(back == tick, f"round trip failed for tick {tick}: got {back}")
 
 
-@test
+@case
 def tick_math_monotonic():
     prev = 0
     for tick in range(-1000, 1001, 7):
@@ -154,7 +165,7 @@ def tick_math_monotonic():
         prev = ratio
 
 
-@test
+@case
 def tick_math_bounds():
     for bad in (v3.MIN_TICK - 1, v3.MAX_TICK + 1, 10 ** 9):
         try:
@@ -173,7 +184,7 @@ def tick_math_bounds():
 # --------------------------------------------------------------------------
 # FullMath / SqrtPriceMath
 # --------------------------------------------------------------------------
-@test
+@case
 def mul_div_rounding():
     check(v3.mul_div(7, 3, 2) == 10, "21/2 floors to 10")
     check(v3.mul_div(7, 3, 2, round_up=True) == 11, "21/2 rounds up to 11")
@@ -184,7 +195,7 @@ def mul_div_rounding():
     check(v3.mul_div(big, big, big) == big, "a*a/a == a for huge a")
 
 
-@test
+@case
 def amount_deltas():
     sqrt_a = v3.get_sqrt_ratio_at_tick(-1000)
     sqrt_b = v3.get_sqrt_ratio_at_tick(1000)
@@ -203,7 +214,7 @@ def amount_deltas():
     check(v3.get_amount0_delta(sqrt_a, sqrt_b, -liquidity, True) == -a0, "negative liquidity")
 
 
-@test
+@case
 def next_sqrt_price_direction():
     liquidity = 10 ** 18
     current = v3.get_sqrt_ratio_at_tick(0)
@@ -218,7 +229,7 @@ def next_sqrt_price_direction():
 # --------------------------------------------------------------------------
 # SwapMath
 # --------------------------------------------------------------------------
-@test
+@case
 def swap_step_single_range():
     """
     current=tick(-100), target=tick(+100) => target price is ABOVE current, so
@@ -258,7 +269,7 @@ def swap_step_single_range():
           "selling token0 must lower the price, bounded by the target")
 
 
-@test
+@case
 def swap_step_small_exact_output_stops_short():
     """
     Asking for LESS output than the range can supply must not reach the target,
@@ -277,7 +288,7 @@ def swap_step_small_exact_output_stops_short():
           "paying in token1 to receive token0 across a falling price must cost more")
 
 
-@test
+@case
 def swap_step_reaches_target_when_rich():
     """
     Asking for exactly the range's capacity lands precisely on the target.
@@ -317,7 +328,7 @@ def swap_step_reaches_target_when_rich():
           "a small request must stop strictly inside the range")
 
 
-@test
+@case
 def tick_math_constants_are_self_consistent():
     """
     Re-derive every TickMath constant from first principles with 200 digits of
@@ -369,7 +380,7 @@ class FakeBitmap:
         return self.words.get(position, 0)
 
 
-@test
+@case
 def tick_bitmap_walk():
     """
     Two subtleties, both reproduced faithfully from the Solidity:
@@ -418,7 +429,7 @@ def tick_bitmap_walk():
     check(init and nxt == 600, f"down from an initialised tick returns it, got ({nxt}, {init})")
 
 
-@test
+@case
 def tick_bitmap_exact_boundary_stall_is_faithful():
     """
     Documents a real edge case: when the current tick sits exactly on a spacing
@@ -446,7 +457,7 @@ def tick_bitmap_exact_boundary_stall_is_faithful():
               f"unexpected error: {exc}")
 
 
-@test
+@case
 def tick_bitmap_compressed_matches_solidity():
     """
     The truncate-toward-zero-then-decrement rule, checked directly against a
@@ -485,7 +496,7 @@ def tick_bitmap_compressed_matches_solidity():
     check(our_compressed(-2000, 60) == -34, "-2000/60 -> -33, then -- -> -34")
 
 
-@test
+@case
 def tick_bitmap_empty_word():
     spacing = 200
     bm = FakeBitmap([-40000, 40000], spacing)
@@ -569,7 +580,7 @@ def ladder_pool(segments: List[Tuple[int, int, int]], start_tick: int,
     )
 
 
-@test
+@case
 def v3_quote_matches_the_analytic_single_range_solution():
     """
     Inside one tick range V3 obeys
@@ -614,7 +625,7 @@ def v3_quote_matches_the_analytic_single_range_solution():
     check(q.liquidity_after == pool["liquidity"], "liquidity must be unchanged inside the range")
 
 
-@test
+@case
 def v3_virtual_reserves_do_not_satisfy_v2_formula():
     """
     Guards the note above with numbers: x*y == L**2 only at the range ends, so
@@ -641,7 +652,7 @@ def v3_virtual_reserves_do_not_satisfy_v2_formula():
           "L/S and L*S are the pointwise virtual reserves whose product is L**2")
 
 
-@test
+@case
 def v3_quote_price_impact_is_monotonic():
     """Bigger trades must never get a better price, and must push price down."""
     pool = ladder_pool(
@@ -665,7 +676,7 @@ def v3_quote_price_impact_is_monotonic():
         check(q.amount_in == size, "exact input must be fully consumed")
 
 
-@test
+@case
 def v3_quote_walks_multiple_ranges():
     """
     A trade big enough to run through several liquidity segments must cross
@@ -692,7 +703,7 @@ def v3_quote_walks_multiple_ranges():
         check("liquidity" in str(exc).lower(), f"unexpected error: {exc}")
 
 
-@test
+@case
 def v3_quote_crosses_ticks_upward():
     """Selling token1 walks the price UP and crosses each range boundary."""
     pool = ladder_pool(
@@ -707,7 +718,7 @@ def v3_quote_crosses_ticks_upward():
     check(q.liquidity_after != pool["liquidity"], "liquidity must change across a boundary")
 
 
-@test
+@case
 def v3_quote_reports_insufficient_liquidity_past_last_range():
     """
     Once a swap crosses out of the only range in a pool, liquidity is 0 and the
@@ -726,7 +737,7 @@ def v3_quote_reports_insufficient_liquidity_past_last_range():
               f"unexpected error: {exc}")
 
 
-@test
+@case
 def v3_quote_exact_output_consistency():
     """exact-in then exact-out for the same amount must agree to a wei or two."""
     pool = single_range_pool(liquidity=5 * 10 ** 19)
@@ -745,7 +756,7 @@ def v3_quote_exact_output_consistency():
     check(not q_out.exact_input and q_in.exact_input, "the two quotes must differ in mode")
 
 
-@test
+@case
 def v3_quote_insufficient_liquidity_raises():
     pool = single_range_pool(liquidity=10 ** 14)
     kwargs = {k: v for k, v in pool.items() if k not in ("lower", "upper")}
@@ -756,7 +767,7 @@ def v3_quote_insufficient_liquidity_raises():
         pass
 
 
-@test
+@case
 def v3_price_conversion_with_decimals():
     """WETH(18)/USDC(6) style pool: raw price is 1e-12 of the human price."""
     sqrt_price = v3.sqrt_ratio_x96_from_price(2500 * 10 ** (6 - 18))
@@ -767,7 +778,7 @@ def v3_price_conversion_with_decimals():
 # --------------------------------------------------------------------------
 # V2 maths
 # --------------------------------------------------------------------------
-@test
+@case
 def v2_get_amount_out_matches_closed_form():
     reserve_in, reserve_out, amount_in = 10 ** 21, 3 * 10 ** 15, 10 ** 18
     got = v2math.get_amount_out(amount_in, reserve_in, reserve_out)
@@ -776,7 +787,7 @@ def v2_get_amount_out_matches_closed_form():
     check(got < reserve_out, "cannot drain more than the pool holds")
 
 
-@test
+@case
 def v2_get_amount_in_rounds_up():
     reserve_in, reserve_out, amount_out = 10 ** 21, 3 * 10 ** 15, 10 ** 14
     need = v2math.get_amount_in(amount_out, reserve_in, reserve_out)
@@ -787,7 +798,7 @@ def v2_get_amount_in_rounds_up():
     check(one_less < amount_out, "rounding up must be tight (need-1 should be insufficient)")
 
 
-@test
+@case
 def v2_reserves_price_and_decimals():
     """WETH is token0 (0xC02a… < 0xdAC1…), 18 vs 6 decimals."""
     reserves = v2math.V2Reserves(
@@ -812,14 +823,14 @@ def v2_reserves_price_and_decimals():
     check(base_reserve == reserves.reserve1 and quote_reserve == reserves.reserve0, "reserves_for token1")
 
 
-@test
+@case
 def v2_multi_hop():
     amounts = v2math.get_amounts_out(10 ** 18, [(10 ** 21, 3 * 10 ** 15), (3 * 10 ** 15, 10 ** 21)])
     check(len(amounts) == 3, "one output per hop plus the input")
     check(amounts[2] < amounts[0], "two hops of fees must cost something")
 
 
-@test
+@case
 def v2_to_raw_avoids_float_drift():
     check(v2math.to_raw(1.5, 18) == 1_500_000_000_000_000_000, "1.5 ETH")
     check(v2math.to_raw(0.1, 18) == 100_000_000_000_000_000, "0.1 ETH must not be 99999…")
@@ -857,7 +868,7 @@ def _gas(cost_quote: float = 5.0) -> object:
     return G()
 
 
-@test
+@case
 def signal_no_edge_is_not_actionable():
     settings = Settings()
     sig = evaluate(settings=settings, index=PricePoint("ETH", "USDT", 2700.0, "cmc"),
@@ -867,7 +878,7 @@ def signal_no_edge_is_not_actionable():
     check(any("threshold" in r for r in sig.reasons), f"reasons: {sig.reasons}")
 
 
-@test
+@case
 def signal_real_edge_is_actionable():
     settings = Settings()
     settings.include_gas_cost = False
@@ -882,7 +893,7 @@ def signal_real_edge_is_actionable():
     check(approx(sig.gross_edge_bps, (2700 - 2680) / 2700 * 10_000, 1e-9), "edge maths")
 
 
-@test
+@case
 def signal_reverse_direction():
     settings = Settings()
     settings.include_gas_cost = False
@@ -892,7 +903,7 @@ def signal_reverse_direction():
     check(sig.actionable, f"expected actionable, reasons={sig.reasons}")
 
 
-@test
+@case
 def signal_gas_kills_small_edge():
     settings = Settings()
     settings.include_gas_cost = True
@@ -904,7 +915,7 @@ def signal_gas_kills_small_edge():
     check(any("gas" in r for r in sig.reasons), f"reasons: {sig.reasons}")
 
 
-@test
+@case
 def signal_slippage_guard():
     settings = Settings()
     settings.include_gas_cost = False
@@ -915,7 +926,7 @@ def signal_slippage_guard():
     check(any("slippage" in r for r in sig.reasons), f"reasons: {sig.reasons}")
 
 
-@test
+@case
 def signal_sanity_warning_on_absurd_spread():
     settings = Settings()
     sig = evaluate(settings=settings, index=PricePoint("ETH", "USDT", 2700.0, "cmc"),
@@ -924,7 +935,7 @@ def signal_sanity_warning_on_absurd_spread():
           "a 10x discrepancy must warn about a wrong asset/pool")
 
 
-@test
+@case
 def gas_estimate_uses_native_price():
     settings = Settings()
     settings.gas_units_per_swap = 180_000
@@ -956,7 +967,7 @@ def gas_estimate_uses_native_price():
 # 1e18 as though it were a token balance.
 
 
-@test
+@case
 def venue_registry_is_internally_consistent():
     from config import VENUES, venues_for
 
@@ -995,7 +1006,7 @@ def venue_registry_is_internally_consistent():
                   f"venues_for({net_key}) returned {v.key} which is not registered there")
 
 
-@test
+@case
 def pancakeswap_v3_tiers_differ_from_uniswap():
     """
     PancakeSwap V3 uses 100/500/2500/10000; Uniswap V3 uses 100/500/3000/10000.
@@ -1019,7 +1030,7 @@ def pancakeswap_v3_tiers_differ_from_uniswap():
           f"unexpected Uniswap tiers: {uni.fee_tiers}")
 
 
-@test
+@case
 def v2_fee_constants_match_each_protocol():
     """
     Uniswap V2: amountIn * 997  / 1000  -> 30 bps
@@ -1053,7 +1064,7 @@ def v2_fee_constants_match_each_protocol():
           f"expected roughly a 5 bps difference, got {gap_bps:.3f} bps")
 
 
-@test
+@case
 def pancakeswap_router_is_not_the_smart_router():
     """
     PancakeSwap's Smart Router (0x13f4EA83D0bd40E75C8222255bc855a974568Dd4)
@@ -1139,7 +1150,7 @@ def v3_slot0_selector_is_shared_but_decoding_differs():
                   f"{net_key}/{key} must declare the uint8 slot0 layout")
 
 
-@test
+@case
 def v3_liquidity_is_not_a_token_balance():
     """
     Guard against the two mistakes that follow from treating a V3 pool's
@@ -1166,7 +1177,7 @@ def v3_liquidity_is_not_a_token_balance():
         check(size / PROBE_DIVISOR < size, "probe did not reduce the size")
 
 
-@test
+@case
 def cross_depth_gate_rejects_a_thin_pool():
     """
     The regression test for the +560,239 bps phantom.
@@ -1224,7 +1235,7 @@ def cross_depth_gate_rejects_a_thin_pool():
           f"sanity: the ungated comparison really was absurd ({phantom_bps:,.0f} bps)")
 
 
-@test
+@case
 def cross_route_compares_exec_not_mid():
     """
     The route must be chosen on executable prices. Choosing on mids and then
@@ -1287,7 +1298,7 @@ def cross_route_compares_exec_not_mid():
           f"the mixed-column figure ({mixed:.0f} bps) should dwarf the real one")
 
 
-@test
+@case
 def cross_split_of_mid_spread_and_execution_cost():
     """mid_spread + gross_edge must reconcile through execution_cost."""
     from dex.cross import CrossScanResult, VenueQuote, _pick_route
@@ -1314,7 +1325,7 @@ def cross_split_of_mid_spread_and_execution_cost():
     check(not res.same_venue, "two different venue keys must not read as same-venue")
 
 
-@test
+@case
 def bsc_network_and_testnet_are_configured():
     """BNB Chain is where both DEXes have liquidity; testnet is for execution."""
     from config import NETWORKS, get_network, get_venue
@@ -1366,7 +1377,7 @@ def pool_cache_keys_include_the_factory():
           "pair_address must derive a factory component for its cache key")
 
 
-@test
+@case
 def wrapped_tokens_get_an_exchange_listed_index_symbol():
     """
     WBNB is the base symbol of BNB Chain but no exchange lists it, so an index
@@ -1393,7 +1404,7 @@ def wrapped_tokens_get_an_exchange_listed_index_symbol():
         check(k.startswith("W"), f"{k} is not a wrapped symbol")
 
 
-@test
+@case
 def bnb_and_wbnb_resolve_to_the_same_contract():
     """
     Two symbol lookups that must NOT be confused, in opposite directions.
@@ -1423,7 +1434,7 @@ def bnb_and_wbnb_resolve_to_the_same_contract():
     check(index_symbol("BNB") == "BNB", "BNB needs no conversion")
 
 
-@test
+@case
 def cross_bps_figures_have_three_denominators():
     """
     Pins the convention, and the trap that comes with it.
@@ -1495,7 +1506,7 @@ def cross_bps_figures_have_three_denominators():
           "profit must equal edge x capital deployed")
 
 
-@test
+@case
 def cross_route_money_rows_sum_for_many_shapes():
     """The currency accounting must hold regardless of which leg wins or loses."""
     from dex.cross import CrossScanResult, VenueQuote, _pick_route
@@ -1536,7 +1547,7 @@ def cross_route_money_rows_sum_for_many_shapes():
               "execution_cost_bps disagrees with its own definition")
 
 
-@test
+@case
 def v2_venues_do_not_get_a_fee_tier_suffix():
     """
     A V2 pool has one fee and no tiers, so its label must not read like a tier.
@@ -1564,7 +1575,7 @@ def v2_venues_do_not_get_a_fee_tier_suffix():
     check(v2.fee_bps == 25.0 and v2.fee_pips == 2500, "V2 fee data was dropped")
 
 
-@test
+@case
 def cross_json_includes_computed_fields():
     """
     `dict(quote.__dict__)` silently drops every @property, so an earlier version
@@ -1700,7 +1711,7 @@ def every_configured_address_is_a_valid_checksum():
             raise AssertionError(f"{bad!r} was accepted as an address")
 
 
-@test
+@case
 def v3_factory_and_router_are_different_contracts():
     """
     PancakeSwap's own testnet docs list 0x9a489505a00cE272eAa5e07Dba6491314CaE3796
@@ -1733,7 +1744,7 @@ def v3_factory_and_router_are_different_contracts():
           f"testnet V3 router is {tn.router}")
 
 
-@test
+@case
 def testnet_gas_symbol_is_priced_by_an_exchange():
     """
     Gas is costed by looking up the network's native_symbol on an exchange. BNB
@@ -1750,7 +1761,7 @@ def testnet_gas_symbol_is_priced_by_an_exchange():
               f"which no exchange lists - gas costing will fail on this network")
 
 
-@test
+@case
 def cross_staleness_detector_sees_what_the_depth_gate_cannot():
     """
     Two independent gates, and neither substitutes for the other.
@@ -2017,7 +2028,7 @@ def wallet_signs_a_transaction_offline():
               f"signature recovers to {recovered}, not the wallet's {info.address}")
 
 
-@test
+@case
 def faucet_list_puts_free_ones_first():
     """
     Ordering is the whole point of this table. Most 2026 faucets gate claims
@@ -2155,7 +2166,7 @@ _TESTNET_SPECS = (
 )
 
 
-@test
+@case
 def to_wei_is_exact_where_float_truncation_is_not():
     """
     Two separate float failures, both of which hit on the small sizes a testnet
@@ -2184,7 +2195,7 @@ def to_wei_is_exact_where_float_truncation_is_not():
     check(to_wei(2_700.5, 6) == 2_700_500_000, "fractional 6-decimal amount wrong")
 
 
-@test
+@case
 def slippage_floor_biases_down_and_respects_decimals():
     """
     The floor must never exceed what the pool will actually return, or the swap
@@ -2217,7 +2228,7 @@ def slippage_floor_biases_down_and_respects_decimals():
         raise AssertionError("a negative slippage tolerance was accepted")
 
 
-@test
+@case
 def plan_picks_one_leg_per_protocol_generation():
     """
     The contract's leg 1 is a V2-style router and leg 2 is V3-style, so the best
@@ -2302,7 +2313,7 @@ def plan_checksums_addresses_so_the_encoder_cannot_reject_them():
         check(Web3.is_checksum_address(hop), f"v2_path[{i}] is not checksummed: {hop}")
 
 
-@test
+@case
 def plan_predicts_its_own_revert_when_the_edge_cannot_cover_the_fee():
     """
     On testnet the round trip is a LOSS, and the plan must say so before anyone
@@ -2338,7 +2349,7 @@ def plan_predicts_its_own_revert_when_the_edge_cannot_cover_the_fee():
           "the warning should name the error the contract will raise")
 
 
-@test
+@case
 def plan_refuses_routes_it_cannot_execute():
     """Every refusal must say what to change, not just that it failed."""
     from arb.executor import PlanError, plan_arbitrage
@@ -2463,7 +2474,7 @@ def plan_calldata_encoding_survives_a_roundtrip():
           "recipient/deadline/amountIn must be zeroed placeholders the contract overwrites")
 
 
-@test
+@case
 def tx_cost_renders_as_a_number_not_a_bound_method():
     """
     Regression: `human` was a plain method while every call site is an f-string
@@ -2490,7 +2501,7 @@ def tx_cost_renders_as_a_number_not_a_bound_method():
     check(rich.affordable is True, "0.0105 BNB should cover a 0.00009 BNB call")
 
 
-@test
+@case
 def deployment_record_survives_a_roundtrip_outside_build():
     """
     Records live in state/, not build/: .gitignore excludes build/ as a Python
@@ -2581,7 +2592,7 @@ def keystore_password_prompting_decides_correctly():
             raise AssertionError("a wrong password was accepted")
 
 
-@test
+@case
 def the_offline_import_chain_has_no_module_level_third_party_imports():
     """
     Guards the invariant that `main.py selftest` runs on a bare Python install.
@@ -2790,7 +2801,7 @@ def wallet_password_prompt_retries_then_gives_up_with_guidance():
             W.prompt_password, W.load_wallet = orig_prompt, orig_load
 
 
-@test
+@case
 def a_cached_solc_binary_that_lost_its_execute_bit_is_repaired():
     """
     solcx caches the compiler in ~/.solcx and reuses it forever. If that file
@@ -2853,7 +2864,7 @@ def a_cached_solc_binary_that_lost_its_execute_bit_is_repaired():
               "repairing an already-executable binary should be a no-op")
 
 
-@test
+@case
 def an_empty_wallet_is_reported_as_unfunded_not_as_a_broken_transaction():
     """
     Two very different problems arrive as the same failed `estimate_gas`, and
@@ -2980,7 +2991,7 @@ def an_empty_wallet_is_reported_as_unfunded_not_as_a_broken_transaction():
           == 7_000_000_000, "the legacy fallback is broken")
 
 
-@test
+@case
 def transaction_hashes_are_printed_and_stored_with_the_0x_prefix():
     """
     hexbytes changed `.hex()` across major versions - 0.x returned "0x0c8b…",
@@ -3044,7 +3055,7 @@ def transaction_hashes_are_printed_and_stored_with_the_0x_prefix():
               f"{to_hex(real)!r}")
 
 
-@test
+@case
 def the_v3_router_shape_is_read_from_bytecode_not_assumed():
     """
     `exactInputSingle` comes in two shapes and they differ BETWEEN MAINNET AND
@@ -3129,7 +3140,7 @@ def the_v3_router_shape_is_read_from_bytecode_not_assumed():
         raise AssertionError("a router with both selectors was silently assigned a shape")
 
 
-@test
+@case
 def each_legs_slippage_floor_is_denominated_in_the_token_that_leg_pays_out():
     """
     Leg 1 buys BASE with the borrowed QUOTE, so its `amountOutMin` is in BASE.
@@ -3206,7 +3217,7 @@ def each_legs_slippage_floor_is_denominated_in_the_token_that_leg_pays_out():
 # --------------------------------------------------------------------------
 # Flash-loan pool selection — the 'LOK' reentrancy constraint
 # --------------------------------------------------------------------------
-@test
+@case
 def the_flash_loan_never_comes_from_the_pool_leg_two_swaps_through():
     """
     A V3 pool's flash() takes its reentrancy lock and holds it across the whole
@@ -3247,7 +3258,7 @@ def the_flash_loan_never_comes_from_the_pool_leg_two_swaps_through():
         raise AssertionError("the locked pool was offered as the lender")
 
 
-@test
+@case
 def the_cheapest_pool_that_can_lend_wins_and_thin_pools_are_skipped():
     """
     PancakeSwap V3 charges the flash fee at the LENDING pool's own swap tier, so
@@ -3292,7 +3303,7 @@ def the_cheapest_pool_that_can_lend_wins_and_thin_pools_are_skipped():
     check(tier == 100, f"a locked preference should fall through, got {tier}")
 
 
-@test
+@case
 def when_no_pool_can_lend_the_refusal_states_every_reason():
     """
     A refusal that only says "failed" sends the reader hunting. This one has to
@@ -3317,7 +3328,7 @@ def when_no_pool_can_lend_the_refusal_states_every_reason():
         raise AssertionError("an impossible loan was accepted")
 
 
-@test
+@case
 def the_repay_is_checked_before_the_transfer_so_the_reason_is_legible():
     """
     Without an explicit check, an unprofitable round trip fails inside the token
@@ -3345,7 +3356,7 @@ def the_repay_is_checked_before_the_transfer_so_the_reason_is_legible():
     check(guard < transfer, "the guard must come BEFORE the transfer it protects")
 
 
-@test
+@case
 def known_revert_reasons_are_translated_into_a_cause():
     """
     These pools and routers revert with reasons that name a mechanism, not a
@@ -3386,6 +3397,279 @@ def known_revert_reasons_are_translated_into_a_cause():
 
     unknown = explain("execution reverted: SOMETHING_NOVEL")
     check("SOMETHING_NOVEL" in unknown, f"an unknown reason was hidden: {unknown}")
+
+
+# --------------------------------------------------------------------------
+# the profit floor (gas cost -> min_profit)
+# --------------------------------------------------------------------------
+# The floor exists because of one measured failure: a testnet run reported
+# "PROFIT" on a round trip that netted 1 wei while spending 331,190 gas. The
+# contract was doing what it was told -- min_profit was 0 -- so the fix belongs
+# here, in the planner, and its arithmetic has to be right in every edge case
+# because a floor that silently rounds down is the same bug again.
+def _fake_scan(buy_exec: float = 760.0, sell_exec: float = 765.0):
+    """A two-leg scan on BSC worth planning: V2 buy, V3 sell, both usable."""
+    from arb.executor import choose_flash_pool  # noqa: F401 - import check
+    from dex.cross import CrossScanResult, VenueQuote
+
+    v2 = VenueQuote(
+        venue_key="pancakeswap_v2", venue_name="PancakeSwap V2", version="v2",
+        fee_pips=25, fee_bps=25.0, ok=True, mid_price=buy_exec, exec_price=buy_exec,
+        impact_bps=9.0, trade_size_base=1.0, router_address="0x" + "AA" * 20,
+        pool_address="0x" + "BB" * 20, block_number=1,
+    )
+    v3 = VenueQuote(
+        venue_key="pancakeswap_v3", venue_name="PancakeSwap V3", version="v3",
+        fee_pips=100, fee_bps=1.0, ok=True, mid_price=sell_exec, exec_price=sell_exec,
+        impact_bps=1.0, trade_size_base=1.0, router_address="0x" + "CC" * 20,
+        pool_address="0x" + "11" * 20, block_number=1,
+    )
+    res = CrossScanResult(
+        network="bsc", base_symbol="WBNB", quote_symbol="USDT",
+        trade_size_base=1.0, max_impact_bps=50.0,
+        quotes=[v2, v3], buy_leg=v2, sell_leg=v3, block_number=1,
+    )
+    pools = {100: "0x" + "11" * 20, 500: "0x" + "22" * 20,
+             2500: "0x" + "33" * 20, 10000: "0x" + "44" * 20}
+
+    def pool_for_fee(fee: int) -> str:
+        return pools.get(int(fee), "")
+
+    return res, pool_for_fee
+
+
+@case
+def profit_floor_never_below_gas_cost():
+    """The regression this whole mechanism exists for: gas beats profit."""
+    from arb.executor import plan_arbitrage
+
+    res, pool_for_fee = _fake_scan()
+    gas = 1_000_000_000_000_000          # 0.001 BNB in wei, ~0.76 USDT at 760
+    plan = plan_arbitrage(
+        res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
+        min_profit_wei=0, gas_cost_quote_wei=gas, min_profit_buffer_bps=2500.0,
+    )
+    floor = plan.min_profit_floor
+    check(floor > gas, f"floor {floor} must exceed the raw gas figure {gas}")
+    check(plan.min_profit == floor,
+          f"min_profit must be raised to the floor, got {plan.min_profit} vs {floor}")
+    check(plan.min_profit >= gas,
+          "min_profit must cover gas or the run can 'profit' while losing money")
+    check(plan.gas_cost_quote_wei == gas, "the plan must carry the gas figure it used")
+
+
+@case
+def profit_floor_never_lowers_the_callers_setting():
+    """An explicit, higher --min-profit is a setting, not a suggestion."""
+    from arb.executor import plan_arbitrage
+
+    res, pool_for_fee = _fake_scan()
+    asked = 5_000_000_000_000_000
+    plan = plan_arbitrage(
+        res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
+        min_profit_wei=asked, gas_cost_quote_wei=1_000_000_000_000_000,
+    )
+    check(plan.min_profit == asked,
+          f"a caller asking for {asked} got {plan.min_profit} instead")
+    check(plan.min_profit_floor < asked, "fixture should make the floor the lower bound")
+
+
+@case
+def profit_floor_absent_without_a_gas_figure():
+    """No gas price known means no floor — and the CLI says so, it does not guess."""
+    from arb.executor import plan_arbitrage
+
+    res, pool_for_fee = _fake_scan()
+    plan = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
+                          min_profit_wei=0, gas_cost_quote_wei=0)
+    check(plan.min_profit == 0, f"expected no floor, got {plan.min_profit}")
+    check(plan.min_profit_floor == 0, "no gas figure must mean no floor")
+
+
+@case
+def profit_floor_buffer_rounds_up_and_rejects_negatives():
+    from arb.executor import PlanError, plan_arbitrage
+
+    res, pool_for_fee = _fake_scan()
+    # Zero buffer still adds 1 wei, so the floor is strictly above the estimate:
+    # landing exactly ON the estimate is the case where fee drift makes a
+    # marginally-profitable run revert.
+    plan = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
+                          gas_cost_quote_wei=3, min_profit_buffer_bps=0.0)
+    check(plan.min_profit_floor == 4, f"expected 3+1, got {plan.min_profit_floor}")
+
+    try:
+        plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
+                       gas_cost_quote_wei=10 ** 15, min_profit_buffer_bps=-1.0)
+    except PlanError:
+        pass
+    else:
+        raise AssertionError("a negative buffer must be refused, not silently used")
+
+
+@case
+def profit_floor_flags_a_run_that_cannot_clear_it():
+    """The planner must SAY a run will revert, not quietly send it."""
+    from arb.executor import plan_arbitrage
+
+    res, pool_for_fee = _fake_scan(buy_exec=760.0, sell_exec=760.10)
+    # Gross 0.10 USDT = 1e17 wei; the tier-500 loan costs 5 bps of 760 = 3.8e17,
+    # so the gross edge does not even cover the flash fee here.
+    plan = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
+                          gas_cost_quote_wei=5 * 10 ** 17)
+    joined = " ".join(plan.notes)
+    check("EXPECTED TO REVERT" in joined,
+          f"a plan that cannot clear its costs must warn; notes were: {plan.notes}")
+    check(plan.min_profit > 0, "the floor must still be set on a doomed plan")
+
+
+@case
+def gas_cost_conversion_is_exact_for_wrapped_native():
+    from arb.executor import gas_cost_in_quote_wei
+
+    wei = 1_234_567_890_000_000
+    check(gas_cost_in_quote_wei(wei, True) == wei,
+          "WBNB is BNB: the conversion must be the identity")
+    check(gas_cost_in_quote_wei(0, True) == 0, "zero gas must convert to zero")
+
+
+@case
+def gas_cost_conversion_uses_the_rate_or_refuses():
+    from arb.executor import gas_cost_in_quote_wei
+
+    # 0.001 BNB at 764.7 USDT/BNB = 0.7647 USDT, in 18-decimal wei.
+    got = gas_cost_in_quote_wei(10 ** 15, False, 764.7)
+    check(got == 764_700_000_000_000_000,
+          f"expected 764700000000000000, got {got}")
+    check(gas_cost_in_quote_wei(10 ** 15, False, 0.0) == 0,
+          "an unknown rate must produce no floor, never a guessed one")
+    # Rounding must go UP: an under-priced floor is the bug this prevents.
+    got = gas_cost_in_quote_wei(3, False, 1.5)
+    check(got == 5, f"3 wei x 1.5 = 4.5 must round up to 5, got {got}")
+
+
+@case
+def the_loan_is_sized_from_the_real_buy_cost_not_a_sell_quote():
+    """
+    The 50 bps bug, pinned down.
+
+    The scan reports what each venue PAYS per base sold. Sizing the flash loan
+    from the cheap venue's sell quote understates the cost of buying by ~2x its
+    fee, so the loan came up ~0.5% short, leg 2 sold less than the plan
+    assumed, and a plan the planner accepted reverted with CannotRepay on chain.
+    With the real getAmountIn cost supplied, the loan must be that number — and
+    gross must be measured against it, not against the optimistic one.
+    """
+    from arb.executor import plan_arbitrage
+
+    res, pool_for_fee = _fake_scan(buy_exec=760.0, sell_exec=765.0)
+    sell_quote_borrow = 760 * 10 ** 18
+    real_cost = int(760 * 10 ** 18 * 1.005)          # ~2 x a 0.25% fee
+
+    optimistic = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee)
+    check(optimistic.flash_amount == sell_quote_borrow,
+          f"without a buy cost the planner uses the sell quote: {optimistic.flash_amount}")
+    check(any("optimistic" in n for n in optimistic.notes),
+          "the fallback must SAY the edge is optimistic, not quietly be one")
+
+    corrected = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
+                               v2_buy_cost_wei=real_cost)
+    check(corrected.flash_amount == real_cost,
+          f"the loan must be sized from the real buy cost, got {corrected.flash_amount}")
+    check(corrected.expected_gross_bps < optimistic.expected_gross_bps,
+          "measuring against the true buy cost must LOWER the reported edge")
+    drop = optimistic.expected_gross_bps - corrected.expected_gross_bps
+    check(40 < drop < 60,
+          f"a 0.5% dearer loan should cut ~50 bps from the gross edge, drop was {drop:.1f}")
+    check(any("buy cost" in n for n in corrected.notes),
+          "the correction must be visible in the notes")
+
+
+@case
+def legs_without_a_router_are_never_chosen():
+    """
+    A quoted venue with no router cannot be sent to, so it must not be picked.
+
+    Found on BSC mainnet: the dearest usable V3 venue was Uniswap V3, whose
+    config had no router, and `arb plan` died with "v3=MISSING" instead of
+    trading the best route it COULD execute.
+    """
+    from arb.executor import best_leg
+    from dex.cross import CrossScanResult, VenueQuote
+
+    good = VenueQuote(
+        venue_key="pancakeswap_v3", venue_name="PancakeSwap V3", version="v3",
+        fee_pips=100, fee_bps=1.0, ok=True, exec_price=754.0,
+        router_address="0x" + "CC" * 20, pool_address="0x" + "11" * 20,
+    )
+    no_router = VenueQuote(
+        venue_key="uniswap_v3", venue_name="Uniswap V3", version="v3",
+        fee_pips=100, fee_bps=1.0, ok=True, exec_price=755.0,   # dearest
+        router_address="", pool_address="0x" + "22" * 20,
+    )
+    res = CrossScanResult(network="bsc", base_symbol="WBNB", quote_symbol="USDT",
+                          trade_size_base=1.0, max_impact_bps=50.0,
+                          quotes=[good, no_router], sell_leg=no_router)
+
+    chosen = best_leg(res, "v3", "sell")
+    check(chosen is not None, "a usable, executable V3 leg exists and must be chosen")
+    check(chosen.venue_key == "pancakeswap_v3",
+          f"picked {chosen.label} which has no router; execution would fail")
+    check(chosen.exec_price == 754.0, "the executable leg must win over the cheaper-to-quote one")
+
+    # With no executable candidate at all, the choice is unchanged so the
+    # missing-router error still names the real problem.
+    res2 = CrossScanResult(network="bsc", base_symbol="WBNB", quote_symbol="USDT",
+                           trade_size_base=1.0, max_impact_bps=50.0,
+                           quotes=[no_router], sell_leg=no_router)
+    still = best_leg(res2, "v3", "sell")
+    check(still is not None and still.venue_key == "uniswap_v3",
+          "with nothing executable, the planner must keep the leg so the error names "
+          "the missing router")
+
+
+@requires("requests")
+def private_submit_fails_loudly_never_falls_back():
+    """
+    A private relay that cannot be reached must raise, not silently rebroadcast
+    through the public mempool — that would defeat the whole point of --private.
+    """
+    from arb.deployer import DeployError, _send_raw_private
+
+    try:
+        _send_raw_private("http://127.0.0.1:9/nowhere", b"\x01\x02")
+    except DeployError as exc:
+        msg = str(exc).lower()
+        check("public" in msg,
+              f"the error must say nothing went to the public mempool: {exc}")
+    else:
+        raise AssertionError("an unreachable relay must raise DeployError")
+
+
+# --------------------------------------------------------------------------
+# pytest bridge
+# --------------------------------------------------------------------------
+# pytest collects module-level functions whose names start with `test`, which is
+# why the decorator above is `case`. This single function is the only collected
+# item: it runs the whole registered suite, so `pytest tests/` and
+# `python main.py selftest` can never disagree about whether the maths is right.
+def test_offline_maths_suite():
+    failures: List[str] = []
+    skipped = 0
+    for name, fn in TESTS:
+        try:
+            fn()
+        except SkipTest:
+            skipped += 1
+        except Exception:  # noqa: BLE001
+            failures.append(name)
+            traceback.print_exc(limit=3)
+    assert not failures, (f"{len(failures)} offline case(s) failed: "
+                          f"{', '.join(failures)}")
+    if TESTS and skipped == len(TESTS):
+        import pytest
+
+        pytest.skip("no offline case could run in this environment")
 
 
 def run_all(verbose: bool = True) -> int:

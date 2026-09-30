@@ -85,7 +85,21 @@ def gas_price_wei(w3) -> int:
     Chain accepts both, and a chain that reports baseFeePerGas but is sent a
     legacy transaction still works — but the reverse (sending 1559 fields to a
     chain with no base fee) does not, so the fallback order matters.
+
+    THIS IS THE PRICE THE TRANSACTION IS SENT AT, and therefore the price the
+    planner's profit floor is computed from — the two must agree or the floor
+    would be solving for a cost the transaction does not pay. Set
+    GAS_PRICE_GWEI in the environment to override it: measured on BNB Chain in
+    September 2026, the chain's own `eth_gasPrice` was 0.05 gwei while this
+    function returns 2 gwei, a 40x overpay that is defensible as priority for a
+    contested inclusion and material as a cost when the edge is thin. An
+    operator who wants to pay market sets GAS_PRICE_GWEI=0.05.
     """
+    import os
+
+    override = os.getenv("GAS_PRICE_GWEI")
+    if override:
+        return int(float(override) * 10 ** 9)
     try:
         latest = w3.eth.get_block("latest")
         base = getattr(latest, "baseFeePerGas", None)
@@ -437,15 +451,74 @@ def to_hex(value) -> str:
     return str(value)
 
 
+def _send_raw_private(submit_url: str, raw) -> Any:
+    """
+    Broadcast a signed raw transaction through a private/MEV-protected RPC.
+
+    These providers (BlockRazor, GetBlock's MEV-protected endpoints, builder
+    APIs) are deliberately drop-in: they speak plain JSON-RPC
+    `eth_sendRawTransaction` like any other endpoint, and the privacy lives
+    server-side in how they route what they receive. So this is an HTTP POST,
+    not a bespoke protocol — and it fails loudly rather than falling back to
+    the public mempool. Quietly re-sending a transaction the caller asked to
+    keep private would be the one bug this function must never have.
+    """
+    import json
+    import uuid
+
+    import requests
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": uuid.uuid4().hex,
+        "method": "eth_sendRawTransaction",
+        "params": [to_hex(raw)],
+    }
+    try:
+        resp = requests.post(submit_url, json=payload, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as exc:  # noqa: BLE001
+        raise DeployError(
+            f"private submission to {submit_url} failed: {type(exc).__name__}: {exc}. "
+            f"Nothing was broadcast to the PUBLIC mempool either — the request did "
+            f"not reach the relay. Fix connectivity or drop --private and accept "
+            f"public visibility."
+        ) from exc
+    if "error" in body and body["error"]:
+        err = body["error"]
+        raise DeployError(
+            f"the private relay {submit_url} refused the transaction: {err}. "
+            f"Nothing was broadcast publicly."
+        )
+    result = body.get("result")
+    if not result:
+        raise DeployError(
+            f"the private relay {submit_url} returned no transaction hash: {body!r}"
+        )
+    return result
+
+
 def send_and_wait(w3, account, tx: Dict[str, Any], timeout: int = 240,
-                  abi: Optional[list] = None) -> Dict[str, Any]:
+                  abi: Optional[list] = None,
+                  submit_url: Optional[str] = None) -> Dict[str, Any]:
     """
     Sign, send, and wait for the receipt. Raises RevertedTx with a decoded
     reason if it mined and reverted, DeployError if it never mined.
+
+    `submit_url`, when given, is where the SIGNED raw transaction is broadcast
+    instead of the default provider — an MEV-protected or private-mempool RPC
+    (BlockRazor, GetBlock+Merkle, a builder endpoint). Reads and the receipt
+    wait still go through `w3`: only the broadcast path changes. Sending is the
+    moment a transaction becomes visible; a private submission path is the only
+    lever that changes who sees it before it lands.
     """
     signed = account.sign_transaction(tx)
     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
-    tx_hash = w3.eth.send_raw_transaction(raw)
+    if submit_url:
+        tx_hash = _send_raw_private(submit_url, raw)
+    else:
+        tx_hash = w3.eth.send_raw_transaction(raw)
     hexed = to_hex(tx_hash)
 
     try:

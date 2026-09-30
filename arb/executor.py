@@ -60,6 +60,11 @@ class ArbPlan:
     v3_fee: int
     v3_amount_out_min: int
     min_profit: int = 0
+    # Where min_profit came from. `min_profit_floor` is the gas-cost floor the
+    # planner derived (0 when no gas cost was supplied); `gas_cost_quote_wei` is
+    # the estimate it was derived from. Human-readable provenance, not sent.
+    min_profit_floor: int = 0
+    gas_cost_quote_wei: int = 0
     # Which exactInputSingle shape the V3 router implements: True for the 8-field
     # one carrying `deadline`. Determined from the router's bytecode by
     # v3_router_uses_deadline(); never guessed, because a wrong guess reverts with
@@ -139,7 +144,38 @@ class ArbPlan:
             f"repay    borrowed + flash fee (fee estimated at {self.expected_flash_fee:,} wei)",
             f"require  profit >= {self.min_profit:,} wei or revert the whole transaction",
         ]
+        if self.min_profit_floor:
+            out.append(
+                f"         floor = gas {self.gas_cost_quote_wei:,} wei + buffer "
+                f"({self.min_profit_floor:,} wei), the --min-profit setting may only raise it"
+            )
         return out
+
+
+def gas_cost_in_quote_wei(gas_cost_native_wei: int, quote_is_wrapped_native: bool,
+                          quote_per_native: float = 1.0) -> int:
+    """
+    Express a native-gas cost in the borrow (quote) token's wei.
+
+    The profit check is denominated in the quote token; gas is paid in the
+    chain's native coin. On BNB Chain the quote is usually WBNB, which IS BNB
+    one-for-one, so the conversion is exact and free. If the quote is anything
+    else (USDT-denominated profit), the caller must pass `quote_per_native` —
+    the price of one native unit in quote-token units (e.g. 12 USDT per BNB) —
+    and when it cannot, the honest answer is 0 with a note, NOT a silently
+    wrong floor: a floor priced with a stale or wrong FX rate is worse than no
+    floor, because it looks enforced while measuring the wrong thing.
+    """
+    if gas_cost_native_wei <= 0:
+        return 0
+    if quote_is_wrapped_native:
+        return int(gas_cost_native_wei)
+    if quote_per_native <= 0:
+        return 0
+    from decimal import Decimal, ROUND_UP
+
+    value = Decimal(gas_cost_native_wei) * Decimal(str(quote_per_native))
+    return int(value.to_integral_value(rounding=ROUND_UP))  # round up: never under-price the floor
 
 
 def to_wei(human: float, decimals: int = 18) -> int:
@@ -295,13 +331,25 @@ def checksum(addr: str) -> str:
 
 def best_leg(res: CrossScanResult, version: str, side: str) -> Optional[VenueQuote]:
     """
-    The best USABLE leg of one protocol generation, for one side.
+    The best USABLE, EXECUTABLE leg of one protocol generation, for one side.
 
     `side="buy"` takes the lowest executable price; `side="sell"` the highest.
     Only usable legs are considered — a leg the depth gate rejected cannot be
     traded, so its price is irrelevant however attractive it looks.
+
+    A leg whose venue has no router configured is also excluded: quoting it is
+    possible (the pool exists) but sending it is not, and choosing it produces
+    "no router address configured" at the very end of planning. That happened
+    on BSC mainnet, where Uniswap V3 was the dearest usable V3 venue and had no
+    router in config — the plan died on a configuration gap instead of trading
+    the best route it could actually execute. If NO candidate has a router the
+    full list is used, so the resulting error still names the missing router
+    rather than claiming there is no leg at all.
     """
     candidates = [q for q in res.usable if q.version == version]
+    executable = [q for q in candidates if q.router_address]
+    if executable:
+        candidates = executable
     if not candidates:
         return None
     if side == "buy":
@@ -408,6 +456,9 @@ def plan_arbitrage(
     v3_uses_deadline: bool = True,
     flash_fee_tiers: Sequence[int] = DEFAULT_FLASH_FEE_TIERS,
     flash_pool_quote_balance: Optional[Callable[[str], int]] = None,
+    gas_cost_quote_wei: int = 0,
+    min_profit_buffer_bps: float = 2500.0,
+    v2_buy_cost_wei: Optional[int] = None,
 ) -> ArbPlan:
     """
     Build an ArbPlan from a completed cross scan.
@@ -483,7 +534,41 @@ def plan_arbitrage(
     # and float truncation turns 0.0119 USDT into 0 wei.
     # quote_decimals matters: USDT is 18 decimals on BNB Chain but 6 on Ethereum
     # mainnet, and assuming 18 would inflate every amount on mainnet by 1e12.
-    borrow_wei = to_wei(size * buy.exec_price, quote_decimals)
+    # WHAT THE LOAN MUST COVER
+    #
+    # `buy.exec_price` is a SELL quote: the scan reports, for every venue, what
+    # you receive per base SOLD into it (dex/fetcher.py: amount_in = size base).
+    # Using the cheap venue's sell quote as the cost of BUYING there is wrong by
+    # exactly twice that venue's fee: selling 1 base at mid returns mid*(1-f),
+    # while buying 1 base costs mid/(1-f) ~= mid*(1+f). Measured on BSC mainnet
+    # against PancakeSwap V2's real reserves: the sell quote said 753.6651 USDT
+    # per WBNB and getAmountIn said 757.4768 — 50.3 bps, i.e. 2 x the 25 bps fee.
+    #
+    # The consequence was not cosmetic. The loan was sized 50 bps too small, so
+    # leg 1 returned ~0.995 base instead of `size`, leg 2 sold that for ~50 bps
+    # less quote than the plan promised, and a plan the planner accepted as
+    # profitable reverted on chain with CannotRepay. That is the whole reason
+    # `v2_buy_cost_wei` exists: the caller passes the exact getAmountIn cost,
+    # computed from live reserves, and the gross edge is measured against it.
+    if v2_buy_cost_wei is not None and v2_buy_cost_wei > 0:
+        borrow_wei = int(v2_buy_cost_wei)
+        approx_borrow = to_wei(size * buy.exec_price, quote_decimals)
+        if borrow_wei > approx_borrow:
+            diff_bps = (borrow_wei - approx_borrow) / borrow_wei * BPS
+            notes.append(
+                f"the loan is sized from leg 1's real buy cost (getAmountIn on the "
+                f"pair's reserves): {borrow_wei:,} wei, which is {diff_bps:,.1f} bps MORE "
+                f"than the venue's sell quote ({approx_borrow:,} wei) implies. Buying "
+                f"costs more than selling pays — that spread is the fee paid twice."
+            )
+    else:
+        borrow_wei = to_wei(size * buy.exec_price, quote_decimals)
+        notes.append(
+            "the loan is sized from the buy venue's SELL quote, not its real buy "
+            "cost. That understates the price of buying by about twice that venue's "
+            "fee, so the edge below is optimistic by the same amount — pass the "
+            "venue's getAmountIn cost to plan_arbitrage to correct it."
+        )
     back_wei = to_wei(size * sell.exec_price, quote_decimals)
     if borrow_wei <= 0:
         raise PlanError(
@@ -531,9 +616,57 @@ def plan_arbitrage(
     if gross_wei <= flash_fee:
         notes.append(
             f"the gross edge ({gross_bps:+,.1f} bps = {gross_wei:,} wei) does not cover "
-            f"the flash fee ({flash_fee:,} wei), so this run is EXPECTED TO REVERT "
-            f"with Unprofitable. That is the profit check working, not a bug — and "
-            f"because it reverts, no tokens move and only gas is spent."
+            f"the flash fee ({flash_fee:,} wei), so this run is EXPECTED TO REVERT. "
+            f"Which check fires depends on how short it comes back: if the proceeds "
+            f"cannot even repay the loan it is CannotRepay (that guard runs first), and "
+            f"only if the loan is repaid but the profit is under the floor is it "
+            f"Unprofitable. Both are the contract working — and because it reverts, no "
+            f"tokens move and only gas is spent."
+        )
+
+    # ---- the profit floor: never plan a "win" that cannot pay for its own gas --
+    #
+    # `min_profit` is the contract's only economic gate: it reverts unless the
+    # round trip ends `min_profit` wei above where it started. Left at 0, a run
+    # that clears 1 wei of profit and 331k gas of cost reports PROFIT and loses
+    # money. The floor below makes that structurally impossible: whatever the
+    # caller asked for, the plan enforces at least (gas cost + buffer), in the
+    # borrow token, denominated in the same wei units as the profit check.
+    #
+    # The buffer is not padding for its own sake. Three things drift between
+    # estimation and inclusion: the gas price (base fee can move a few percent
+    # per block), the two pool prices (a floor set exactly at the estimate makes
+    # a merely-moved market revert), and the estimate itself is a simulation of
+    # a state that will be a block older when mined. 25% is deliberately loose
+    # on a chain where the whole cost is ~1e15 wei; tightening it saves pennies
+    # and reintroduces the exact failure this removes.
+    min_profit_floor = 0
+    if gas_cost_quote_wei > 0:
+        from decimal import Decimal
+
+        if min_profit_buffer_bps < 0:
+            raise PlanError(
+                f"min_profit_buffer_bps cannot be negative, got {min_profit_buffer_bps}"
+            )
+        keep = (Decimal(int(BPS)) + Decimal(str(min_profit_buffer_bps))) / Decimal(int(BPS))
+        min_profit_floor = int(Decimal(gas_cost_quote_wei) * keep) + 1  # round up
+    effective_min_profit = max(min_profit_wei, min_profit_floor)
+    if effective_min_profit > min_profit_wei:
+        notes.append(
+            f"--min-profit was {min_profit_wei:,} wei, below the cost of sending the "
+            f"transaction. Raised to {effective_min_profit:,} wei: estimated gas "
+            f"{gas_cost_quote_wei:,} wei in quote-token terms plus a "
+            f"{min_profit_buffer_bps / 100:.0f}% drift buffer. A trade that clears "
+            f"less than this is not a profit, it is a smaller loss."
+        )
+    net_expected = gross_wei - flash_fee
+    if net_expected < effective_min_profit:
+        notes.append(
+            f"expected net ({net_expected:,} wei after the flash fee) does not clear the "
+            f"{effective_min_profit:,} wei floor, so this run is EXPECTED TO REVERT — "
+            f"with Unprofitable if the loan is still repaid, or with CannotRepay if the "
+            f"proceeds fall short of the loan entirely (that guard runs first). Either "
+            f"way nothing moves but gas."
         )
 
     if leg2_pool and pool.lower() != leg2_pool.lower():
@@ -576,7 +709,9 @@ def plan_arbitrage(
         v3_token_out=quote_address,
         v3_fee=sell.fee_pips,
         v3_amount_out_min=v3_min,
-        min_profit=min_profit_wei,
+        min_profit=effective_min_profit,
+        min_profit_floor=min_profit_floor,
+        gas_cost_quote_wei=gas_cost_quote_wei,
         v3_uses_deadline=v3_uses_deadline,
         buy_label=buy.label,
         sell_label=sell.label,

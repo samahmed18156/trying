@@ -1511,14 +1511,28 @@ def cmd_arb_plan(args) -> int:
     base_decimals = _decimals_on_chain(reader, base)
     uses_deadline = _v3_router_shape(provider.w3, res)
     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
+    # The real cost of leg 1's buy. See _v2_buy_cost_fn: the sell quote the scan
+    # reports is ~2x-fee cheaper than what buying actually costs.
+    buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
+
+    # Two passes, because the profit floor needs the gas cost and the gas cost
+    # needs a plan to simulate. Pass 1 builds with no floor; its only job is to
+    # be encodable so the exact call can be simulated. Pass 2 rebuilds from the
+    # same scan with the floor priced in. plan_arbitrage is pure, so the rebuild
+    # is deterministic and cheap.
+    plan_kwargs = dict(
+        slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+        quote_decimals=quote_decimals, base_decimals=base_decimals,
+        v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
+        min_profit_buffer_bps=args.min_profit_buffer,
+        v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
+    )
     try:
-        plan = plan_arbitrage(
-            res, base, quote, pool_for_fee,
-            slippage_bps=args.slippage, min_profit_wei=args.min_profit,
-            quote_decimals=quote_decimals, base_decimals=base_decimals,
-            v3_uses_deadline=uses_deadline,
-            flash_pool_quote_balance=quote_bal,
-        )
+        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
+        gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
+            provider, net, settings, res, probe, sender=None, contract_address=None)
+        plan = plan_arbitrage(res, base, quote, pool_for_fee,
+                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
     except PlanError as exc:
         print(fmt.red(f"\n  {exc}"))
         return 4
@@ -1534,6 +1548,8 @@ def cmd_arb_plan(args) -> int:
     print(f"  gross     {fmt.fmt_bps(plan.expected_gross_bps)} bps before the flash fee")
     for n in plan.notes:
         _wrap_note(n)
+    if gas_note:
+        _wrap_note(gas_note)
     if not args.json_out:
         print(fmt.dim("\n  Nothing was sent. Add --execute to sign and broadcast it."))
     else:
@@ -1586,6 +1602,152 @@ def _contract_address(args, dep) -> str:
         raise SystemExit(fmt.red(
             f"{raw!r} is not a valid address ({exc}). It must be 0x followed by "
             f"40 hex characters - copy it again from your deployment output."))
+
+
+# A measured gas figure for one arbitrage() call, used when the transaction
+# cannot be simulated (no contract deployed yet, or simulation would revert).
+# 570,906 was the estimate for the first testnet run with its 1.35x margin, so
+# the raw call is ~423k; 600k is that plus headroom. It only feeds the profit
+# FLOOR (which may never be under-priced), never the gas limit sent.
+ARB_GAS_FALLBACK_UNITS = 600_000
+
+
+def _quote_is_wrapped_native(quote_symbol: str, native_symbol: str) -> bool:
+    """
+    True when the quote token IS the chain's native asset (WBNB on BNB Chain).
+
+    WBNB is BNB one-for-one by construction, so a gas cost paid in BNB is
+    already denominated in the borrow token and the conversion is exact. This
+    is checked by symbol pair rather than by address so it works on any chain
+    the config knows, and refuses to guess for anything else.
+    """
+    from config import index_symbol
+    return index_symbol(quote_symbol) == native_symbol.upper()
+
+
+def _gas_cost_quote_wei(provider, net, settings, res, plan, sender, contract_address):
+    """
+    What this arbitrage's gas will cost, expressed in the borrow token's wei.
+
+    Simulates the real call when it can (contract deployed, state sane); falls
+    back to a fixed unit count x live gas price when it cannot, so `arb plan`
+    on a chain with no deployment still prices the floor instead of silently
+    skipping it. Returns (cost_wei, units_used, note) — note is non-empty when
+    the conversion is anything other than the exact wrapped-native case, because
+    a floor priced off a wrong FX rate is worse than no floor.
+    """
+    from arb.deployer import gas_price_wei
+    from arb.executor import gas_cost_in_quote_wei
+
+    units = ARB_GAS_FALLBACK_UNITS
+    note = ""
+    if contract_address and sender:
+        try:
+            factory = _contract_factory(provider.w3, contract_address, plan)
+            data = _encode_arbitrage(factory, plan)
+            est = int(provider.w3.eth.estimate_gas({
+                "from": sender, "to": contract_address, "data": data, "value": 0,
+            }))
+            if est > 0:
+                units = est
+        except Exception:  # noqa: BLE001 - fallback is the documented behaviour
+            note = (f"gas could not be simulated; the floor uses a fixed "
+                    f"{ARB_GAS_FALLBACK_UNITS:,}-unit estimate")
+    price = gas_price_wei(provider.w3)
+    native_cost = units * price
+    if _quote_is_wrapped_native(settings.quote_symbol, net.native_symbol):
+        cost = gas_cost_in_quote_wei(native_cost, True)
+    else:
+        # Profit is in the quote token but gas is native. Without a live price
+        # for the pair-native cross there is no honest conversion, so the floor
+        # is 0 and the user is TOLD to set --min-profit by hand. Quietly using a
+        # stale rate here would look like enforcement while measuring nothing.
+        rate = _native_price_in_quote(res)
+        cost = gas_cost_in_quote_wei(native_cost, False, rate)
+        if cost == 0:
+            note = (f"the quote token ({settings.quote_symbol}) is not the native "
+                    f"asset and no live price was found to convert {net.native_symbol} "
+                    f"gas into it — the profit floor could NOT be priced. Set "
+                    f"--min-profit to at least the gas cost in quote-token wei.")
+    return cost, units, note
+
+
+def _native_price_in_quote(res) -> float:
+    """
+    Best-effort price of 1 native unit in quote-token units, from the scan.
+
+    Only used when the quote is not the wrapped native asset. `exec_price` is
+    quote-per-base, which IS quote-per-native exactly when the base is the
+    wrapped native token. Anything else returns 0.0, meaning "unknown" — never
+    a guess, because the caller turns this into a profit floor and an invented
+    rate would under- or over-price it silently.
+    """
+    from config import index_symbol
+    if not _symbol_is_native(res.base_symbol, res.network):
+        return 0.0
+    for q in (res.sell_leg, res.buy_leg):
+        if q is not None and q.ok and q.exec_price > 0:
+            return q.exec_price
+    return 0.0
+
+
+def _symbol_is_native(symbol: str, network_key: str) -> bool:
+    from config import get_network, index_symbol
+    net = get_network(network_key)
+    return index_symbol(symbol) == net.native_symbol.upper()
+
+
+def _contract_factory(w3, contract_address, plan):
+    from arb.compiler import load_build
+    compiled = load_build("FlashArb")
+    from dex.fetcher import contract_factory
+    return contract_factory(w3, contract_address, compiled.abi)
+
+
+def _encode_arbitrage(factory, plan) -> bytes:
+    data = factory.encode_abi(abi_element_identifier="arbitrage", args=plan.call_args) \
+        if hasattr(factory, "encode_abi") else None
+    if data is None:
+        data = factory.functions.arbitrage(*plan.call_args).build_transaction()["data"]
+    if isinstance(data, str):
+        data = bytes.fromhex(data[2:])
+    return data
+
+
+def _v2_buy_cost_fn(reader, venues, base: str, quote: str):
+    """
+    A callable(size_base) -> quote wei: what leg 1 really costs to buy `size`.
+
+    `getAmountIn` on the pair's live raw reserves — NOT `size x sell-quote`. The
+    two differ by about twice the venue's fee (50.3 bps measured against
+    PancakeSwap V2's real reserves), and that difference is the difference
+    between a plan that completes and one that reverts with CannotRepay: sized
+    from the sell quote, the loan is 50 bps too small, leg 1 returns ~0.995 of
+    the expected base, and leg 2 sells that for 50 bps less than promised.
+
+    Returns None when no V2 venue is configured or the pair cannot be read, in
+    which case the planner falls back to the sell-quote approximation and says
+    so in its notes rather than silently quoting an optimistic number.
+    """
+    from dex import uniswap_v2_math as v2math
+    from dex.fetcher import UniswapV2Reader
+
+    v2_venue = next((v for v in venues if v.version == "v2"), None)
+    if v2_venue is None:
+        return None
+    pair_reader = UniswapV2Reader(reader, venue=v2_venue)
+
+    def cost(size_base: float) -> int:
+        pair = pair_reader.pair_address(base, quote)
+        reserves = pair_reader.get_reserves(pair)
+        base_is_token0 = base.lower() == reserves.token0.lower()
+        reserve_base, reserve_quote = reserves.reserves_for(base)
+        base_dec = reserves.decimals0 if base_is_token0 else reserves.decimals1
+        amount_out_raw = v2math.to_raw(size_base, base_dec)
+        return int(v2math.get_amount_in(amount_out_raw, reserve_quote, reserve_base,
+                                        pair_reader.fee_num, pair_reader.fee_den))
+
+    return cost
 
 
 def _pool_quote_balance_fn(w3, quote_address: str):
@@ -1694,12 +1856,29 @@ def cmd_arb_run(args) -> int:
     base_decimals = _decimals_on_chain(reader, base)
     uses_deadline = _v3_router_shape(provider.w3, res)
     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
+    buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
+
+    # Only --execute needs the private key; a dry run just needs the address.
+    sender, account, wpath = _sender(args, need_key=bool(args.execute))
+
+    # Two passes: the profit floor must cover gas, and pricing gas needs the
+    # exact call to simulate. Pass 1's plan exists only to be encoded; pass 2
+    # is what gets printed and sent. See _gas_cost_quote_wei for the conversion
+    # rules and what happens when the quote token is not the native asset.
+    plan_kwargs = dict(
+        slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+        quote_decimals=quote_decimals, base_decimals=base_decimals,
+        v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
+        min_profit_buffer_bps=args.min_profit_buffer,
+        v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
+    )
     try:
+        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
+        gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
+            provider, net, settings, res, probe,
+            sender=sender, contract_address=contract_address)
         plan = plan_arbitrage(res, base, quote, pool_for_fee,
-                              slippage_bps=args.slippage, min_profit_wei=args.min_profit,
-                              quote_decimals=quote_decimals, base_decimals=base_decimals,
-                              v3_uses_deadline=uses_deadline,
-                              flash_pool_quote_balance=quote_bal)
+                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
     except PlanError as exc:
         print(fmt.red(f"  {exc}"))
         return 4
@@ -1709,22 +1888,16 @@ def cmd_arb_run(args) -> int:
         print("    " + line)
     for n in plan.notes:
         _wrap_note(n, indent="    note: ")
+    if gas_note:
+        _wrap_note(gas_note, indent="    note: ")
 
-    # Only --execute needs the private key; a dry run just needs the address.
-    sender, account, wpath = _sender(args, need_key=bool(args.execute))
     compiled = load_build(args.contract)
     flash = contract_factory(provider.w3, contract_address, compiled.abi)
 
     print(f"\n  contract  {contract_address}")
     print(f"  wallet    {sender}")
 
-    data = flash.encode_abi(abi_element_identifier="arbitrage", args=plan.call_args) \
-        if hasattr(flash, "encode_abi") else None
-    if data is None:
-        # web3 6/7 spell this differently.
-        data = flash.functions.arbitrage(*plan.call_args).build_transaction()["data"]
-    if isinstance(data, str):
-        data = bytes.fromhex(data[2:])
+    data = _encode_arbitrage(flash, plan)
 
     tx = {"from": sender, "to": contract_address, "data": data, "value": 0,
           "chainId": net.chain_id}
@@ -1759,9 +1932,12 @@ def cmd_arb_run(args) -> int:
         account, wpath = _load_wallet(args)
 
     print(fmt.cyan("\n  sending…"))
+    if args.private:
+        print(fmt.dim(f"  submitting through the private relay {args.private} "
+                      f"— this transaction will not appear in the public mempool"))
     try:
         receipt = send_and_wait(provider.w3, account, tx, timeout=args.timeout,
-                                abi=compiled.abi)
+                                abi=compiled.abi, submit_url=args.private)
     except RevertedTx as exc:
         print(fmt.red(f"  REVERTED  {exc.tx_hash}"))
         print(fmt.red(f"  reason    {exc.reason}"))
@@ -1793,6 +1969,167 @@ def cmd_arb_run(args) -> int:
         print(f"    {verb:<14} {profit / 1e18:+,.8f} {quote_symbol}")
     else:
         print(fmt.yellow("  the transaction mined but emitted no ArbitrageExecuted event"))
+    return 0
+
+
+def cmd_arb_survey(args) -> int:
+    """
+    Dry-run the planner in a loop, logging every iteration's all-in economics.
+
+    This is the evidence-gathering step, not a trading command: it never
+    deploys, never signs, never sends. Each iteration scans the venues, builds
+    the plan the executor WOULD send, prices it exactly as `arb run` would
+    (gas floor included), and appends one JSONL line to the log with the net
+    edge after flash fee and gas.
+
+    The question it exists to answer is the one testnet cannot: does a real,
+    recurring edge survive all costs on this chain, at this size? A week of
+    these lines is the only honest way to answer it. Rows are appended, so
+    repeated runs accumulate history instead of replacing it.
+    """
+    import json as _json
+    import time
+
+    from arb.executor import PlanError, plan_arbitrage
+    from config import get_venue, token_address, venues_for
+    from dex.cross import scan_venues
+    from dex.fetcher import ChainReader
+
+    settings = Settings()
+    _apply_overrides(args, settings)
+    net, provider = _connect(settings)
+
+    base_symbol = settings.base_symbol.upper()
+    quote_symbol = settings.quote_symbol.upper()
+    try:
+        base = token_address(net, base_symbol)
+        quote = token_address(net, quote_symbol)
+    except KeyError as exc:
+        print(fmt.red(f"  {exc}"))
+        return 2
+
+    venues = ([get_venue(net.key, v.strip()) for v in args.venues.split(",") if v.strip()]
+              if args.venues else venues_for(net.key))
+
+    log_path = pathlib.Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(fmt.banner(f"ARB  ·  survey on {net.name}  ·  {base_symbol}/{quote_symbol}"))
+    print(f"  size     {settings.trade_size_base:g} {base_symbol} per iteration")
+    print(f"  budget   {args.iterations} iterations, {args.interval:g}s apart"
+          + (f", at most {args.duration:g}s total" if args.duration else ""))
+    print(f"  log      {log_path}")
+    print(fmt.dim("  this command never signs or sends anything"))
+
+    rows = []
+    started = time.time()
+    net_bps_seen = []
+    for i in range(1, args.iterations + 1):
+        if args.duration and (time.time() - started) >= args.duration:
+            print(fmt.dim(f"  time budget reached after {i - 1} iterations"))
+            break
+        t0 = time.time()
+        row = {"ts": round(time.time(), 3), "iteration": i,
+               "network": net.key, "pair": f"{base_symbol}/{quote_symbol}",
+               "size_base": settings.trade_size_base}
+        try:
+            reader = ChainReader(provider, net)
+            res = scan_venues(
+                provider, net, base, quote, base_symbol, quote_symbol,
+                settings.trade_size_base, venues, reader=reader,
+                max_impact_bps=(args.max_impact if args.max_impact is not None
+                                else settings.max_impact_bps),
+                all_tiers=not args.deepest_only,
+            )
+            row["block"] = res.block_number
+            row["legs_usable"] = len(res.usable)
+            row["mid_spread_usable_bps"] = round(res.mid_spread_usable_bps, 2)
+
+            v3_venue = next((v for v in venues if v.version == "v3"), None)
+
+            def pool_for_fee(fee_pips: int) -> str:
+                if v3_venue is None:
+                    return ""
+                return _v3_reader_for(reader, v3_venue).pool_for_fee(base, quote, fee_pips)
+
+            buy_cost = _v2_buy_cost_fn(reader, venues, base, quote)
+            plan = plan_arbitrage(
+                res, base, quote, pool_for_fee,
+                slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+                quote_decimals=_decimals_on_chain(reader, quote),
+                base_decimals=_decimals_on_chain(reader, base),
+                v3_uses_deadline=_v3_router_shape(provider.w3, res),
+                flash_pool_quote_balance=_pool_quote_balance_fn(provider.w3, quote),
+                min_profit_buffer_bps=args.min_profit_buffer,
+                v2_buy_cost_wei=buy_cost(settings.trade_size_base) if buy_cost else None,
+            )
+            # No contract and no sender here, so gas is priced from the fixed
+            # unit estimate x the live gas price — the same arithmetic the
+            # floor uses, minus the simulation.
+            gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
+                provider, net, settings, res, plan, sender=None, contract_address=None)
+
+            from arb.deployer import gas_price_wei as _gas_price_wei
+            from decimal import Decimal
+            row["gas_price_used_wei"] = _gas_price_wei(provider.w3)
+            try:
+                row["gas_price_market_wei"] = int(provider.w3.eth.gas_price)
+            except Exception:  # noqa: BLE001
+                pass
+            gross_wei = int(Decimal(plan.flash_amount)
+                            * Decimal(str(plan.expected_gross_bps)) / Decimal(10_000))
+            net_wei = gross_wei - plan.expected_flash_fee - gas_quote
+            net_bps = float(Decimal(net_wei) / Decimal(plan.flash_amount) * Decimal(10_000)) \
+                if plan.flash_amount else 0.0
+            clears = net_wei >= max(plan.min_profit_floor, args.min_profit)
+
+            row.update({
+                "buy": plan.buy_label, "sell": plan.sell_label,
+                "buy_exec": plan.buy_exec, "sell_exec": plan.sell_exec,
+                "gross_bps": round(plan.expected_gross_bps, 2),
+                "flash_fee_wei": plan.expected_flash_fee,
+                "gas_quote_wei": gas_quote, "gas_units": gas_units,
+                "floor_wei": plan.min_profit_floor,
+                "net_wei": net_wei, "net_bps": round(net_bps, 2),
+                "clears_floor": clears,
+                "expected_revert": "EXPECTED TO REVERT" in " ".join(plan.notes),
+                "notes": plan.notes,
+            })
+            if gas_note:
+                row["gas_note"] = gas_note
+            net_bps_seen.append(net_bps)
+            mark = fmt.green("CLEARS") if clears else fmt.dim("below ")
+            print(f"  [{i:>3}] blk {row.get('block', '?'):>10}  {mark}  "
+                  f"gross {row['gross_bps']:>+8.2f} bps  net {net_bps:>+8.2f} bps  "
+                  f"({plan.buy_label} -> {plan.sell_label})")
+        except PlanError as exc:
+            row["plan_error"] = str(exc)
+            print(f"  [{i:>3}] no plan: {exc}")
+        except Exception as exc:  # noqa: BLE001 - one bad iteration must not kill the survey
+            row["error"] = f"{type(exc).__name__}: {exc}"
+            print(f"  [{i:>3}] {type(exc).__name__}: {exc}")
+        row["elapsed_s"] = round(time.time() - t0, 3)
+        rows.append(row)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(_json.dumps(row, default=str) + "\n")
+
+        if i < args.iterations:
+            time.sleep(args.interval)
+
+    print(fmt.cyan("\n  SUMMARY"))
+    print(f"    iterations   {len(rows)}")
+    if net_bps_seen:
+        net_bps_seen_sorted = sorted(net_bps_seen)
+        wins = [b for b in net_bps_seen if b > 0]
+        med = net_bps_seen_sorted[len(net_bps_seen_sorted) // 2]
+        print(f"    net bps      best {max(net_bps_seen):+.2f}   median {med:+.2f}   "
+              f"worst {min(net_bps_seen):+.2f}")
+        print(f"    positive     {len(wins)} of {len(net_bps_seen)} iterations "
+              f"cleared all costs after the flash fee")
+        if not wins:
+            print(fmt.yellow("    No iteration beat its own costs. Executing this loop "
+                             "for real would be buying gas, not edge."))
+    print(f"    log          {log_path}  ({len(rows)} rows appended)")
     return 0
 
 
@@ -2064,7 +2401,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-profit", type=int, dest="min_profit", default=0,
                     help="minimum wei of quote token to keep, or the contract reverts "
                          "the whole transaction (default 0 = never end up with less "
-                         "than you started)")
+                         "than you started). The planner raises this to at least the "
+                         "gas cost plus the buffer below; this flag may only raise it")
+    ap.add_argument("--min-profit-buffer", type=float, dest="min_profit_buffer",
+                    default=2500.0, metavar="BPS",
+                    help="margin added on top of the gas-cost floor, in bps (default "
+                         "2500 = 25%%, absorbing gas-price and price drift between "
+                         "estimation and inclusion)")
     ap.set_defaults(func=cmd_arb_plan)
 
     ap = asub.add_parser("run", help="plan, then sign and broadcast the arbitrage")
@@ -2074,13 +2417,49 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-impact", type=float, dest="max_impact", default=None)
     ap.add_argument("--deepest-only", action="store_true")
     ap.add_argument("--slippage", type=float, default=100.0)
-    ap.add_argument("--min-profit", type=int, dest="min_profit", default=0)
+    ap.add_argument("--min-profit", type=int, dest="min_profit", default=0,
+                    help="minimum wei of quote token to keep. The planner raises this "
+                         "to at least the gas cost plus the buffer; it may only raise it")
+    ap.add_argument("--min-profit-buffer", type=float, dest="min_profit_buffer",
+                    default=2500.0, metavar="BPS",
+                    help="margin added on top of the gas-cost floor, in bps "
+                         "(default 2500 = 25%%)")
     ap.add_argument("--contract", default="FlashArb")
     ap.add_argument("--address", help="contract address (default: the recorded deployment)")
+    ap.add_argument("--private", metavar="URL", default=None,
+                    help="broadcast the signed transaction through this private/"
+                         "MEV-protected RPC instead of the public mempool (e.g. "
+                         "https://bsc.blockrazor.xyz). The BNB Chain mempool is "
+                         "watched by searchers; on a public broadcast your floors "
+                         "stop a theft but not the EV loss of being picked off. "
+                         "Fails loudly if the relay is unreachable — it never "
+                         "silently falls back to the public path")
     ap.add_argument("--execute", action="store_true",
                     help="actually broadcast. Without it this is a dry run that "
                          "shows the plan and the gas estimate only")
     ap.set_defaults(func=cmd_arb_run)
+
+    ap = asub.add_parser("survey",
+                         help="dry-run the planner in a loop, logging all-in economics "
+                              "per iteration — the evidence step before real size")
+    common(ap)
+    ap.add_argument("--venues", help="comma-separated venue keys (default: all for the network)")
+    ap.add_argument("--max-impact", type=float, dest="max_impact", default=None)
+    ap.add_argument("--deepest-only", action="store_true")
+    ap.add_argument("--slippage", type=float, default=100.0)
+    ap.add_argument("--min-profit", type=int, dest="min_profit", default=0)
+    ap.add_argument("--min-profit-buffer", type=float, dest="min_profit_buffer",
+                    default=2500.0, metavar="BPS")
+    ap.add_argument("--iterations", type=int, default=10,
+                    help="how many scans to run (default 10)")
+    ap.add_argument("--interval", type=float, default=12.0,
+                    help="seconds between scans (default 12 = one BNB Chain block)")
+    ap.add_argument("--duration", type=float, default=0.0, metavar="SECONDS",
+                    help="stop early after this many seconds, whatever --iterations "
+                         "says (default 0 = no time limit)")
+    ap.add_argument("--log", default="logs/arb_survey.jsonl",
+                    help="JSONL file to append results to (default logs/arb_survey.jsonl)")
+    ap.set_defaults(func=cmd_arb_survey)
 
     ap = asub.add_parser("status", help="check the deployment and what it holds")
     common(ap)

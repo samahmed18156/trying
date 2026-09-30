@@ -1,0 +1,3061 @@
+diff --git a/NOTES-production.md b/NOTES-production.md
+new file mode 100644
+index 0000000..db5646e
+--- /dev/null
++++ b/NOTES-production.md
+@@ -0,0 +1,246 @@
++# Before real money: the five gates, and what we found
++
++This file is the answer to "is the flash-arb bot ready for real trade?" as of
++2026-09-29, and the checklist to re-run before answering it again. It is written
++to be re-read when you have forgotten everything, by someone with an unshakeable
++belief that the maths is probably fine. Read the findings at the bottom first.
++
++**Verdict: do not trade real size yet. Run the micro-drill (gate 5) at most.**
++Not because the code is bad — the mechanism is now proven end to end against
++real BNB Chain state — but because the measured opportunity is negative, and
++that measurement only became trustworthy today.
++
++---
++
++## 1. Fork tests: the contract, on real pools — GREEN
++
++`pytest tests/test_fork.py -q` → **6 passed**
++
++anvil forks BNB Chain mainnet; the contract is compiled with the pinned solc and
++deployed onto the fork; the transaction sent is the exact `plan.call_args` the
++planner would send. No mocks, no simulated pools.
++
++| test | what it proves |
++|---|---|
++| `test_live_plan_either_profits_or_reverts_cleanly` | whatever the market is doing, the plan either profits and clears its own floor, or reverts with balances unchanged — never a partial execution |
++| `test_manufactured_edge_profits_though_real_pools` | with a manufactured ~2% edge, the round trip profits, the event's `profit` equals the contract's balance change, and the size is what the numbers predict |
++| `test_impossible_min_profit_reverts_without_moving_tokens` | an unreachable floor reverts with `Unprofitable`, nothing moves |
++| `test_borrowing_from_the_leg2_pool_reverts_with_lok` | the LOK trap is real, and `choose_flash_pool` avoiding it is load-bearing |
++| `test_withdraw_is_owner_only_then_moves_exactly_that_amount` | `withdrawTokens` refuses a non-owner (`NotOwner`) and moves exactly the requested amount for the owner |
++| `test_preview_flash_fee_matches_the_planner` | the planner's `ceil(amount × tier / 1e6)` equals the pool's own figure, to the wei |
++
++**Two things to know about running it.**
++
++* The fork needs ARCHIVE state, even forking at head, because anvil fetches state
++  lazily and the first cold slot a token read touches may be years old. Free
++  endpoints that actually serve it: `api.zan.top/bsc-mainnet`,
++  `bsc-mainnet.public.blastapi.io`. `bsc-rpc.publicnode.com` refuses
++  ("Archive requests require a personal token") and `bsc-dataseed.binance.org`
++  says "missing trie node". The fixture probes candidates and picks one that can
++  serve; override with `FORK_RPC_URL=...`.
++* The profit test MANUFACTURES its edge by writing the V2 pair's reserves
++  (`anvil_setStorageAt`, ~2% skew) rather than waiting for a real mispricing —
++  otherwise the suite would pass or fail with the market, which is not a test.
++  The reserves slot is *discovered* by matching `getReserves()`, never assumed:
++  PancakeSwap's pair stores its reserves in slot 8, not Uniswap's 6.
++  Note the skew survives exactly one swap — V2's `swap()` ends by syncing
++  reserves back to real balances — so the fixture re-applies it per test.
++
++## 2. Profit floor ≥ gas + buffer — DONE
++
++`min_profit` can no longer be 0. `plan_arbitrage` raises it to
++`gas cost in quote-token wei + 25%` (buffer settable with `--min-profit-buffer`)
++and the CLI can only raise it further. Rationale: `min_profit` is the contract's
++only economic gate, and a round trip that clears 1 wei of profit while spending
++331k gas of cost is a loss the contract is happy to call a win.
++
++* Gas is converted into the borrow token correctly: WBNB *is* BNB so the
++  conversion is the identity; for a non-wrapped quote the planner uses the
++  scan's USDT-per-BNB (and if that cannot be found it sets NO floor and SAYS so
++  rather than inventing a rate).
++* **Gas price: `gas_price_wei` pays 2 gwei while BNB Chain's own `eth_gasPrice`
++  is 0.05 gwei — a 40x overpay.** It is the price the floor inherits, so it is
++  conservative, but it is real money: 600k gas is ~0.92 USDT at 2 gwei and
++  ~0.023 USDT at 0.05. Set `GAS_PRICE_GWEI=0.05` to pay market; leave it unset
++  to keep buying priority. Both the floor and the send use the same function, so
++  they cannot disagree.
++
++## 3. A week of dry runs, logged — TOOL READY, EVIDENCE COLLECTED (and bad news)
++
++```
++python main.py arb survey --network bsc --base WBNB --quote USDT --size 1 \
++    --iterations 2000 --interval 12 --duration 604800 --log logs/arb_survey.jsonl
++```
++
++`arb survey` never signs, never sends. Each iteration scans, builds the plan the
++executor *would* send, prices it exactly as `arb run` does (gas floor included),
++and appends one JSONL row: prices, gross bps, flash fee, gas, net bps, whether it
++clears, and why not. Rows accumulate across runs.
++
++### What five iterations on BSC mainnet actually showed
++
++| log | gross bps | net bps | clears |
++|---|---|---|---|
++| `logs/arb_survey_before_buy_cost_fix.jsonl` | +27.9, +29.3 | +10.8, +12.2 | **yes** |
++| `logs/arb_survey.jsonl` | −25.2, −18.8, −20.5, −16.2, −25.5 | −42.2 … −33.2 | **no** |
++
++Same pair, same size, same route shape. The only difference is a bug fix
++(finding #1 below). **The "profitable" readings were the bug.** On this evidence
++there is no edge in the V2→V3 WBNB/USDT route at 1 WBNB size: the route loses
++16–25 bps before costs and 33–42 bps after them.
++
++### The cost floor a real edge has to clear (BSC, WBNB/USDT, 1 WBNB)
++
++| item | bps |
++|---|---|
++| PancakeSwap V2 fee (on leg 1's input) | 25 |
++| flash-loan fee (tier-500 lending pool) | 5 |
++| V3 tier-100 fee (leg 2) | 1 |
++| gas, 600k units @ 2 gwei, ~765 USDT/BNB | ~12 |
++| gas @ 0.05 gwei (`GAS_PRICE_GWEI=0.05`) | ~0.3 |
++| **total friction** | **~31 bps, ~43 bps with default gas** |
++
++Measured route friction: median −37 bps at 1 WBNB. Cheaper gas does not rescue
++a 20 bps negative gross.
++
++## 4. Private submission — IMPLEMENTED, decision recorded
++
++```
++python main.py arb run --network bsc --private https://bsc.blockrazor.xyz --execute
++```
++
++`send_and_wait(submit_url=...)` broadcasts the signed transaction through any
++drop-in private/MEV-protected RPC (BlockRazor, GetBlock+Merkle, a builder
++endpoint) while reads and the receipt wait stay on the normal provider. It fails
++LOUDLY if the relay is unreachable — it never silently falls back to the public
++mempool, because that would defeat the only thing `--private` is for.
++
++The reasoning, the EV arithmetic and the decision rule are in
++`docs/ev-private-memo.md`. Short version: the floors mean a searcher cannot take
++money *from* you, but they can turn your edge into their edge and your gas into a
++fee paid for nothing. At today's measured −20 bps gross there is nothing to
++protect and nothing to trade; if the survey ever shows a real edge, that edge is
++worth more than the relay's cost and latency, so private submission is the
++default posture.
++
++## 5. The micro-drill — RUNBOOK, NOT YET RUN
++
++Only after the survey shows positive net bps for a sustained period (a week of
++`arb_survey` rows, not five samples) and a positive median.
++
++1. Deploy on BSC mainnet: `python main.py arb deploy --network bsc` — gas is
++   real, ~0.001 BNB.
++2. Fund the wallet with **only what the drill needs**. Not the trading float.
++   The owner key can withdraw everything the contract holds; treat the wallet as
++   the contract's security boundary.
++3. Verify the source on BscScan so the deployed bytecode is public (and so the
++   constructor cannot have been tampered with).
++4. `python main.py arb survey --network bsc --iterations 20 --log logs/pre_drill.jsonl`
++   then confirm at least one row with `clears_floor: true`.
++5. `python main.py arb plan --network bsc --size <small>` and read every line,
++   especially the borrow amount and the floor.
++6. `python main.py arb run --network bsc --size <small> --private <relay> --execute`
++   at a notional where losing the whole gas cost is irrelevant (~0.1–1 USDT).
++7. `python main.py arb status --network bsc` → confirm the profit is in the
++   contract.
++8. `python main.py arb withdraw --network bsc --token USDT --all --execute` →
++   confirm it lands in the wallet. Sweep after every run, always.
++9. Record from BscScan: tx hash, gas used, and whether the `ArbitrageExecuted`
++   profit matches what the plan predicted. **That comparison is the only test of
++   the planner's accuracy that money can buy — and the bug in finding #1 is
++   exactly what it would have caught.**
++
++---
++
++## Findings from this pass
++
++### 1. The planner understated the cost of buying by 2× the venue fee (FIXED)
++
++The scan reports, for every venue, what you receive per base SOLD into it
++(`dex/fetcher.py` sizes every quote as `amount_in = trade size`). The executor
++used the cheap venue's **sell** quote as the **cost of buying** there. Selling 1
++base at mid returns `mid×(1−f)`; buying 1 base costs `mid/(1−f) ≈ mid×(1+f)`.
++
++Measured against PancakeSwap V2's live reserves:
++
++```
++sell quote (what the planner used) : 753.6651 USDT/WBNB
++getAmountIn (the real cost)        : 757.4768 USDT/WBNB
++understated by                     : 50.3 bps = 2 × the 25 bps fee
++```
++
++Consequences: the loan was sized ~50 bps too small, leg 1 returned ~0.995 base
++instead of 1.0, leg 2 sold that for ~50 bps less than promised, and plans the
++planner accepted as profitable reverted with `CannotRepay` (observed on the
++fork: held 751.12 vs owed 753.58 USDT). Every survey row before the fix was
++optimistic by that amount, which is why the "clean" runs looked profitable.
++
++Fix: `plan_arbitrage(..., v2_buy_cost_wei=...)` — the CLI now passes the exact
++`getAmountIn` cost from live raw reserves. The planner refuses to silently use
++the optimistic number: without a buy cost it adds a note saying the edge is
++optimistic and by roughly what.
++
++**This is the finding that matters.** No amount of testnet success would have
++surfaced it: on BSC testnet the V2/V3 dislocation was ~20%, which swamps 50 bps.
++
++### 2. Mainnet venue registry was incomplete — BSC/ETH/Base Uniswap V3 had no router (FIXED)
++
++`arb plan --network bsc` died with `(v2=0x10ED…, v3=MISSING)`: the dearest
++usable V3 venue was Uniswap V3, whose config had a factory and no router. Added,
++each verified on chain (bytecode present, `factory()` returns the configured
++factory, selector shape probed — not copied from a blog post):
++
++| chain | router | shape |
++|---|---|---|
++| BSC | `0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2` | SwapRouter02, 7-field (no deadline) |
++| Ethereum | `0xE592427A0AEce92De3Edee1F18E0157C05861564` | SwapRouter, 8-field |
++| Base | `0x2626664c2603336E57B271c5C0b26F421741e481` | SwapRouter02, 7-field |
++
++Belt and braces: `best_leg` now excludes legs whose venue has no router, so a
++configuration gap can never again masquerade as "no route exists".
++
++### 3. The planner's revert prediction named the wrong guard (FIXED)
++
++Notes said "EXPECTED TO REVERT with Unprofitable". On chain, a route that comes
++back short of the loan itself reverts earlier with `CannotRepay` — that guard
++runs before the repay, `Unprofitable` after it. The notes now name both and say
++which fires when.
++
++### 4. Test suite was not green, and could not have been (FIXED)
++
++`pytest tests/` reported `1 passed, 1 error`: the offline suite's registration
++decorator was named `test`, so pytest collected it as an item with a required
++`fn` argument → `fixture 'fn' not found`. Renamed to `case`, plus a single
++`test_offline_maths_suite` bridge so `pytest tests/` and `main.py selftest`
++can never disagree. Now: **94/94 offline, 2 passed under pytest.**
++
++---
++
++## What is still NOT proven
++
++* **That an edge exists at all.** Five samples say no. The survey has to run for
++  a week before any answer is worth acting on.
++* **Live private-relay behaviour.** The code path is unit-tested for failure and
++  the relay protocol is plain `eth_sendRawTransaction`, but no transaction has
++  been sent through BlockRazor/GetBlock from here.
++* **The seeded opportunity, if one appears.** A persistent mid-price gap against
++  a thin pool is a liquidity artefact, not money (see `dex/cross.py`'s own
++  notes on the Uniswap V3 0.30% pool: 90x thinner than the 0.01% pool, which is
++  *why* it is mispriced). Size into it and the impact eats the edge.
++* **Reorg / dropped-transaction handling.** There is none. A transaction that
++  does not mine within `--timeout` is reported, not replaced or re-priced.
++* **Key management at size.** The owner key can withdraw everything the contract
++  ever holds. Do not let that key's exposure exceed the drill.
++
++## Standing rules
++
++1. The contract's profit check is the only protection that counts; everything
++   off-chain is advisory. Keep `min_profit` above gas — the planner now enforces
++   it and you cannot lower it from the CLI.
++2. Never run `--execute` without first seeing the plan's floor printed and a
++   `survey` row that clears it.
++3. Sweep profit out of the contract after every run (`arb withdraw --all`).
++4. Re-run `pytest tests/ -q` and `pytest tests/test_fork.py -q` after ANY change
++   to `arb/`, `config.py`, or `contracts/`.
++5. If the survey shows positive net bps, believe it only after it survives a
++   different size (`--size 0.1` and `--size 10`) and a different hour.
+diff --git a/UPGRADE-2026-09-30.md b/UPGRADE-2026-09-30.md
+new file mode 100644
+index 0000000..d6486e3
+--- /dev/null
++++ b/UPGRADE-2026-09-30.md
+@@ -0,0 +1,65 @@
++# Upgrade — 2026-09-30
++
++Five production-readiness gates, plus the bugs they uncovered. Full write-up in
++**`NOTES-production.md`** — read that first; this file is just the index.
++
++## What changed
++
++| file | change |
++|---|---|
++| `arb/executor.py` | `min_profit` floor (gas + 25% buffer) so a run can never "profit" below its own gas cost; `v2_buy_cost_wei` — loan sized from leg 1's real `getAmountIn` cost; `best_leg` refuses venues with no router; revert-prediction notes name the right guard |
++| `arb/deployer.py` | `send_and_wait(..., submit_url=)` — private/MEV-protected broadcast that fails loudly instead of falling back to the public mempool; `GAS_PRICE_GWEI` override (default still 2 gwei vs BSC's ~0.05 market) |
++| `main.py` | `arb survey` (dry-run loop, JSONL evidence log); `--private`, `--min-profit-buffer` flags; gas→quote conversion and two-pass planning in `arb plan` / `arb run` |
++| `config.py` | Uniswap V3 routers added for **BSC, Ethereum and Base** (each verified on chain: bytecode, `factory()`, selector shape). BSC planning previously died with `v3=MISSING` |
++| `tests/test_math.py` | fixed the pytest collection collision (`1 passed, 1 error` → green); 10 new offline cases; `test_offline_maths_suite` bridge so pytest and `main.py selftest` agree |
++| `tests/test_fork.py` | **new** — 6 tests against a BNB Chain mainnet fork: profit on real pools, revert-without-moving-tokens, LOK trap, owner-only withdraw, flash-fee agreement |
++| `logs/arb_survey*.jsonl` | the evidence: `before_buy_cost_fix` (looked profitable) vs `after` (negative — the honest number) |
++| `docs/ev-private-memo.md` | public-vs-private submission decision and arithmetic |
++
++## Two ways to use this zip
++
++**A. Review the diff, then merge (recommended).**
++The zip keeps `.git`, so from the project root:
++
++```bash
++git status          # shows exactly which files the upgrade touched
++git diff --stat
++git diff arb/executor.py
++```
++
++Or apply the standalone patch to your own checkout:
++
++```bash
++git apply --check upgrade-2026-09-30.patch   # verify it applies
++git apply upgrade-2026-09-30.patch
++```
++
++**B. Replace your copy.** The tree is complete and self-contained apart from
++`.git/config` (stripped) and caches. Re-run the two suites after either route.
++
++Note: the patch is code and docs only. `logs/arb_survey*.jsonl` (the evidence
++`NOTES-production.md` cites) are gitignored, so they are in the full tree but not
++in the patch. `build/` is likewise not shipped — it regenerates on first compile.
++
++## Verify it works
++
++```bash
++python main.py selftest                    # 94/94 offline, no network
++python -m pytest tests/ -q                 # 2 passed
++python -m pytest tests/test_fork.py -q     # 6 passed (needs Foundry + archive RPC)
++```
++
++Fork tests need `anvil`. They probe for a BNB RPC that can serve archive state
++(`api.zan.top`, `bsc-mainnet.public.blastapi.io` work; publicnode does not) and
++skip cleanly if neither anvil nor a fork source is available.
++
++## Read before trading
++
++1. `NOTES-production.md` — findings, the cost floor table, the micro-drill runbook.
++2. `docs/ev-private-memo.md` — why `--private` is the default posture.
++
++**Headline: do not trade real size yet.** Not for code-quality reasons — the
++contract is now proven end to end against real mainnet state — but because the
++measured edge on the V2→V3 WBNB/USDT route is **negative** (−16 to −25 bps gross,
++−33 to −42 bps net, at 1 WBNB). The earlier "profitable" survey rows were a
++2×-fee modelling bug that is now fixed.
+diff --git a/arb/deployer.py b/arb/deployer.py
+index 49a934e..d9944f7 100644
+--- a/arb/deployer.py
++++ b/arb/deployer.py
+@@ -85,7 +85,21 @@ def gas_price_wei(w3) -> int:
+     Chain accepts both, and a chain that reports baseFeePerGas but is sent a
+     legacy transaction still works — but the reverse (sending 1559 fields to a
+     chain with no base fee) does not, so the fallback order matters.
++
++    THIS IS THE PRICE THE TRANSACTION IS SENT AT, and therefore the price the
++    planner's profit floor is computed from — the two must agree or the floor
++    would be solving for a cost the transaction does not pay. Set
++    GAS_PRICE_GWEI in the environment to override it: measured on BNB Chain in
++    September 2026, the chain's own `eth_gasPrice` was 0.05 gwei while this
++    function returns 2 gwei, a 40x overpay that is defensible as priority for a
++    contested inclusion and material as a cost when the edge is thin. An
++    operator who wants to pay market sets GAS_PRICE_GWEI=0.05.
+     """
++    import os
++
++    override = os.getenv("GAS_PRICE_GWEI")
++    if override:
++        return int(float(override) * 10 ** 9)
+     try:
+         latest = w3.eth.get_block("latest")
+         base = getattr(latest, "baseFeePerGas", None)
+@@ -437,15 +451,74 @@ def to_hex(value) -> str:
+     return str(value)
+ 
+ 
++def _send_raw_private(submit_url: str, raw) -> Any:
++    """
++    Broadcast a signed raw transaction through a private/MEV-protected RPC.
++
++    These providers (BlockRazor, GetBlock's MEV-protected endpoints, builder
++    APIs) are deliberately drop-in: they speak plain JSON-RPC
++    `eth_sendRawTransaction` like any other endpoint, and the privacy lives
++    server-side in how they route what they receive. So this is an HTTP POST,
++    not a bespoke protocol — and it fails loudly rather than falling back to
++    the public mempool. Quietly re-sending a transaction the caller asked to
++    keep private would be the one bug this function must never have.
++    """
++    import json
++    import uuid
++
++    import requests
++
++    payload = {
++        "jsonrpc": "2.0",
++        "id": uuid.uuid4().hex,
++        "method": "eth_sendRawTransaction",
++        "params": [to_hex(raw)],
++    }
++    try:
++        resp = requests.post(submit_url, json=payload, timeout=30)
++        resp.raise_for_status()
++        body = resp.json()
++    except Exception as exc:  # noqa: BLE001
++        raise DeployError(
++            f"private submission to {submit_url} failed: {type(exc).__name__}: {exc}. "
++            f"Nothing was broadcast to the PUBLIC mempool either — the request did "
++            f"not reach the relay. Fix connectivity or drop --private and accept "
++            f"public visibility."
++        ) from exc
++    if "error" in body and body["error"]:
++        err = body["error"]
++        raise DeployError(
++            f"the private relay {submit_url} refused the transaction: {err}. "
++            f"Nothing was broadcast publicly."
++        )
++    result = body.get("result")
++    if not result:
++        raise DeployError(
++            f"the private relay {submit_url} returned no transaction hash: {body!r}"
++        )
++    return result
++
++
+ def send_and_wait(w3, account, tx: Dict[str, Any], timeout: int = 240,
+-                  abi: Optional[list] = None) -> Dict[str, Any]:
++                  abi: Optional[list] = None,
++                  submit_url: Optional[str] = None) -> Dict[str, Any]:
+     """
+     Sign, send, and wait for the receipt. Raises RevertedTx with a decoded
+     reason if it mined and reverted, DeployError if it never mined.
++
++    `submit_url`, when given, is where the SIGNED raw transaction is broadcast
++    instead of the default provider — an MEV-protected or private-mempool RPC
++    (BlockRazor, GetBlock+Merkle, a builder endpoint). Reads and the receipt
++    wait still go through `w3`: only the broadcast path changes. Sending is the
++    moment a transaction becomes visible; a private submission path is the only
++    lever that changes who sees it before it lands.
+     """
+     signed = account.sign_transaction(tx)
+     raw = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction")
+-    tx_hash = w3.eth.send_raw_transaction(raw)
++    if submit_url:
++        tx_hash = _send_raw_private(submit_url, raw)
++    else:
++        tx_hash = w3.eth.send_raw_transaction(raw)
+     hexed = to_hex(tx_hash)
+ 
+     try:
+diff --git a/arb/executor.py b/arb/executor.py
+index 540e174..ac75688 100644
+--- a/arb/executor.py
++++ b/arb/executor.py
+@@ -60,6 +60,11 @@ class ArbPlan:
+     v3_fee: int
+     v3_amount_out_min: int
+     min_profit: int = 0
++    # Where min_profit came from. `min_profit_floor` is the gas-cost floor the
++    # planner derived (0 when no gas cost was supplied); `gas_cost_quote_wei` is
++    # the estimate it was derived from. Human-readable provenance, not sent.
++    min_profit_floor: int = 0
++    gas_cost_quote_wei: int = 0
+     # Which exactInputSingle shape the V3 router implements: True for the 8-field
+     # one carrying `deadline`. Determined from the router's bytecode by
+     # v3_router_uses_deadline(); never guessed, because a wrong guess reverts with
+@@ -139,9 +144,40 @@ class ArbPlan:
+             f"repay    borrowed + flash fee (fee estimated at {self.expected_flash_fee:,} wei)",
+             f"require  profit >= {self.min_profit:,} wei or revert the whole transaction",
+         ]
++        if self.min_profit_floor:
++            out.append(
++                f"         floor = gas {self.gas_cost_quote_wei:,} wei + buffer "
++                f"({self.min_profit_floor:,} wei), the --min-profit setting may only raise it"
++            )
+         return out
+ 
+ 
++def gas_cost_in_quote_wei(gas_cost_native_wei: int, quote_is_wrapped_native: bool,
++                          quote_per_native: float = 1.0) -> int:
++    """
++    Express a native-gas cost in the borrow (quote) token's wei.
++
++    The profit check is denominated in the quote token; gas is paid in the
++    chain's native coin. On BNB Chain the quote is usually WBNB, which IS BNB
++    one-for-one, so the conversion is exact and free. If the quote is anything
++    else (USDT-denominated profit), the caller must pass `quote_per_native` —
++    the price of one native unit in quote-token units (e.g. 12 USDT per BNB) —
++    and when it cannot, the honest answer is 0 with a note, NOT a silently
++    wrong floor: a floor priced with a stale or wrong FX rate is worse than no
++    floor, because it looks enforced while measuring the wrong thing.
++    """
++    if gas_cost_native_wei <= 0:
++        return 0
++    if quote_is_wrapped_native:
++        return int(gas_cost_native_wei)
++    if quote_per_native <= 0:
++        return 0
++    from decimal import Decimal, ROUND_UP
++
++    value = Decimal(gas_cost_native_wei) * Decimal(str(quote_per_native))
++    return int(value.to_integral_value(rounding=ROUND_UP))  # round up: never under-price the floor
++
++
+ def to_wei(human: float, decimals: int = 18) -> int:
+     """
+     Convert a human amount to wei exactly.
+@@ -295,13 +331,25 @@ def checksum(addr: str) -> str:
+ 
+ def best_leg(res: CrossScanResult, version: str, side: str) -> Optional[VenueQuote]:
+     """
+-    The best USABLE leg of one protocol generation, for one side.
++    The best USABLE, EXECUTABLE leg of one protocol generation, for one side.
+ 
+     `side="buy"` takes the lowest executable price; `side="sell"` the highest.
+     Only usable legs are considered — a leg the depth gate rejected cannot be
+     traded, so its price is irrelevant however attractive it looks.
++
++    A leg whose venue has no router configured is also excluded: quoting it is
++    possible (the pool exists) but sending it is not, and choosing it produces
++    "no router address configured" at the very end of planning. That happened
++    on BSC mainnet, where Uniswap V3 was the dearest usable V3 venue and had no
++    router in config — the plan died on a configuration gap instead of trading
++    the best route it could actually execute. If NO candidate has a router the
++    full list is used, so the resulting error still names the missing router
++    rather than claiming there is no leg at all.
+     """
+     candidates = [q for q in res.usable if q.version == version]
++    executable = [q for q in candidates if q.router_address]
++    if executable:
++        candidates = executable
+     if not candidates:
+         return None
+     if side == "buy":
+@@ -408,6 +456,9 @@ def plan_arbitrage(
+     v3_uses_deadline: bool = True,
+     flash_fee_tiers: Sequence[int] = DEFAULT_FLASH_FEE_TIERS,
+     flash_pool_quote_balance: Optional[Callable[[str], int]] = None,
++    gas_cost_quote_wei: int = 0,
++    min_profit_buffer_bps: float = 2500.0,
++    v2_buy_cost_wei: Optional[int] = None,
+ ) -> ArbPlan:
+     """
+     Build an ArbPlan from a completed cross scan.
+@@ -483,7 +534,41 @@ def plan_arbitrage(
+     # and float truncation turns 0.0119 USDT into 0 wei.
+     # quote_decimals matters: USDT is 18 decimals on BNB Chain but 6 on Ethereum
+     # mainnet, and assuming 18 would inflate every amount on mainnet by 1e12.
+-    borrow_wei = to_wei(size * buy.exec_price, quote_decimals)
++    # WHAT THE LOAN MUST COVER
++    #
++    # `buy.exec_price` is a SELL quote: the scan reports, for every venue, what
++    # you receive per base SOLD into it (dex/fetcher.py: amount_in = size base).
++    # Using the cheap venue's sell quote as the cost of BUYING there is wrong by
++    # exactly twice that venue's fee: selling 1 base at mid returns mid*(1-f),
++    # while buying 1 base costs mid/(1-f) ~= mid*(1+f). Measured on BSC mainnet
++    # against PancakeSwap V2's real reserves: the sell quote said 753.6651 USDT
++    # per WBNB and getAmountIn said 757.4768 — 50.3 bps, i.e. 2 x the 25 bps fee.
++    #
++    # The consequence was not cosmetic. The loan was sized 50 bps too small, so
++    # leg 1 returned ~0.995 base instead of `size`, leg 2 sold that for ~50 bps
++    # less quote than the plan promised, and a plan the planner accepted as
++    # profitable reverted on chain with CannotRepay. That is the whole reason
++    # `v2_buy_cost_wei` exists: the caller passes the exact getAmountIn cost,
++    # computed from live reserves, and the gross edge is measured against it.
++    if v2_buy_cost_wei is not None and v2_buy_cost_wei > 0:
++        borrow_wei = int(v2_buy_cost_wei)
++        approx_borrow = to_wei(size * buy.exec_price, quote_decimals)
++        if borrow_wei > approx_borrow:
++            diff_bps = (borrow_wei - approx_borrow) / borrow_wei * BPS
++            notes.append(
++                f"the loan is sized from leg 1's real buy cost (getAmountIn on the "
++                f"pair's reserves): {borrow_wei:,} wei, which is {diff_bps:,.1f} bps MORE "
++                f"than the venue's sell quote ({approx_borrow:,} wei) implies. Buying "
++                f"costs more than selling pays — that spread is the fee paid twice."
++            )
++    else:
++        borrow_wei = to_wei(size * buy.exec_price, quote_decimals)
++        notes.append(
++            "the loan is sized from the buy venue's SELL quote, not its real buy "
++            "cost. That understates the price of buying by about twice that venue's "
++            "fee, so the edge below is optimistic by the same amount — pass the "
++            "venue's getAmountIn cost to plan_arbitrage to correct it."
++        )
+     back_wei = to_wei(size * sell.exec_price, quote_decimals)
+     if borrow_wei <= 0:
+         raise PlanError(
+@@ -531,9 +616,57 @@ def plan_arbitrage(
+     if gross_wei <= flash_fee:
+         notes.append(
+             f"the gross edge ({gross_bps:+,.1f} bps = {gross_wei:,} wei) does not cover "
+-            f"the flash fee ({flash_fee:,} wei), so this run is EXPECTED TO REVERT "
+-            f"with Unprofitable. That is the profit check working, not a bug — and "
+-            f"because it reverts, no tokens move and only gas is spent."
++            f"the flash fee ({flash_fee:,} wei), so this run is EXPECTED TO REVERT. "
++            f"Which check fires depends on how short it comes back: if the proceeds "
++            f"cannot even repay the loan it is CannotRepay (that guard runs first), and "
++            f"only if the loan is repaid but the profit is under the floor is it "
++            f"Unprofitable. Both are the contract working — and because it reverts, no "
++            f"tokens move and only gas is spent."
++        )
++
++    # ---- the profit floor: never plan a "win" that cannot pay for its own gas --
++    #
++    # `min_profit` is the contract's only economic gate: it reverts unless the
++    # round trip ends `min_profit` wei above where it started. Left at 0, a run
++    # that clears 1 wei of profit and 331k gas of cost reports PROFIT and loses
++    # money. The floor below makes that structurally impossible: whatever the
++    # caller asked for, the plan enforces at least (gas cost + buffer), in the
++    # borrow token, denominated in the same wei units as the profit check.
++    #
++    # The buffer is not padding for its own sake. Three things drift between
++    # estimation and inclusion: the gas price (base fee can move a few percent
++    # per block), the two pool prices (a floor set exactly at the estimate makes
++    # a merely-moved market revert), and the estimate itself is a simulation of
++    # a state that will be a block older when mined. 25% is deliberately loose
++    # on a chain where the whole cost is ~1e15 wei; tightening it saves pennies
++    # and reintroduces the exact failure this removes.
++    min_profit_floor = 0
++    if gas_cost_quote_wei > 0:
++        from decimal import Decimal
++
++        if min_profit_buffer_bps < 0:
++            raise PlanError(
++                f"min_profit_buffer_bps cannot be negative, got {min_profit_buffer_bps}"
++            )
++        keep = (Decimal(int(BPS)) + Decimal(str(min_profit_buffer_bps))) / Decimal(int(BPS))
++        min_profit_floor = int(Decimal(gas_cost_quote_wei) * keep) + 1  # round up
++    effective_min_profit = max(min_profit_wei, min_profit_floor)
++    if effective_min_profit > min_profit_wei:
++        notes.append(
++            f"--min-profit was {min_profit_wei:,} wei, below the cost of sending the "
++            f"transaction. Raised to {effective_min_profit:,} wei: estimated gas "
++            f"{gas_cost_quote_wei:,} wei in quote-token terms plus a "
++            f"{min_profit_buffer_bps / 100:.0f}% drift buffer. A trade that clears "
++            f"less than this is not a profit, it is a smaller loss."
++        )
++    net_expected = gross_wei - flash_fee
++    if net_expected < effective_min_profit:
++        notes.append(
++            f"expected net ({net_expected:,} wei after the flash fee) does not clear the "
++            f"{effective_min_profit:,} wei floor, so this run is EXPECTED TO REVERT — "
++            f"with Unprofitable if the loan is still repaid, or with CannotRepay if the "
++            f"proceeds fall short of the loan entirely (that guard runs first). Either "
++            f"way nothing moves but gas."
+         )
+ 
+     if leg2_pool and pool.lower() != leg2_pool.lower():
+@@ -576,7 +709,9 @@ def plan_arbitrage(
+         v3_token_out=quote_address,
+         v3_fee=sell.fee_pips,
+         v3_amount_out_min=v3_min,
+-        min_profit=min_profit_wei,
++        min_profit=effective_min_profit,
++        min_profit_floor=min_profit_floor,
++        gas_cost_quote_wei=gas_cost_quote_wei,
+         v3_uses_deadline=v3_uses_deadline,
+         buy_label=buy.label,
+         sell_label=sell.label,
+diff --git a/config.py b/config.py
+index c1be338..141ee39 100644
+--- a/config.py
++++ b/config.py
+@@ -260,6 +260,12 @@ VENUES: Dict[tuple, Venue] = {
+     ("ethereum", "uniswap_v3"): Venue(
+         key="uniswap_v3", dex="uniswap", version="v3", name="Uniswap V3",
+         factory="0x1F98431c8aD98523631AE4a59f267346ea31F984",
++        # SwapRouter (the original one, not SwapRouter02). Verified on chain:
++        # factory() returns the factory above and the bytecode contains the
++        # 8-field exactInputSingle selector, so `v3_router_uses_deadline`
++        # resolves to True. Without this address the executor refuses any plan
++        # whose sell leg lands here — which is how its absence was found.
++        router="0xE592427A0AEce92De3Edee1F18E0157C05861564",
+         quoter="0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
+         fee_tiers=_UNI_V3_TIERS, fee_tier_preference=_UNI_V3_PREF,
+     ),
+@@ -300,6 +306,13 @@ VENUES: Dict[tuple, Venue] = {
+     ("bsc", "uniswap_v3"): Venue(
+         key="uniswap_v3", dex="uniswap", version="v3", name="Uniswap V3",
+         factory="0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
++        # SwapRouter02 on BNB Chain. Verified on chain: factory() returns the
++        # factory above, and the bytecode carries the 7-field exactInputSingle
++        # (0x04e45aaf) and NOT the 8-field one — SwapRouter02 dropped the
++        # deadline parameter. `arb plan` on BSC mainnet failed with
++        # "v3=MISSING" before this was added, which is exactly the class of gap
++        # that only shows up the first time a chain is traded for real.
++        router="0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",
+         fee_tiers=_UNI_V3_TIERS, fee_tier_preference=_UNI_V3_PREF,
+     ),
+     # ---- Base -------------------------------------------------------------
+@@ -312,6 +325,9 @@ VENUES: Dict[tuple, Venue] = {
+     ("base", "uniswap_v3"): Venue(
+         key="uniswap_v3", dex="uniswap", version="v3", name="Uniswap V3",
+         factory="0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
++        # SwapRouter02, same shape as BSC's (7-field, no deadline). Verified on
++        # chain against the factory above.
++        router="0x2626664c2603336E57B271c5C0b26F421741e481",
+         quoter="0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
+         fee_tiers=_UNI_V3_TIERS, fee_tier_preference=_UNI_V3_PREF,
+     ),
+diff --git a/docs/ev-private-memo.md b/docs/ev-private-memo.md
+new file mode 100644
+index 0000000..59da321
+--- /dev/null
++++ b/docs/ev-private-memo.md
+@@ -0,0 +1,104 @@
++# Memo: public vs private transaction submission
++
++**Decision needed:** should arbitrage transactions be broadcast through a private
++/ MEV-protected relay, or is the public mempool acceptable?
++
++**Decision:** private submission by default (`--private <relay-url>`), with the
++public path used only for non-competitive transactions (deploy, withdraw, funding).
++This is a decision about *when an edge exists*, not about today: today's measured
++edge is negative and nothing should be sent at all.
++
++Written 2026-09-29. Re-read whenever the survey's median net bps turns positive.
++
++---
++
++## What the contract already protects
++
++The floors and the profit check mean a searcher **cannot take money out of the
++transaction**:
++
++* `v2_amount_out_min` / `v3_amount_out_min` are floors derived from each leg's own
++  executable price minus `--slippage` (default 100 bps).
++* `min_profit` is a floor on the whole round trip, now enforced at
++  gas cost + 25% buffer.
++* If any floor is breached the transaction reverts, unwinds, and costs only gas.
++
++So the exposure is **not theft**. It is:
++
++1. **Front-running.** A searcher sees your exact pools and sizes in the public
++   mempool, takes the same two legs first with a higher gas price, and your
++   transaction reverts (you pay gas) or gets filled at your floors (they take
++   the edge, you take the risk). The floors turn a loss into a break-even, not
++   into a win.
++2. **Back-running / sandwiching to your limits.** Your slots get consumed before
++   you land; your output sits exactly at the floor because that is the most
++   profitable way to fill you.
++3. **Being the liquidity provider for bots.** On a public broadcast, any edge
++   you can see, everyone can see. The value of having computed it is zero.
++
++## The arithmetic
++
++Per round trip on BSC at 1 WBNB notional, using measured numbers:
++
++| item | value |
++|---|---|
++| edge the planner must find to break even | ~31 bps + gas (~43 bps at default gas) |
++| measured gross edge (V2→V3, 5 samples) | −16 to −25 bps |
++| gas per attempt, 600k units @ 2 gwei | ~0.92 USDT (~12 bps at 1 WBNB) |
++| gas @ 0.05 gwei (`GAS_PRICE_GWEI=0.05`) | ~0.023 USDT (~0.3 bps) |
++| flash fee (tier-500 loan) | 5 bps |
++
++Two regimes:
++
++* **No edge (today's measured state).** Every public broadcast is a 0.92 USDT
++  donation to the validator, repeated. Private submission changes nothing —
++  there is no edge to protect — and the correct action is to send nothing.
++  `arb survey` exists precisely so this is decided with data instead of mood.
++* **Real edge, e.g. +60 bps gross (~1.8 USDT at 1 WBNB).** Public: you are one of
++  several bots racing, and you lose the race with high probability. Even when you
++  win, your own transaction moves the pool you are arbitraging, which is why the
++  edge decays as others pile in. Private: the transaction is not visible before
++  inclusion, so the race you lose is "did someone else find it independently",
++  not "did someone read my mempool entry".
++
++**The asymmetry that decides it:** with a real edge, the *cost* of private
++submission (relay reliability, a few hundred ms of latency, sometimes an
++explicit tip) is bounded and small; the *cost* of public submission is the entire
++edge, unbounded in frequency. There is no setting where public submission is
++better for a competitive two-leg arbitrage.
++
++## Implementation
++
++`arb/deployer.py::send_and_wait(submit_url=...)` POSTs the signed raw
++transaction to the relay with a plain `eth_sendRawTransaction` JSON-RPC call —
++every MEV-protected endpoint (BlockRazor, GetBlock+ Merkle, builder APIs) is a
++drop-in RPC, so no SDK and no protocol lock-in. Reads and the receipt wait stay
++on the configured provider: only the broadcast path changes.
++
++If the relay is unreachable the call **raises**, and the message says explicitly
++that nothing reached the public mempool. There is deliberately no fallback: a
++private submission that silently degrades to public is worse than no privacy
++feature, because the operator would believe the position was protected.
++
++## What to check before relying on it
++
++1. Pick a relay and confirm it accepts BSC transactions (`https://bsc.blockrazor.xyz`
++   is the endpoint used in the CLI examples; GetBlock's MEV-protected BSC
++   endpoint needs a paid plan).
++2. Measure its latency and inclusion rate with the micro-drill's transactions —
++   a relay that adds 2 seconds to a 0.75-second block time is not usable.
++3. Decide the tip. Relays vary between free-with-refunds and explicit payment.
++4. Keep the public path for `deploy` / `withdraw` / funding. They are not
++   competitive and public inclusion is more reliable.
++
++## Residual risk, stated plainly
++
++* **The relay sees the transaction.** You are trusting it not to front-run you.
++  That is a different trust model from the public mempool, not a strictly safer
++  one — it is a bet on the relay's incentives, and it should be re-evaluated if
++  the relay's ownership or behaviour changes.
++* **Latency.** Private submission can be slower to include. For an edge that
++  decays in one block, that may cost more than it saves — which is why step 2
++  above is not optional.
++* **No reorg handling exists** in this codebase, public or private. A relay does
++  not change that.
+diff --git a/main.py b/main.py
+index 9c1d85d..38307a3 100644
+--- a/main.py
++++ b/main.py
+@@ -1511,14 +1511,28 @@ def cmd_arb_plan(args) -> int:
+     base_decimals = _decimals_on_chain(reader, base)
+     uses_deadline = _v3_router_shape(provider.w3, res)
+     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
++    # The real cost of leg 1's buy. See _v2_buy_cost_fn: the sell quote the scan
++    # reports is ~2x-fee cheaper than what buying actually costs.
++    buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
++
++    # Two passes, because the profit floor needs the gas cost and the gas cost
++    # needs a plan to simulate. Pass 1 builds with no floor; its only job is to
++    # be encodable so the exact call can be simulated. Pass 2 rebuilds from the
++    # same scan with the floor priced in. plan_arbitrage is pure, so the rebuild
++    # is deterministic and cheap.
++    plan_kwargs = dict(
++        slippage_bps=args.slippage, min_profit_wei=args.min_profit,
++        quote_decimals=quote_decimals, base_decimals=base_decimals,
++        v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
++        min_profit_buffer_bps=args.min_profit_buffer,
++        v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
++    )
+     try:
+-        plan = plan_arbitrage(
+-            res, base, quote, pool_for_fee,
+-            slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+-            quote_decimals=quote_decimals, base_decimals=base_decimals,
+-            v3_uses_deadline=uses_deadline,
+-            flash_pool_quote_balance=quote_bal,
+-        )
++        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
++        gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
++            provider, net, settings, res, probe, sender=None, contract_address=None)
++        plan = plan_arbitrage(res, base, quote, pool_for_fee,
++                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
+     except PlanError as exc:
+         print(fmt.red(f"\n  {exc}"))
+         return 4
+@@ -1534,6 +1548,8 @@ def cmd_arb_plan(args) -> int:
+     print(f"  gross     {fmt.fmt_bps(plan.expected_gross_bps)} bps before the flash fee")
+     for n in plan.notes:
+         _wrap_note(n)
++    if gas_note:
++        _wrap_note(gas_note)
+     if not args.json_out:
+         print(fmt.dim("\n  Nothing was sent. Add --execute to sign and broadcast it."))
+     else:
+@@ -1588,6 +1604,152 @@ def _contract_address(args, dep) -> str:
+             f"40 hex characters - copy it again from your deployment output."))
+ 
+ 
++# A measured gas figure for one arbitrage() call, used when the transaction
++# cannot be simulated (no contract deployed yet, or simulation would revert).
++# 570,906 was the estimate for the first testnet run with its 1.35x margin, so
++# the raw call is ~423k; 600k is that plus headroom. It only feeds the profit
++# FLOOR (which may never be under-priced), never the gas limit sent.
++ARB_GAS_FALLBACK_UNITS = 600_000
++
++
++def _quote_is_wrapped_native(quote_symbol: str, native_symbol: str) -> bool:
++    """
++    True when the quote token IS the chain's native asset (WBNB on BNB Chain).
++
++    WBNB is BNB one-for-one by construction, so a gas cost paid in BNB is
++    already denominated in the borrow token and the conversion is exact. This
++    is checked by symbol pair rather than by address so it works on any chain
++    the config knows, and refuses to guess for anything else.
++    """
++    from config import index_symbol
++    return index_symbol(quote_symbol) == native_symbol.upper()
++
++
++def _gas_cost_quote_wei(provider, net, settings, res, plan, sender, contract_address):
++    """
++    What this arbitrage's gas will cost, expressed in the borrow token's wei.
++
++    Simulates the real call when it can (contract deployed, state sane); falls
++    back to a fixed unit count x live gas price when it cannot, so `arb plan`
++    on a chain with no deployment still prices the floor instead of silently
++    skipping it. Returns (cost_wei, units_used, note) — note is non-empty when
++    the conversion is anything other than the exact wrapped-native case, because
++    a floor priced off a wrong FX rate is worse than no floor.
++    """
++    from arb.deployer import gas_price_wei
++    from arb.executor import gas_cost_in_quote_wei
++
++    units = ARB_GAS_FALLBACK_UNITS
++    note = ""
++    if contract_address and sender:
++        try:
++            factory = _contract_factory(provider.w3, contract_address, plan)
++            data = _encode_arbitrage(factory, plan)
++            est = int(provider.w3.eth.estimate_gas({
++                "from": sender, "to": contract_address, "data": data, "value": 0,
++            }))
++            if est > 0:
++                units = est
++        except Exception:  # noqa: BLE001 - fallback is the documented behaviour
++            note = (f"gas could not be simulated; the floor uses a fixed "
++                    f"{ARB_GAS_FALLBACK_UNITS:,}-unit estimate")
++    price = gas_price_wei(provider.w3)
++    native_cost = units * price
++    if _quote_is_wrapped_native(settings.quote_symbol, net.native_symbol):
++        cost = gas_cost_in_quote_wei(native_cost, True)
++    else:
++        # Profit is in the quote token but gas is native. Without a live price
++        # for the pair-native cross there is no honest conversion, so the floor
++        # is 0 and the user is TOLD to set --min-profit by hand. Quietly using a
++        # stale rate here would look like enforcement while measuring nothing.
++        rate = _native_price_in_quote(res)
++        cost = gas_cost_in_quote_wei(native_cost, False, rate)
++        if cost == 0:
++            note = (f"the quote token ({settings.quote_symbol}) is not the native "
++                    f"asset and no live price was found to convert {net.native_symbol} "
++                    f"gas into it — the profit floor could NOT be priced. Set "
++                    f"--min-profit to at least the gas cost in quote-token wei.")
++    return cost, units, note
++
++
++def _native_price_in_quote(res) -> float:
++    """
++    Best-effort price of 1 native unit in quote-token units, from the scan.
++
++    Only used when the quote is not the wrapped native asset. `exec_price` is
++    quote-per-base, which IS quote-per-native exactly when the base is the
++    wrapped native token. Anything else returns 0.0, meaning "unknown" — never
++    a guess, because the caller turns this into a profit floor and an invented
++    rate would under- or over-price it silently.
++    """
++    from config import index_symbol
++    if not _symbol_is_native(res.base_symbol, res.network):
++        return 0.0
++    for q in (res.sell_leg, res.buy_leg):
++        if q is not None and q.ok and q.exec_price > 0:
++            return q.exec_price
++    return 0.0
++
++
++def _symbol_is_native(symbol: str, network_key: str) -> bool:
++    from config import get_network, index_symbol
++    net = get_network(network_key)
++    return index_symbol(symbol) == net.native_symbol.upper()
++
++
++def _contract_factory(w3, contract_address, plan):
++    from arb.compiler import load_build
++    compiled = load_build("FlashArb")
++    from dex.fetcher import contract_factory
++    return contract_factory(w3, contract_address, compiled.abi)
++
++
++def _encode_arbitrage(factory, plan) -> bytes:
++    data = factory.encode_abi(abi_element_identifier="arbitrage", args=plan.call_args) \
++        if hasattr(factory, "encode_abi") else None
++    if data is None:
++        data = factory.functions.arbitrage(*plan.call_args).build_transaction()["data"]
++    if isinstance(data, str):
++        data = bytes.fromhex(data[2:])
++    return data
++
++
++def _v2_buy_cost_fn(reader, venues, base: str, quote: str):
++    """
++    A callable(size_base) -> quote wei: what leg 1 really costs to buy `size`.
++
++    `getAmountIn` on the pair's live raw reserves — NOT `size x sell-quote`. The
++    two differ by about twice the venue's fee (50.3 bps measured against
++    PancakeSwap V2's real reserves), and that difference is the difference
++    between a plan that completes and one that reverts with CannotRepay: sized
++    from the sell quote, the loan is 50 bps too small, leg 1 returns ~0.995 of
++    the expected base, and leg 2 sells that for 50 bps less than promised.
++
++    Returns None when no V2 venue is configured or the pair cannot be read, in
++    which case the planner falls back to the sell-quote approximation and says
++    so in its notes rather than silently quoting an optimistic number.
++    """
++    from dex import uniswap_v2_math as v2math
++    from dex.fetcher import UniswapV2Reader
++
++    v2_venue = next((v for v in venues if v.version == "v2"), None)
++    if v2_venue is None:
++        return None
++    pair_reader = UniswapV2Reader(reader, venue=v2_venue)
++
++    def cost(size_base: float) -> int:
++        pair = pair_reader.pair_address(base, quote)
++        reserves = pair_reader.get_reserves(pair)
++        base_is_token0 = base.lower() == reserves.token0.lower()
++        reserve_base, reserve_quote = reserves.reserves_for(base)
++        base_dec = reserves.decimals0 if base_is_token0 else reserves.decimals1
++        amount_out_raw = v2math.to_raw(size_base, base_dec)
++        return int(v2math.get_amount_in(amount_out_raw, reserve_quote, reserve_base,
++                                        pair_reader.fee_num, pair_reader.fee_den))
++
++    return cost
++
++
+ def _pool_quote_balance_fn(w3, quote_address: str):
+     """
+     A callable giving the quote-token balance held by any pool address.
+@@ -1694,12 +1856,29 @@ def cmd_arb_run(args) -> int:
+     base_decimals = _decimals_on_chain(reader, base)
+     uses_deadline = _v3_router_shape(provider.w3, res)
+     quote_bal = _pool_quote_balance_fn(provider.w3, quote)
++    buy_cost_fn = _v2_buy_cost_fn(reader, venues, base, quote)
++
++    # Only --execute needs the private key; a dry run just needs the address.
++    sender, account, wpath = _sender(args, need_key=bool(args.execute))
++
++    # Two passes: the profit floor must cover gas, and pricing gas needs the
++    # exact call to simulate. Pass 1's plan exists only to be encoded; pass 2
++    # is what gets printed and sent. See _gas_cost_quote_wei for the conversion
++    # rules and what happens when the quote token is not the native asset.
++    plan_kwargs = dict(
++        slippage_bps=args.slippage, min_profit_wei=args.min_profit,
++        quote_decimals=quote_decimals, base_decimals=base_decimals,
++        v3_uses_deadline=uses_deadline, flash_pool_quote_balance=quote_bal,
++        min_profit_buffer_bps=args.min_profit_buffer,
++        v2_buy_cost_wei=buy_cost_fn(settings.trade_size_base) if buy_cost_fn else None,
++    )
+     try:
++        probe = plan_arbitrage(res, base, quote, pool_for_fee, **plan_kwargs)
++        gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
++            provider, net, settings, res, probe,
++            sender=sender, contract_address=contract_address)
+         plan = plan_arbitrage(res, base, quote, pool_for_fee,
+-                              slippage_bps=args.slippage, min_profit_wei=args.min_profit,
+-                              quote_decimals=quote_decimals, base_decimals=base_decimals,
+-                              v3_uses_deadline=uses_deadline,
+-                              flash_pool_quote_balance=quote_bal)
++                              gas_cost_quote_wei=gas_quote, **plan_kwargs)
+     except PlanError as exc:
+         print(fmt.red(f"  {exc}"))
+         return 4
+@@ -1709,22 +1888,16 @@ def cmd_arb_run(args) -> int:
+         print("    " + line)
+     for n in plan.notes:
+         _wrap_note(n, indent="    note: ")
++    if gas_note:
++        _wrap_note(gas_note, indent="    note: ")
+ 
+-    # Only --execute needs the private key; a dry run just needs the address.
+-    sender, account, wpath = _sender(args, need_key=bool(args.execute))
+     compiled = load_build(args.contract)
+     flash = contract_factory(provider.w3, contract_address, compiled.abi)
+ 
+     print(f"\n  contract  {contract_address}")
+     print(f"  wallet    {sender}")
+ 
+-    data = flash.encode_abi(abi_element_identifier="arbitrage", args=plan.call_args) \
+-        if hasattr(flash, "encode_abi") else None
+-    if data is None:
+-        # web3 6/7 spell this differently.
+-        data = flash.functions.arbitrage(*plan.call_args).build_transaction()["data"]
+-    if isinstance(data, str):
+-        data = bytes.fromhex(data[2:])
++    data = _encode_arbitrage(flash, plan)
+ 
+     tx = {"from": sender, "to": contract_address, "data": data, "value": 0,
+           "chainId": net.chain_id}
+@@ -1759,9 +1932,12 @@ def cmd_arb_run(args) -> int:
+         account, wpath = _load_wallet(args)
+ 
+     print(fmt.cyan("\n  sending…"))
++    if args.private:
++        print(fmt.dim(f"  submitting through the private relay {args.private} "
++                      f"— this transaction will not appear in the public mempool"))
+     try:
+         receipt = send_and_wait(provider.w3, account, tx, timeout=args.timeout,
+-                                abi=compiled.abi)
++                                abi=compiled.abi, submit_url=args.private)
+     except RevertedTx as exc:
+         print(fmt.red(f"  REVERTED  {exc.tx_hash}"))
+         print(fmt.red(f"  reason    {exc.reason}"))
+@@ -1796,6 +1972,167 @@ def cmd_arb_run(args) -> int:
+     return 0
+ 
+ 
++def cmd_arb_survey(args) -> int:
++    """
++    Dry-run the planner in a loop, logging every iteration's all-in economics.
++
++    This is the evidence-gathering step, not a trading command: it never
++    deploys, never signs, never sends. Each iteration scans the venues, builds
++    the plan the executor WOULD send, prices it exactly as `arb run` would
++    (gas floor included), and appends one JSONL line to the log with the net
++    edge after flash fee and gas.
++
++    The question it exists to answer is the one testnet cannot: does a real,
++    recurring edge survive all costs on this chain, at this size? A week of
++    these lines is the only honest way to answer it. Rows are appended, so
++    repeated runs accumulate history instead of replacing it.
++    """
++    import json as _json
++    import time
++
++    from arb.executor import PlanError, plan_arbitrage
++    from config import get_venue, token_address, venues_for
++    from dex.cross import scan_venues
++    from dex.fetcher import ChainReader
++
++    settings = Settings()
++    _apply_overrides(args, settings)
++    net, provider = _connect(settings)
++
++    base_symbol = settings.base_symbol.upper()
++    quote_symbol = settings.quote_symbol.upper()
++    try:
++        base = token_address(net, base_symbol)
++        quote = token_address(net, quote_symbol)
++    except KeyError as exc:
++        print(fmt.red(f"  {exc}"))
++        return 2
++
++    venues = ([get_venue(net.key, v.strip()) for v in args.venues.split(",") if v.strip()]
++              if args.venues else venues_for(net.key))
++
++    log_path = pathlib.Path(args.log)
++    log_path.parent.mkdir(parents=True, exist_ok=True)
++
++    print(fmt.banner(f"ARB  ·  survey on {net.name}  ·  {base_symbol}/{quote_symbol}"))
++    print(f"  size     {settings.trade_size_base:g} {base_symbol} per iteration")
++    print(f"  budget   {args.iterations} iterations, {args.interval:g}s apart"
++          + (f", at most {args.duration:g}s total" if args.duration else ""))
++    print(f"  log      {log_path}")
++    print(fmt.dim("  this command never signs or sends anything"))
++
++    rows = []
++    started = time.time()
++    net_bps_seen = []
++    for i in range(1, args.iterations + 1):
++        if args.duration and (time.time() - started) >= args.duration:
++            print(fmt.dim(f"  time budget reached after {i - 1} iterations"))
++            break
++        t0 = time.time()
++        row = {"ts": round(time.time(), 3), "iteration": i,
++               "network": net.key, "pair": f"{base_symbol}/{quote_symbol}",
++               "size_base": settings.trade_size_base}
++        try:
++            reader = ChainReader(provider, net)
++            res = scan_venues(
++                provider, net, base, quote, base_symbol, quote_symbol,
++                settings.trade_size_base, venues, reader=reader,
++                max_impact_bps=(args.max_impact if args.max_impact is not None
++                                else settings.max_impact_bps),
++                all_tiers=not args.deepest_only,
++            )
++            row["block"] = res.block_number
++            row["legs_usable"] = len(res.usable)
++            row["mid_spread_usable_bps"] = round(res.mid_spread_usable_bps, 2)
++
++            v3_venue = next((v for v in venues if v.version == "v3"), None)
++
++            def pool_for_fee(fee_pips: int) -> str:
++                if v3_venue is None:
++                    return ""
++                return _v3_reader_for(reader, v3_venue).pool_for_fee(base, quote, fee_pips)
++
++            buy_cost = _v2_buy_cost_fn(reader, venues, base, quote)
++            plan = plan_arbitrage(
++                res, base, quote, pool_for_fee,
++                slippage_bps=args.slippage, min_profit_wei=args.min_profit,
++                quote_decimals=_decimals_on_chain(reader, quote),
++                base_decimals=_decimals_on_chain(reader, base),
++                v3_uses_deadline=_v3_router_shape(provider.w3, res),
++                flash_pool_quote_balance=_pool_quote_balance_fn(provider.w3, quote),
++                min_profit_buffer_bps=args.min_profit_buffer,
++                v2_buy_cost_wei=buy_cost(settings.trade_size_base) if buy_cost else None,
++            )
++            # No contract and no sender here, so gas is priced from the fixed
++            # unit estimate x the live gas price — the same arithmetic the
++            # floor uses, minus the simulation.
++            gas_quote, gas_units, gas_note = _gas_cost_quote_wei(
++                provider, net, settings, res, plan, sender=None, contract_address=None)
++
++            from arb.deployer import gas_price_wei as _gas_price_wei
++            from decimal import Decimal
++            row["gas_price_used_wei"] = _gas_price_wei(provider.w3)
++            try:
++                row["gas_price_market_wei"] = int(provider.w3.eth.gas_price)
++            except Exception:  # noqa: BLE001
++                pass
++            gross_wei = int(Decimal(plan.flash_amount)
++                            * Decimal(str(plan.expected_gross_bps)) / Decimal(10_000))
++            net_wei = gross_wei - plan.expected_flash_fee - gas_quote
++            net_bps = float(Decimal(net_wei) / Decimal(plan.flash_amount) * Decimal(10_000)) \
++                if plan.flash_amount else 0.0
++            clears = net_wei >= max(plan.min_profit_floor, args.min_profit)
++
++            row.update({
++                "buy": plan.buy_label, "sell": plan.sell_label,
++                "buy_exec": plan.buy_exec, "sell_exec": plan.sell_exec,
++                "gross_bps": round(plan.expected_gross_bps, 2),
++                "flash_fee_wei": plan.expected_flash_fee,
++                "gas_quote_wei": gas_quote, "gas_units": gas_units,
++                "floor_wei": plan.min_profit_floor,
++                "net_wei": net_wei, "net_bps": round(net_bps, 2),
++                "clears_floor": clears,
++                "expected_revert": "EXPECTED TO REVERT" in " ".join(plan.notes),
++                "notes": plan.notes,
++            })
++            if gas_note:
++                row["gas_note"] = gas_note
++            net_bps_seen.append(net_bps)
++            mark = fmt.green("CLEARS") if clears else fmt.dim("below ")
++            print(f"  [{i:>3}] blk {row.get('block', '?'):>10}  {mark}  "
++                  f"gross {row['gross_bps']:>+8.2f} bps  net {net_bps:>+8.2f} bps  "
++                  f"({plan.buy_label} -> {plan.sell_label})")
++        except PlanError as exc:
++            row["plan_error"] = str(exc)
++            print(f"  [{i:>3}] no plan: {exc}")
++        except Exception as exc:  # noqa: BLE001 - one bad iteration must not kill the survey
++            row["error"] = f"{type(exc).__name__}: {exc}"
++            print(f"  [{i:>3}] {type(exc).__name__}: {exc}")
++        row["elapsed_s"] = round(time.time() - t0, 3)
++        rows.append(row)
++        with log_path.open("a", encoding="utf-8") as fh:
++            fh.write(_json.dumps(row, default=str) + "\n")
++
++        if i < args.iterations:
++            time.sleep(args.interval)
++
++    print(fmt.cyan("\n  SUMMARY"))
++    print(f"    iterations   {len(rows)}")
++    if net_bps_seen:
++        net_bps_seen_sorted = sorted(net_bps_seen)
++        wins = [b for b in net_bps_seen if b > 0]
++        med = net_bps_seen_sorted[len(net_bps_seen_sorted) // 2]
++        print(f"    net bps      best {max(net_bps_seen):+.2f}   median {med:+.2f}   "
++              f"worst {min(net_bps_seen):+.2f}")
++        print(f"    positive     {len(wins)} of {len(net_bps_seen)} iterations "
++              f"cleared all costs after the flash fee")
++        if not wins:
++            print(fmt.yellow("    No iteration beat its own costs. Executing this loop "
++                             "for real would be buying gas, not edge."))
++    print(f"    log          {log_path}  ({len(rows)} rows appended)")
++    return 0
++
++
+ def cmd_arb_status(args) -> int:
+     from arb.compiler import load_build
+     from config import token_address
+@@ -2064,7 +2401,13 @@ def build_parser() -> argparse.ArgumentParser:
+     ap.add_argument("--min-profit", type=int, dest="min_profit", default=0,
+                     help="minimum wei of quote token to keep, or the contract reverts "
+                          "the whole transaction (default 0 = never end up with less "
+-                         "than you started)")
++                         "than you started). The planner raises this to at least the "
++                         "gas cost plus the buffer below; this flag may only raise it")
++    ap.add_argument("--min-profit-buffer", type=float, dest="min_profit_buffer",
++                    default=2500.0, metavar="BPS",
++                    help="margin added on top of the gas-cost floor, in bps (default "
++                         "2500 = 25%%, absorbing gas-price and price drift between "
++                         "estimation and inclusion)")
+     ap.set_defaults(func=cmd_arb_plan)
+ 
+     ap = asub.add_parser("run", help="plan, then sign and broadcast the arbitrage")
+@@ -2074,14 +2417,50 @@ def build_parser() -> argparse.ArgumentParser:
+     ap.add_argument("--max-impact", type=float, dest="max_impact", default=None)
+     ap.add_argument("--deepest-only", action="store_true")
+     ap.add_argument("--slippage", type=float, default=100.0)
+-    ap.add_argument("--min-profit", type=int, dest="min_profit", default=0)
++    ap.add_argument("--min-profit", type=int, dest="min_profit", default=0,
++                    help="minimum wei of quote token to keep. The planner raises this "
++                         "to at least the gas cost plus the buffer; it may only raise it")
++    ap.add_argument("--min-profit-buffer", type=float, dest="min_profit_buffer",
++                    default=2500.0, metavar="BPS",
++                    help="margin added on top of the gas-cost floor, in bps "
++                         "(default 2500 = 25%%)")
+     ap.add_argument("--contract", default="FlashArb")
+     ap.add_argument("--address", help="contract address (default: the recorded deployment)")
++    ap.add_argument("--private", metavar="URL", default=None,
++                    help="broadcast the signed transaction through this private/"
++                         "MEV-protected RPC instead of the public mempool (e.g. "
++                         "https://bsc.blockrazor.xyz). The BNB Chain mempool is "
++                         "watched by searchers; on a public broadcast your floors "
++                         "stop a theft but not the EV loss of being picked off. "
++                         "Fails loudly if the relay is unreachable — it never "
++                         "silently falls back to the public path")
+     ap.add_argument("--execute", action="store_true",
+                     help="actually broadcast. Without it this is a dry run that "
+                          "shows the plan and the gas estimate only")
+     ap.set_defaults(func=cmd_arb_run)
+ 
++    ap = asub.add_parser("survey",
++                         help="dry-run the planner in a loop, logging all-in economics "
++                              "per iteration — the evidence step before real size")
++    common(ap)
++    ap.add_argument("--venues", help="comma-separated venue keys (default: all for the network)")
++    ap.add_argument("--max-impact", type=float, dest="max_impact", default=None)
++    ap.add_argument("--deepest-only", action="store_true")
++    ap.add_argument("--slippage", type=float, default=100.0)
++    ap.add_argument("--min-profit", type=int, dest="min_profit", default=0)
++    ap.add_argument("--min-profit-buffer", type=float, dest="min_profit_buffer",
++                    default=2500.0, metavar="BPS")
++    ap.add_argument("--iterations", type=int, default=10,
++                    help="how many scans to run (default 10)")
++    ap.add_argument("--interval", type=float, default=12.0,
++                    help="seconds between scans (default 12 = one BNB Chain block)")
++    ap.add_argument("--duration", type=float, default=0.0, metavar="SECONDS",
++                    help="stop early after this many seconds, whatever --iterations "
++                         "says (default 0 = no time limit)")
++    ap.add_argument("--log", default="logs/arb_survey.jsonl",
++                    help="JSONL file to append results to (default logs/arb_survey.jsonl)")
++    ap.set_defaults(func=cmd_arb_survey)
++
+     ap = asub.add_parser("status", help="check the deployment and what it holds")
+     common(ap)
+     ap.add_argument("--contract", default="FlashArb")
+diff --git a/tests/test_fork.py b/tests/test_fork.py
+new file mode 100644
+index 0000000..5bae87c
+--- /dev/null
++++ b/tests/test_fork.py
+@@ -0,0 +1,783 @@
++"""
++Fork tests: the real contract against real BNB Chain mainnet state.
++
++Why these exist
++---------------
++Every other test in this repo is offline maths or a mocked node, and the one
++question none of them can answer is the one that matters before real money is
++at risk: does `FlashArb.arbitrage` actually complete a round trip and end up
++holding more of the borrow token, on the chain it will run on, against the
++pools it will trade with?
++
++These tests answer it the only way that is not a guess: anvil forks BNB Chain
++mainnet, the contract is compiled with the pinned solc and deployed onto that
++fork, and the transaction under test is the exact `plan.call_args` the planner
++would send in production — same code path, real pools, no mocks.
++
++Two deliberate design choices
++-----------------------------
++* FORKED AT HEAD, not at a pinned block. Pinning a block needs ARCHIVE state,
++  and every free public BNB RPC refuses it ("Archive requests require a personal
++  token", "missing trie node"). Set FORK_BLOCK (with FORK_RPC_URL pointed at an
++  archive endpoint) to pin; otherwise the fork follows the chain head.
++* THE PROFIT TEST MANUFACTURES ITS EDGE. Waiting for a real mispricing would
++  make the suite flaky — it would pass when the market happens to offer one and
++  fail when it does not, which is the opposite of a test. Instead the test
++  writes the V2 pair's stored reserves directly (anvil_setStorageAt) to skew
++  its price by ~2%, then re-scans and plans against that state. The edge is
++  fabricated; everything downstream — the flash loan, both swaps, the repay,
++  the profit check, the event — runs against real mainnet contracts with real
++  balances. That is what "does this work on the real chain" needs to mean.
++
++What is covered
++---------------
++1. The live plan never partially executes: it either profits (>= its own floor)
++   or reverts with balances byte-for-byte unchanged.
++2. A manufactured +~2% edge produces a real, positive, floor-clearing profit.
++3. An impossible min_profit reverts and moves nothing.
++4. The LOK trap stays closed: borrowing from the pool leg 2 swaps through
++   reverts with the pool's own reentrancy-lock reason.
++5. `withdrawTokens` is refused for a non-owner and moves exactly the requested
++   amount for the owner.
++6. The contract's `previewFlashFee` agrees with the planner's fee arithmetic to
++   the wei, checked against the live pool.
++
++Running
++-------
++    pytest tests/test_fork.py -q
++    FORK_RPC_URL=<archive-rpc> FORK_BLOCK=124736671 pytest tests/test_fork.py -q
++
++Requires anvil (Foundry) on PATH or at ~/.foundry/bin/anvil, web3, and network
++access to a BNB Chain RPC. Skips cleanly when anvil is absent.
++"""
++
++from __future__ import annotations
++
++import dataclasses
++import os
++import shutil
++import socket
++import subprocess
++import sys
++import time
++from decimal import Decimal
++from typing import Optional, Tuple
++
++import pytest
++
++web3_module = pytest.importorskip("web3")        # no web3 -> nothing here can run
++
++from web3 import Web3                            # noqa: E402
++from eth_utils import keccak                     # noqa: E402
++from web3.exceptions import ContractCustomError, ContractLogicError   # noqa: E402
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++# The slot a Uniswap-V2-style pair stores (reserve0, reserve1, timestamp) in.
++# NOT hardcoded: PancakeSwap's pair is not byte-identical to Uniswap's (its
++# reserves live in slot 8, not 6), so the test DISCOVERS the slot by scanning
++# for the packed value that decodes to the reserves getReserves() reports. A
++# hardcoded slot would silently corrupt the wrong storage on a layout change,
++# and the failure would look like a broken contract instead of a broken test.
++_PACK112 = 2 ** 112 - 1
++
++
++
++def _find_anvil() -> Optional[str]:
++    """
++    Locate the anvil binary.
++
++    PATH first, then Foundry's own install locations — `foundryup` writes to
++    ~/.foundry/bin and only adds it to PATH in the shell profile it edited, so a
++    subprocess launched from an IDE (or a fresh CI step) sees an anvil that
++    `which anvil` denies. ANVIL_BIN overrides everything for unusual installs.
++    """
++    override = os.getenv("ANVIL_BIN")
++    if override and os.path.exists(override):
++        return override
++    found = shutil.which("anvil")
++    if found:
++        return found
++    for candidate in (os.path.join(os.path.expanduser("~"), ".foundry", "bin", "anvil"),
++                      "/usr/local/bin/anvil", "/opt/foundry/bin/anvil"):
++        if os.path.exists(candidate):
++            return candidate
++    return None
++
++
++ANVIL = _find_anvil()
++FORK_BLOCK = os.getenv("FORK_BLOCK", "").strip()
++
++# Which RPC to pull fork state from.
++#
++# Forking needs ARCHIVE state even when forking at head: anvil fetches state
++# lazily, and the first thing these tests do (reading a V2 pair's reserves) is a
++# slot last written in the same block, but reading a token's decimals is a slot
++# last written years ago. A head-only endpoint answers that with
++# "Archive requests require a personal token" (publicnode) or "missing trie
++# node" (binance dataseed), and the fork errors mid-test rather than at startup.
++#
++# So the source is CHOSEN BY PROBE, not by hope: each candidate is given a fork
++# and asked for deep state; the first that answers wins. FORK_RPC_URL overrides
++# the list entirely (use this for a private archive endpoint).
++_env_fork = os.getenv("FORK_RPC_URL", "").strip()
++FORK_CANDIDATES = [_env_fork] if _env_fork else [
++    "https://api.zan.top/bsc-mainnet",
++    "https://bsc-mainnet.public.blastapi.io",
++    "https://bsc-rpc.publicnode.com",
++]
++FORK_URL = FORK_CANDIDATES[0]      # for messages; the fixture reports what it used
++SIZE_BASE = float(os.getenv("FORK_SIZE", "1.0"))
++SKEW_FACTOR = float(os.getenv("FORK_SKEW", "0.98"))   # V2 USDT reserve multiplier
++GAS_UNITS = 600_000          # the same fixed estimate the CLI's floor uses
++
++pytestmark = pytest.mark.skipif(
++    ANVIL is None,
++    reason="anvil (Foundry) is not installed; install Foundry to run fork tests",
++)
++
++
++# --------------------------------------------------------------------------
++# fixtures
++# --------------------------------------------------------------------------
++def _free_port() -> int:
++    with socket.socket() as s:
++        s.bind(("127.0.0.1", 0))
++        return s.getsockname()[1]
++
++
++_COLD_SLOT_PAIR = "0x16b9a82891338f9bA80E2D6970FddA79D1eb0daE"   # Pancake V2 WBNB/USDT
++_COLD_SLOT = 8                                                  # its reserves
++
++
++def _fork_source_serves_state(w3) -> bool:
++    """
++    True when this fork can read state written long ago, not just freshly.
++
++    Read the V2 pair's reserves — a slot written every block, which a head-only
++    node would serve fine — AND a slot that has not changed in years (a token's
++    decimals). The second is what fails on a non-archive endpoint, and it fails
++    lazily, deep inside a later test, which is why it is probed here instead.
++    """
++    try:
++        raw = int.from_bytes(bytes(w3.eth.get_storage_at(_COLD_SLOT_PAIR, _COLD_SLOT)), "big")
++        if raw == 0:
++            return False
++        wbnb = w3.eth.contract(
++            address=Web3.to_checksum_address("0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"),
++            abi=[{"inputs": [], "name": "symbol", "outputs": [{"name": "", "type": "string"}],
++                  "stateMutability": "view", "type": "function"}])
++        return wbnb.functions.symbol().call() == "WBNB"
++    except Exception:  # noqa: BLE001 - any failure means this source is not usable
++        return False
++
++
++def _start_anvil(url: str, port: int):
++    cmd = [ANVIL, "--fork-url", url, "--chain-id", "56",
++           "--host", "127.0.0.1", "--port", str(port), "--silent"]
++    if FORK_BLOCK:
++        cmd += ["--fork-block-number", FORK_BLOCK]
++    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++
++
++# Selectors for the contract's custom errors. web3 raises ContractCustomError
++# (not ContractLogicError) for these and hands back the raw ABI data, so a test
++# that only catches the string-revert exception fails with a confusing
++# "value is not an exception" error instead of a clear assertion.
++UNPROFITABLE = "0x" + keccak(text="Unprofitable(int256,uint256)")[:4].hex()
++NOT_OWNER = "0x" + keccak(text="NotOwner()")[:4].hex()
++CANNOT_REPAY = "0x" + keccak(text="CannotRepay(uint256,uint256)")[:4].hex()
++
++
++# A fork source can fail in ways that look like a contract revert to a naive
++# assertion. These markers mean "the RPC could not serve the state", not "the
++# contract refused" — the distinction matters because the first is an
++# environment problem that must be retried or reported, and treating it as the
++# second would let a broken fork source look like a passing test.
++_PROVIDER_ERROR_MARKERS = (
++    "failed to get storage", "fork error", "rate limit", "too many requests",
++    "register to unlock", "-32603", "429 too", "connection", "timed out",
++)
++
++
++def _is_provider_error(exc: BaseException) -> bool:
++    text = str(exc).lower()
++    if "unprofitable" in text or "lok" in text or "notowner" in text:
++        return False
++    return any(m in text for m in _PROVIDER_ERROR_MARKERS)
++
++
++def _retry(fn, what: str, attempts: int = 4, delay: float = 2.0):
++    """
++    Run fn, retrying on behalf of a flaky fork source.
++
++    If the fork endpoint keeps failing, that is a test-environment problem and
++    is reported as such — never as a contract assertion, and never as a silent
++    pass, because a gate that goes green when it could not read the chain is
++    worse than no gate.
++    """
++    last = None
++    for attempt in range(attempts):
++        try:
++            return fn()
++        except Exception as exc:  # noqa: BLE001
++            if not _is_provider_error(exc):
++                raise
++            last = exc
++            time.sleep(delay * (attempt + 1))
++    pytest.fail(
++        f"{what}: the fork RPC failed {attempts} times in a row — {last}. "
++        f"This is an environment problem, not a contract one. Set FORK_RPC_URL to "
++        f"an archive endpoint with more headroom and re-run."
++    )
++
++
++def _assert_reverted_with(fn, selector: str, what: str) -> None:
++    """Run fn, expect a revert carrying `selector` (or a matching revert string)."""
++    with pytest.raises(Exception) as excinfo:      # noqa: PT011 - asserted below
++        _retry(fn, what)
++    text = str(excinfo.value)
++    assert selector.lower() in text.lower(), (
++        f"{what}: expected a revert carrying {selector}, got: {text}"
++    )
++
++
++@pytest.fixture(scope="module")
++def fork():
++    """
++    A BNB Chain mainnet fork on a private port, from the first source that can
++    actually serve mainnet state.
++    """
++    attempts = []
++    chosen = None
++    for url in FORK_CANDIDATES:
++        port = _free_port()
++        proc = _start_anvil(url, port)
++        w3 = Web3(Web3.HTTPProvider(f"http://127.0.0.1:{port}",
++                                    request_kwargs={"timeout": 180}))
++        deadline = time.time() + 60
++        ready = False
++        while time.time() < deadline:
++            try:
++                w3.eth.block_number
++                ready = True
++                break
++            except Exception:  # noqa: BLE001 - not up yet
++                time.sleep(1)
++        if ready and _fork_source_serves_state(w3):
++            chosen = (proc, f"http://127.0.0.1:{port}")
++            break
++        attempts.append(f"{url}: {'started but cannot serve deep state' if ready else 'did not start'}")
++        proc.terminate()
++        try:
++            proc.wait(timeout=10)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++
++    if chosen is None:
++        pytest.skip(
++            "no configured BNB Chain fork source could serve mainnet state: "
++            + "; ".join(attempts)
++            + ". Set FORK_RPC_URL to an archive-capable endpoint "
++              "(the free ones that work are api.zan.top and public.blastapi.io)."
++        )
++
++    proc, url = chosen
++    w3 = Web3(Web3.HTTPProvider(url, request_kwargs={"timeout": 180}))
++    try:
++        yield w3, url
++    finally:
++        proc.terminate()
++        try:
++            proc.wait(timeout=10)
++        except subprocess.TimeoutExpired:
++            proc.kill()
++
++
++@pytest.fixture(scope="module")
++def forked_net(fork):
++    """The real BSC network config, with its RPC list replaced by the fork."""
++    from config import get_network
++
++    _, url = fork
++    return dataclasses.replace(get_network("bsc"), rpc_urls=[url])
++
++
++@pytest.fixture(scope="module")
++def provider(forked_net):
++    from rpc import NodeProvider
++
++    p = NodeProvider(forked_net, timeout=180)
++    p.connect()
++    return p
++
++
++@pytest.fixture(scope="module")
++def deployed(provider):
++    """Compile the pinned contract, deploy it on the fork, hand back the handles."""
++    from arb.compiler import load_build
++
++    c = load_build("FlashArb")
++    w3 = provider.w3
++    acct = w3.eth.accounts[0]
++    factory = w3.eth.contract(abi=c.abi, bytecode=c.bytecode)
++    txh = factory.constructor().transact({"from": acct, "gas": 8_000_000})
++    receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
++    assert receipt.status == 1, "deployment of FlashArb failed on the fork"
++    contract = w3.eth.contract(address=receipt.contractAddress, abi=c.abi)
++    return contract, c.abi, acct, receipt.contractAddress
++
++
++def _scan(provider, net):
++    """Scan the fork's real venues for WBNB/USDT at SIZE_BASE."""
++    from config import token_address, venues_for
++    from dex.cross import scan_venues
++    from dex.fetcher import ChainReader
++
++    reader = ChainReader(provider, net)
++    res = _retry(lambda: scan_venues(provider, net, token_address(net, "WBNB"),
++                                     token_address(net, "USDT"), "WBNB", "USDT",
++                                     SIZE_BASE, venues_for(net.key), reader=reader,
++                                     max_impact_bps=50.0, all_tiers=True),
++                 "scanning venues on the fork")
++    return res, reader
++
++
++def _plan_from(provider, net, res, reader):
++    """Build the exact plan `arb run` would send, floor included."""
++    from abis import ERC20_ABI
++    from arb.deployer import gas_price_wei
++    from arb.executor import plan_arbitrage, v3_router_uses_deadline
++    from config import token_address, venues_for
++    from dex.fetcher import UniswapV3Reader
++
++    w3 = provider.w3
++    base = token_address(net, "WBNB")
++    quote = token_address(net, "USDT")
++    venues = venues_for(net.key)
++    v3_venue = next((v for v in venues if v.version == "v3"), None)
++
++    def pool_for_fee(fee_pips: int) -> str:
++        if v3_venue is None:
++            return ""
++        return UniswapV3Reader(reader, venue=v3_venue).pool_for_fee(base, quote, fee_pips)
++
++    token = w3.eth.contract(address=Web3.to_checksum_address(quote), abi=ERC20_ABI)
++    cache: dict = {}
++
++    def quote_balance_of(pool: str) -> int:
++        key = pool.lower()
++        if key not in cache:
++            cache[key] = int(token.functions.balanceOf(pool).call())
++        return cache[key]
++
++    sell = next((q for q in res.usable if q.version == "v3"), None)
++    assert sell is not None and sell.router_address, "no usable V3 leg on the fork"
++
++    # The floor's gas figure, converted to the quote token the way the CLI does:
++    # units x price = native wei; x USDT-per-WBNB (the sell price IS that, and
++    # WBNB is BNB) = USDT wei.
++    gas_quote = int(Decimal(GAS_UNITS * gas_price_wei(w3)) * Decimal(str(sell.exec_price)))
++
++    # Leg 1's real buy cost, exactly as the CLI computes it: getAmountIn on the
++    # pair's live reserves. Mirroring production here is the point — a fork test
++    # that plans differently from the bot tests nothing about the bot.
++    from dex import uniswap_v2_math as v2math
++    from dex.fetcher import UniswapV2Reader
++
++    v2_venue = next(v for v in venues if v.version == "v2")
++    pair_reader = UniswapV2Reader(reader, venue=v2_venue)
++    pair = pair_reader.pair_address(base, quote)
++    reserves = pair_reader.get_reserves(pair)
++    reserve_base, reserve_quote = reserves.reserves_for(base)
++    base_dec = (reserves.decimals0 if base.lower() == reserves.token0.lower()
++                else reserves.decimals1)
++    buy_cost = int(v2math.get_amount_in(v2math.to_raw(SIZE_BASE, base_dec),
++                                        reserve_quote, reserve_base,
++                                        pair_reader.fee_num, pair_reader.fee_den))
++
++    plan = plan_arbitrage(
++        res, base, quote, pool_for_fee,
++        slippage_bps=100.0, min_profit_wei=0,
++        quote_decimals=int(reader.decimals(quote)),
++        base_decimals=int(reader.decimals(base)),
++        v3_uses_deadline=v3_router_uses_deadline(w3, sell.router_address),
++        flash_pool_quote_balance=quote_balance_of,
++        gas_cost_quote_wei=gas_quote,
++        v2_buy_cost_wei=buy_cost,
++    )
++    return plan, pool_for_fee
++
++
++@pytest.fixture(scope="module")
++def live_plan(provider, forked_net):
++    """What the planner would send right now, against the forked head."""
++    res, reader = _scan(provider, forked_net)
++    plan, resolver = _plan_from(provider, forked_net, res, reader)
++    return plan, res, resolver
++
++
++def _decoded_reserves(w3, pair: str, slot: int) -> Tuple[int, int, int]:
++    raw = bytes(w3.eth.get_storage_at(Web3.to_checksum_address(pair), slot))
++    val = int.from_bytes(raw, "big")
++    return val & _PACK112, (val >> 112) & _PACK112, (val >> 224) & 0xFFFFFFFF
++
++
++def _reserves_slot(w3, pair: str) -> int:
++    """
++    Find which storage slot holds the pair's (reserve0, reserve1, timestamp).
++
++    Identified by decoding each candidate slot and matching against what
++    `getReserves()` returns, so it cannot pick a slot that merely looks
++    plausible. Raises if none matches — a silent wrong slot would corrupt a
++    real contract's storage and look like a contract bug.
++    """
++    abi = [{"inputs": [], "name": "getReserves", "stateMutability": "view",
++            "outputs": [{"name": "_reserve0", "type": "uint112"},
++                        {"name": "_reserve1", "type": "uint112"},
++                        {"name": "_blockTimestampLast", "type": "uint32"}],
++            "type": "function"}]
++    c = w3.eth.contract(address=Web3.to_checksum_address(pair), abi=abi)
++    want = c.functions.getReserves().call()
++    for slot in range(0, 24):
++        r0, r1, ts = _decoded_reserves(w3, pair, slot)
++        if r0 == want[0] and r1 == want[1]:
++            assert ts == want[2], (
++                f"slot {slot} matched the reserves but not the timestamp "
++                f"({ts} vs {want[2]}); the layout assumption is wrong"
++            )
++            return slot
++    raise AssertionError(
++        f"could not find the reserves slot for pair {pair}; the V2 storage "
++        f"layout is not what this test assumes"
++    )
++
++
++def _apply_skew(w3, pair: str, slot: int, factor: float) -> Tuple[int, int, int]:
++    """
++    Scale a pair's stored input-token reserve, and return (r0, r1, new_r0).
++
++    This must be re-applied before every trade that consumes it: V2's swap()
++    ends with `_update(balance0, balance1, ...)`, which writes the pair's REAL
++    balances back into storage. So the manufactured price survives exactly one
++    swap and then the market is back. A test that skips the re-apply fails with
++    INSUFFICIENT_OUTPUT_AMOUNT — the leg-1 floor was set against a price that no
++    longer exists — which is how this was discovered.
++    """
++    r0, r1, ts = _decoded_reserves(w3, pair, slot)
++    assert r0 > 0 and r1 > 0, "pair has empty reserves; nothing to skew"
++    new_r0 = int(r0 * factor)
++    packed = new_r0 | (r1 << 112) | (ts << 224)
++    resp = w3.provider.make_request(
++        "anvil_setStorageAt", [Web3.to_checksum_address(pair), hex(slot), hex(packed)])
++    assert "error" not in resp or not resp["error"], \
++        f"anvil refused the storage write: {resp}"
++    after = _decoded_reserves(w3, pair, slot)
++    assert after[0] == new_r0 and after[1] == r1, "the storage write did not take effect"
++    return r0, r1, new_r0
++
++
++class Skewed:
++    """A plan whose edge comes from a skewed pair, plus how to re-apply it."""
++
++    def __init__(self, plan, res, skew, resolver, pair, slot):
++        self.plan = plan
++        self.res = res
++        self.skew = skew
++        self.resolver = resolver
++        self.pair = pair
++        self.slot = slot
++
++
++@pytest.fixture(scope="module")
++def skewed_plan(provider, forked_net, live_plan):
++    """
++    A plan built against a V2 pair whose price has been deliberately skewed.
++
++    The pair's stored USDT reserve is scaled by SKEW_FACTOR (default 0.98), which
++    makes WBNB ~2% cheaper there than the market while leaving the V3 leg priced
++    by the real market — i.e. a guaranteed, repeatable arbitrage. The write is a
++    single storage slot on a throwaway fork; the contract, routers, pools and
++    token balances are all real mainnet ones.
++
++    The k-invariant check inside V2's swap() is satisfied because it compares
++    the ACTUAL balances (which stay large) against the STORED reserves (which
++    shrink): the manufactured price is unfavourable to the pool in the same
++    direction that makes the k check pass more easily.
++    """
++    w3 = provider.w3
++    plan0, res0, _ = live_plan
++    v2 = next((q for q in res0.usable if q.version == "v2"), None)
++    assert v2 is not None and v2.pool_address, "no usable V2 leg to skew"
++
++    slot = _reserves_slot(w3, v2.pool_address)
++    skew = _apply_skew(w3, v2.pool_address, slot, SKEW_FACTOR)
++
++    # Re-scan so the plan prices the skewed state exactly as production would.
++    res, reader = _scan(provider, forked_net)
++    plan, resolver = _plan_from(provider, forked_net, res, reader)
++    return Skewed(plan, res, skew, resolver, v2.pool_address, slot)
++
++
++@pytest.fixture
++def fresh_skew(provider, skewed_plan):
++    """
++    The skewed plan, with the skew re-applied for THIS test.
++
++    Function-scoped on purpose: any trade through the pair syncs its reserves
++    back to reality (see _apply_skew), so a module-scoped fixture would hand
++    later tests a plan whose price no longer exists.
++    """
++    w3 = provider.w3
++    _apply_skew(w3, skewed_plan.pair, skewed_plan.slot, SKEW_FACTOR)
++    return skewed_plan
++
++
++def _usdt_balance_of(w3, token_address_: str, who: str) -> int:
++    from abis import ERC20_ABI
++
++    c = w3.eth.contract(address=Web3.to_checksum_address(token_address_), abi=ERC20_ABI)
++    return int(c.functions.balanceOf(who).call())
++
++
++def _plan_args(plan) -> Tuple:
++    return plan.call_args
++
++
++def _run_trade(w3, contract, plan, sender: str):
++    """
++    Send the plan's exact call args and return (receipt, decoded outcome).
++
++    The eth_call first is not just a dry run: anvil forks lazily, fetching each
++    state slot from the upstream RPC on first touch, and a transaction that
++    touches a hundred cold slots can sit unmined for minutes while that happens.
++    Simulating first warms every slot the real transaction needs, so the send
++    mines immediately. It also means a revert is reported as a decoded reason
++    before anything is broadcast.
++    """
++    from arb.executor import decode_outcome
++
++    data = contract.encode_abi(abi_element_identifier="arbitrage", args=_plan_args(plan))
++    _retry(lambda: contract.functions.arbitrage(*_plan_args(plan)).call({"from": sender}),
++           "warming the fork's state before sending")
++
++    tx = {"from": sender, "to": contract.address, "data": data, "value": 0,
++          "gas": 2_000_000, "gasPrice": int(w3.eth.gas_price)}
++    # anvil accounts are unlocked, so no signing or key material is involved.
++    txh = _retry(lambda: w3.eth.send_transaction(tx), "broadcasting on the fork")
++    receipt = _retry(
++        lambda: w3.eth.wait_for_transaction_receipt(txh, timeout=600),
++        "waiting for the forked transaction to mine")
++    outcome = decode_outcome(receipt.logs, contract.abi, contract.address)
++    return receipt, outcome
++
++
++# --------------------------------------------------------------------------
++# 1. the live plan is atomic: profit, or a clean revert
++# --------------------------------------------------------------------------
++def test_live_plan_either_profits_or_reverts_cleanly(provider, live_plan, deployed):
++    """
++    Whatever the market is doing at fork time, this must never half-execute.
++
++    The interesting case cannot be arranged on demand: if the planner accepts
++    the live route, the trade must actually profit and clear its own floor. If
++    the market offers nothing, a revert with unchanged balances is the correct
++    outcome — and the test asserts exactly that, rather than failing because
++    today's market is quiet. What is NOT acceptable, in either direction, is
++    the contract keeping half of the trade.
++    """
++    contract, abi, acct, addr = deployed
++    plan, res, _resolver = live_plan
++    w3 = provider.w3
++
++    before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
++    before_base = _usdt_balance_of(w3, plan.intermediate_token, addr)
++    expected_revert = "EXPECTED TO REVERT" in " ".join(plan.notes)
++
++    if expected_revert:
++        # Either guard is a correct refusal, and WHICH one fires is not something
++        # the planner can promise: CannotRepay runs before the repay, Unprofitable
++        # after it. A route that comes back short of the loan itself trips the
++        # first; one that repays but misses the floor trips the second. Asserting
++        # only "Unprofitable" failed on real data for exactly that reason.
++        with pytest.raises(Exception) as excinfo:      # noqa: PT011 - asserted below
++            _retry(lambda: contract.functions.arbitrage(*plan.call_args)
++                   .call({"from": acct}), "simulating the live plan")
++        text = str(excinfo.value).lower()
++        assert UNPROFITABLE in text or CANNOT_REPAY in text, (
++            f"a plan flagged as unprofitable must be refused by the contract's own "
++            f"checks ({UNPROFITABLE} Unprofitable / {CANNOT_REPAY} CannotRepay); "
++            f"got: {excinfo.value}"
++        )
++        assert _usdt_balance_of(w3, plan.borrow_token, addr) == before_usdt
++    else:
++        receipt, outcome = _run_trade(w3, contract, plan, acct)
++        assert receipt.status == 1, "the planner accepted a route that reverted"
++        assert outcome is not None, "no ArbitrageExecuted event was emitted"
++        profit = int(outcome["outcome.profit"])
++        assert profit > 0, f"a plan the planner accepted lost {profit} wei"
++        assert profit >= plan.min_profit, (
++            f"profit {profit} below the plan's own floor {plan.min_profit}"
++        )
++        assert _usdt_balance_of(w3, plan.borrow_token, addr) == before_usdt + profit
++
++    # Either way: no half-executed state. Base is transient — bought and sold
++    # inside one transaction — so its balance must be exactly what it was.
++    assert _usdt_balance_of(w3, plan.intermediate_token, addr) == before_base, \
++        "the contract kept base tokens it should have sold"
++
++
++# --------------------------------------------------------------------------
++# 2. a real round trip, on real pools, with a manufactured edge
++# --------------------------------------------------------------------------
++def test_manufactured_edge_profits_though_real_pools(provider, fresh_skew, deployed):
++    contract, abi, acct, addr = deployed
++    plan, res, skew, resolver = fresh_skew.plan, fresh_skew.res, \
++        fresh_skew.skew, fresh_skew.resolver
++    w3 = provider.w3
++    r0, r1, new_r0 = skew
++
++    assert plan.min_profit_floor > 0, "the gas-cost floor must be set before sending"
++    assert plan.min_profit == plan.min_profit_floor
++    assert plan.expected_gross_bps > 50, (
++        f"the skew was meant to create a large edge; the plan sees "
++        f"{plan.expected_gross_bps:.1f} bps — the V2 price did not move as intended"
++    )
++
++    before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
++    receipt, outcome = _run_trade(w3, contract, plan, acct)
++    assert receipt.status == 1, "the arbitrage reverted on real mainnet pools"
++    assert outcome is not None, "no ArbitrageExecuted event was emitted"
++
++    profit = int(outcome["outcome.profit"])
++    assert profit > 0, f"round trip did not profit: {profit} wei"
++    assert profit >= plan.min_profit, (
++        f"contract reported profit {profit} below its own floor {plan.min_profit}"
++    )
++
++    # The profit stays IN the contract as quote-token balance, which is what
++    # withdrawTokens moves later.
++    held = _usdt_balance_of(w3, plan.borrow_token, addr)
++    assert held == before_usdt + profit, f"contract holds {held}, event says {profit}"
++
++    # And it is the rough size the numbers say: ~2% of a ~750 USDT notional.
++    expected = plan.flash_amount * plan.expected_gross_bps / 10_000
++    assert profit > expected * 0.5, (
++        f"profit {profit} is nowhere near the ~{expected:.0f} wei the plan's own "
++        f"numbers predict"
++    )
++
++
++# --------------------------------------------------------------------------
++# 3. an unreachable floor reverts and moves nothing
++# --------------------------------------------------------------------------
++def test_impossible_min_profit_reverts_without_moving_tokens(provider, fresh_skew, deployed):
++    contract, abi, acct, addr = deployed
++    plan = fresh_skew.plan
++    w3 = provider.w3
++
++    before_usdt = _usdt_balance_of(w3, plan.borrow_token, addr)
++    before_base = _usdt_balance_of(w3, plan.intermediate_token, addr)
++
++    impossible = dataclasses.replace(plan, min_profit=10 ** 27)
++
++    def call():
++        contract.functions.arbitrage(*impossible.call_args).call({"from": acct})
++
++    _assert_reverted_with(call, UNPROFITABLE,
++                          "a min_profit no round trip could ever reach")
++
++    assert _usdt_balance_of(w3, plan.borrow_token, addr) == before_usdt
++    assert _usdt_balance_of(w3, plan.intermediate_token, addr) == before_base
++
++
++# --------------------------------------------------------------------------
++# 4. the LOK trap stays closed
++# --------------------------------------------------------------------------
++def test_borrowing_from_the_leg2_pool_reverts_with_lok(provider, fresh_skew, deployed):
++    """
++    The flash loan must not come from the pool leg 2 swaps through: flash()
++    holds that pool's lock for the whole callback, so the swap inside it reverts
++    with 'LOK'. This asserts the trap is real — and, by implication, that
++    choose_flash_pool avoiding it is load-bearing rather than defensive.
++    """
++    contract, abi, acct, addr = deployed
++    plan, resolver = fresh_skew.plan, fresh_skew.resolver
++    w3 = provider.w3
++
++    # The pool leg 2 actually swaps through is the one the PLANNER resolved for
++    # the sell leg's fee tier. Taking "the first usable V3 quote" instead picks a
++    # different tier much of the time, and the trapped plan then fails for an
++    # unrelated reason (it borrowed from an arbitrary pool) instead of
++    # demonstrating LOK — which is exactly what happened while writing this.
++    leg2_pool = resolver(plan.v3_fee)
++    assert leg2_pool, f"could not resolve a pool for tier {plan.v3_fee}"
++    assert leg2_pool.lower() != plan.pool.lower(), (
++        "the flash pool and leg 2's pool must differ; otherwise this tests nothing"
++    )
++
++    trapped = dataclasses.replace(plan, pool=Web3.to_checksum_address(leg2_pool))
++
++    def call():
++        contract.functions.arbitrage(*trapped.call_args).call({"from": acct})
++
++    with pytest.raises(Exception) as excinfo:      # noqa: PT011 - asserted below
++        call()
++    assert "LOK" in str(excinfo.value), (
++        f"expected the pool's reentrancy lock to refuse this; got: {excinfo.value}"
++    )
++
++
++# --------------------------------------------------------------------------
++# 5. withdrawals are owner-only, and move the real amount
++# --------------------------------------------------------------------------
++def test_withdraw_is_owner_only_then_moves_exactly_that_amount(provider, fresh_skew, deployed):
++    contract, abi, acct, addr = deployed
++    plan = fresh_skew.plan
++    w3 = provider.w3
++
++    if _usdt_balance_of(w3, plan.borrow_token, addr) == 0:
++        receipt, _ = _run_trade(w3, contract, plan, acct)
++        assert receipt.status == 1, "needed a profitable trade first; it reverted"
++
++    balance = _usdt_balance_of(w3, plan.borrow_token, addr)
++    assert balance > 0
++
++    stranger = w3.eth.accounts[1]
++
++    def stranger_call():
++        contract.functions.withdrawTokens(plan.borrow_token, stranger, balance).call(
++            {"from": stranger})
++
++    _assert_reverted_with(stranger_call, NOT_OWNER,
++                          "a withdrawal attempted by a non-owner")
++    assert _usdt_balance_of(w3, plan.borrow_token, addr) == balance, \
++        "a refused withdrawal must not move anything"
++
++    before_owner = _usdt_balance_of(w3, plan.borrow_token, acct)
++    txh = contract.functions.withdrawTokens(plan.borrow_token, acct, balance).transact(
++        {"from": acct, "gas": 200_000})
++    receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
++    assert receipt.status == 1
++    assert _usdt_balance_of(w3, plan.borrow_token, acct) == before_owner + balance
++    assert _usdt_balance_of(w3, plan.borrow_token, addr) == 0
++
++
++# --------------------------------------------------------------------------
++# 6. the contract's fee preview agrees with the planner, to the wei
++# --------------------------------------------------------------------------
++def test_preview_flash_fee_matches_the_planner(provider, fresh_skew, deployed):
++    """
++    The planner computes ceil(amount * tier / 1e6) off-chain and the pool
++    charges its own figure on-chain. If they ever disagree the plan is
++    mispricing its loan, so ask the deployed contract — which quotes the real
++    pool — and compare.
++    """
++    contract, abi, acct, addr = deployed
++    plan = fresh_skew.plan
++
++    fee0, fee1 = contract.functions.previewFlashFee(plan.pool, plan.flash_amount).call()
++    assert fee0 == fee1 == plan.expected_flash_fee, (
++        f"planner says the flash fee is {plan.expected_flash_fee} wei, the pool says "
++        f"{fee0}/{fee1} wei — the plan is pricing its own loan wrong"
++    )
+diff --git a/tests/test_math.py b/tests/test_math.py
+index f68ae29..ce43da7 100644
+--- a/tests/test_math.py
++++ b/tests/test_math.py
+@@ -99,18 +99,29 @@ def requires(*modules: str):
+                     hint="python -m pip install -r requirements.txt")
+             skipped.__name__ = fn.__name__
+             skipped.__doc__ = fn.__doc__
+-            return test(skipped)
+-        return test(fn)
++            return case(skipped)
++        return case(fn)
+ 
+-    # NOTE: `requires` registers the test itself, so it REPLACES `@test` rather
++    # NOTE: `requires` registers the test itself, so it REPLACES `@case` rather
+     # than stacking on top of it. Writing both registers the same name twice -
+     # once runnable and once skipped - which shows up as a phantom failure next
+     # to a skip for the identical test.
+     return decorate
+ 
+ 
+-def test(fn: Callable[[], None]):
+-    """Decorator registering a test."""
++def case(fn: Callable[[], None]):
++    """
++    Decorator registering a test.
++
++    Deliberately NOT named `test`: pytest collects every module-level function
++    whose name starts with `test`, so a decorator called `test` became a
++    collected item in its own right — one with a required `fn` argument, which
++    pytest reported as `fixture 'fn' not found`. That turned every `pytest
++    tests/` run into "1 passed, 1 error" regardless of whether any maths was
++    wrong, and an error line next to a pass is exactly how a real failure later
++    gets ignored. The whole suite is run instead by the single `test_*`
++    function at the bottom of this file.
++    """
+     TESTS.append((fn.__name__, fn))
+     return fn
+ 
+@@ -121,7 +132,7 @@ TESTS: List[Tuple[str, Callable[[], None]]] = []
+ # --------------------------------------------------------------------------
+ # TickMath
+ # --------------------------------------------------------------------------
+-@test
++@case
+ def tick_math_known_vectors():
+     check(v3.get_sqrt_ratio_at_tick(0) == v3.Q96, "tick 0 must be exactly 2**96 (price 1.0)")
+     check(v3.get_sqrt_ratio_at_tick(v3.MIN_TICK) == v3.MIN_SQRT_RATIO,
+@@ -136,7 +147,7 @@ def tick_math_known_vectors():
+     check(approx(price, 1 / 1.0001, 1e-9), f"tick -1 got {price!r}")
+ 
+ 
+-@test
++@case
+ def tick_math_round_trip():
+     for tick in (0, 1, -1, 100, -100, 12345, -98765, 200_000, -200_000,
+                  v3.MIN_TICK + 1, v3.MAX_TICK - 1):
+@@ -145,7 +156,7 @@ def tick_math_round_trip():
+         check(back == tick, f"round trip failed for tick {tick}: got {back}")
+ 
+ 
+-@test
++@case
+ def tick_math_monotonic():
+     prev = 0
+     for tick in range(-1000, 1001, 7):
+@@ -154,7 +165,7 @@ def tick_math_monotonic():
+         prev = ratio
+ 
+ 
+-@test
++@case
+ def tick_math_bounds():
+     for bad in (v3.MIN_TICK - 1, v3.MAX_TICK + 1, 10 ** 9):
+         try:
+@@ -173,7 +184,7 @@ def tick_math_bounds():
+ # --------------------------------------------------------------------------
+ # FullMath / SqrtPriceMath
+ # --------------------------------------------------------------------------
+-@test
++@case
+ def mul_div_rounding():
+     check(v3.mul_div(7, 3, 2) == 10, "21/2 floors to 10")
+     check(v3.mul_div(7, 3, 2, round_up=True) == 11, "21/2 rounds up to 11")
+@@ -184,7 +195,7 @@ def mul_div_rounding():
+     check(v3.mul_div(big, big, big) == big, "a*a/a == a for huge a")
+ 
+ 
+-@test
++@case
+ def amount_deltas():
+     sqrt_a = v3.get_sqrt_ratio_at_tick(-1000)
+     sqrt_b = v3.get_sqrt_ratio_at_tick(1000)
+@@ -203,7 +214,7 @@ def amount_deltas():
+     check(v3.get_amount0_delta(sqrt_a, sqrt_b, -liquidity, True) == -a0, "negative liquidity")
+ 
+ 
+-@test
++@case
+ def next_sqrt_price_direction():
+     liquidity = 10 ** 18
+     current = v3.get_sqrt_ratio_at_tick(0)
+@@ -218,7 +229,7 @@ def next_sqrt_price_direction():
+ # --------------------------------------------------------------------------
+ # SwapMath
+ # --------------------------------------------------------------------------
+-@test
++@case
+ def swap_step_single_range():
+     """
+     current=tick(-100), target=tick(+100) => target price is ABOVE current, so
+@@ -258,7 +269,7 @@ def swap_step_single_range():
+           "selling token0 must lower the price, bounded by the target")
+ 
+ 
+-@test
++@case
+ def swap_step_small_exact_output_stops_short():
+     """
+     Asking for LESS output than the range can supply must not reach the target,
+@@ -277,7 +288,7 @@ def swap_step_small_exact_output_stops_short():
+           "paying in token1 to receive token0 across a falling price must cost more")
+ 
+ 
+-@test
++@case
+ def swap_step_reaches_target_when_rich():
+     """
+     Asking for exactly the range's capacity lands precisely on the target.
+@@ -317,7 +328,7 @@ def swap_step_reaches_target_when_rich():
+           "a small request must stop strictly inside the range")
+ 
+ 
+-@test
++@case
+ def tick_math_constants_are_self_consistent():
+     """
+     Re-derive every TickMath constant from first principles with 200 digits of
+@@ -369,7 +380,7 @@ class FakeBitmap:
+         return self.words.get(position, 0)
+ 
+ 
+-@test
++@case
+ def tick_bitmap_walk():
+     """
+     Two subtleties, both reproduced faithfully from the Solidity:
+@@ -418,7 +429,7 @@ def tick_bitmap_walk():
+     check(init and nxt == 600, f"down from an initialised tick returns it, got ({nxt}, {init})")
+ 
+ 
+-@test
++@case
+ def tick_bitmap_exact_boundary_stall_is_faithful():
+     """
+     Documents a real edge case: when the current tick sits exactly on a spacing
+@@ -446,7 +457,7 @@ def tick_bitmap_exact_boundary_stall_is_faithful():
+               f"unexpected error: {exc}")
+ 
+ 
+-@test
++@case
+ def tick_bitmap_compressed_matches_solidity():
+     """
+     The truncate-toward-zero-then-decrement rule, checked directly against a
+@@ -485,7 +496,7 @@ def tick_bitmap_compressed_matches_solidity():
+     check(our_compressed(-2000, 60) == -34, "-2000/60 -> -33, then -- -> -34")
+ 
+ 
+-@test
++@case
+ def tick_bitmap_empty_word():
+     spacing = 200
+     bm = FakeBitmap([-40000, 40000], spacing)
+@@ -569,7 +580,7 @@ def ladder_pool(segments: List[Tuple[int, int, int]], start_tick: int,
+     )
+ 
+ 
+-@test
++@case
+ def v3_quote_matches_the_analytic_single_range_solution():
+     """
+     Inside one tick range V3 obeys
+@@ -614,7 +625,7 @@ def v3_quote_matches_the_analytic_single_range_solution():
+     check(q.liquidity_after == pool["liquidity"], "liquidity must be unchanged inside the range")
+ 
+ 
+-@test
++@case
+ def v3_virtual_reserves_do_not_satisfy_v2_formula():
+     """
+     Guards the note above with numbers: x*y == L**2 only at the range ends, so
+@@ -641,7 +652,7 @@ def v3_virtual_reserves_do_not_satisfy_v2_formula():
+           "L/S and L*S are the pointwise virtual reserves whose product is L**2")
+ 
+ 
+-@test
++@case
+ def v3_quote_price_impact_is_monotonic():
+     """Bigger trades must never get a better price, and must push price down."""
+     pool = ladder_pool(
+@@ -665,7 +676,7 @@ def v3_quote_price_impact_is_monotonic():
+         check(q.amount_in == size, "exact input must be fully consumed")
+ 
+ 
+-@test
++@case
+ def v3_quote_walks_multiple_ranges():
+     """
+     A trade big enough to run through several liquidity segments must cross
+@@ -692,7 +703,7 @@ def v3_quote_walks_multiple_ranges():
+         check("liquidity" in str(exc).lower(), f"unexpected error: {exc}")
+ 
+ 
+-@test
++@case
+ def v3_quote_crosses_ticks_upward():
+     """Selling token1 walks the price UP and crosses each range boundary."""
+     pool = ladder_pool(
+@@ -707,7 +718,7 @@ def v3_quote_crosses_ticks_upward():
+     check(q.liquidity_after != pool["liquidity"], "liquidity must change across a boundary")
+ 
+ 
+-@test
++@case
+ def v3_quote_reports_insufficient_liquidity_past_last_range():
+     """
+     Once a swap crosses out of the only range in a pool, liquidity is 0 and the
+@@ -726,7 +737,7 @@ def v3_quote_reports_insufficient_liquidity_past_last_range():
+               f"unexpected error: {exc}")
+ 
+ 
+-@test
++@case
+ def v3_quote_exact_output_consistency():
+     """exact-in then exact-out for the same amount must agree to a wei or two."""
+     pool = single_range_pool(liquidity=5 * 10 ** 19)
+@@ -745,7 +756,7 @@ def v3_quote_exact_output_consistency():
+     check(not q_out.exact_input and q_in.exact_input, "the two quotes must differ in mode")
+ 
+ 
+-@test
++@case
+ def v3_quote_insufficient_liquidity_raises():
+     pool = single_range_pool(liquidity=10 ** 14)
+     kwargs = {k: v for k, v in pool.items() if k not in ("lower", "upper")}
+@@ -756,7 +767,7 @@ def v3_quote_insufficient_liquidity_raises():
+         pass
+ 
+ 
+-@test
++@case
+ def v3_price_conversion_with_decimals():
+     """WETH(18)/USDC(6) style pool: raw price is 1e-12 of the human price."""
+     sqrt_price = v3.sqrt_ratio_x96_from_price(2500 * 10 ** (6 - 18))
+@@ -767,7 +778,7 @@ def v3_price_conversion_with_decimals():
+ # --------------------------------------------------------------------------
+ # V2 maths
+ # --------------------------------------------------------------------------
+-@test
++@case
+ def v2_get_amount_out_matches_closed_form():
+     reserve_in, reserve_out, amount_in = 10 ** 21, 3 * 10 ** 15, 10 ** 18
+     got = v2math.get_amount_out(amount_in, reserve_in, reserve_out)
+@@ -776,7 +787,7 @@ def v2_get_amount_out_matches_closed_form():
+     check(got < reserve_out, "cannot drain more than the pool holds")
+ 
+ 
+-@test
++@case
+ def v2_get_amount_in_rounds_up():
+     reserve_in, reserve_out, amount_out = 10 ** 21, 3 * 10 ** 15, 10 ** 14
+     need = v2math.get_amount_in(amount_out, reserve_in, reserve_out)
+@@ -787,7 +798,7 @@ def v2_get_amount_in_rounds_up():
+     check(one_less < amount_out, "rounding up must be tight (need-1 should be insufficient)")
+ 
+ 
+-@test
++@case
+ def v2_reserves_price_and_decimals():
+     """WETH is token0 (0xC02a… < 0xdAC1…), 18 vs 6 decimals."""
+     reserves = v2math.V2Reserves(
+@@ -812,14 +823,14 @@ def v2_reserves_price_and_decimals():
+     check(base_reserve == reserves.reserve1 and quote_reserve == reserves.reserve0, "reserves_for token1")
+ 
+ 
+-@test
++@case
+ def v2_multi_hop():
+     amounts = v2math.get_amounts_out(10 ** 18, [(10 ** 21, 3 * 10 ** 15), (3 * 10 ** 15, 10 ** 21)])
+     check(len(amounts) == 3, "one output per hop plus the input")
+     check(amounts[2] < amounts[0], "two hops of fees must cost something")
+ 
+ 
+-@test
++@case
+ def v2_to_raw_avoids_float_drift():
+     check(v2math.to_raw(1.5, 18) == 1_500_000_000_000_000_000, "1.5 ETH")
+     check(v2math.to_raw(0.1, 18) == 100_000_000_000_000_000, "0.1 ETH must not be 99999…")
+@@ -857,7 +868,7 @@ def _gas(cost_quote: float = 5.0) -> object:
+     return G()
+ 
+ 
+-@test
++@case
+ def signal_no_edge_is_not_actionable():
+     settings = Settings()
+     sig = evaluate(settings=settings, index=PricePoint("ETH", "USDT", 2700.0, "cmc"),
+@@ -867,7 +878,7 @@ def signal_no_edge_is_not_actionable():
+     check(any("threshold" in r for r in sig.reasons), f"reasons: {sig.reasons}")
+ 
+ 
+-@test
++@case
+ def signal_real_edge_is_actionable():
+     settings = Settings()
+     settings.include_gas_cost = False
+@@ -882,7 +893,7 @@ def signal_real_edge_is_actionable():
+     check(approx(sig.gross_edge_bps, (2700 - 2680) / 2700 * 10_000, 1e-9), "edge maths")
+ 
+ 
+-@test
++@case
+ def signal_reverse_direction():
+     settings = Settings()
+     settings.include_gas_cost = False
+@@ -892,7 +903,7 @@ def signal_reverse_direction():
+     check(sig.actionable, f"expected actionable, reasons={sig.reasons}")
+ 
+ 
+-@test
++@case
+ def signal_gas_kills_small_edge():
+     settings = Settings()
+     settings.include_gas_cost = True
+@@ -904,7 +915,7 @@ def signal_gas_kills_small_edge():
+     check(any("gas" in r for r in sig.reasons), f"reasons: {sig.reasons}")
+ 
+ 
+-@test
++@case
+ def signal_slippage_guard():
+     settings = Settings()
+     settings.include_gas_cost = False
+@@ -915,7 +926,7 @@ def signal_slippage_guard():
+     check(any("slippage" in r for r in sig.reasons), f"reasons: {sig.reasons}")
+ 
+ 
+-@test
++@case
+ def signal_sanity_warning_on_absurd_spread():
+     settings = Settings()
+     sig = evaluate(settings=settings, index=PricePoint("ETH", "USDT", 2700.0, "cmc"),
+@@ -924,7 +935,7 @@ def signal_sanity_warning_on_absurd_spread():
+           "a 10x discrepancy must warn about a wrong asset/pool")
+ 
+ 
+-@test
++@case
+ def gas_estimate_uses_native_price():
+     settings = Settings()
+     settings.gas_units_per_swap = 180_000
+@@ -956,7 +967,7 @@ def gas_estimate_uses_native_price():
+ # 1e18 as though it were a token balance.
+ 
+ 
+-@test
++@case
+ def venue_registry_is_internally_consistent():
+     from config import VENUES, venues_for
+ 
+@@ -995,7 +1006,7 @@ def venue_registry_is_internally_consistent():
+                   f"venues_for({net_key}) returned {v.key} which is not registered there")
+ 
+ 
+-@test
++@case
+ def pancakeswap_v3_tiers_differ_from_uniswap():
+     """
+     PancakeSwap V3 uses 100/500/2500/10000; Uniswap V3 uses 100/500/3000/10000.
+@@ -1019,7 +1030,7 @@ def pancakeswap_v3_tiers_differ_from_uniswap():
+           f"unexpected Uniswap tiers: {uni.fee_tiers}")
+ 
+ 
+-@test
++@case
+ def v2_fee_constants_match_each_protocol():
+     """
+     Uniswap V2: amountIn * 997  / 1000  -> 30 bps
+@@ -1053,7 +1064,7 @@ def v2_fee_constants_match_each_protocol():
+           f"expected roughly a 5 bps difference, got {gap_bps:.3f} bps")
+ 
+ 
+-@test
++@case
+ def pancakeswap_router_is_not_the_smart_router():
+     """
+     PancakeSwap's Smart Router (0x13f4EA83D0bd40E75C8222255bc855a974568Dd4)
+@@ -1139,7 +1150,7 @@ def v3_slot0_selector_is_shared_but_decoding_differs():
+                   f"{net_key}/{key} must declare the uint8 slot0 layout")
+ 
+ 
+-@test
++@case
+ def v3_liquidity_is_not_a_token_balance():
+     """
+     Guard against the two mistakes that follow from treating a V3 pool's
+@@ -1166,7 +1177,7 @@ def v3_liquidity_is_not_a_token_balance():
+         check(size / PROBE_DIVISOR < size, "probe did not reduce the size")
+ 
+ 
+-@test
++@case
+ def cross_depth_gate_rejects_a_thin_pool():
+     """
+     The regression test for the +560,239 bps phantom.
+@@ -1224,7 +1235,7 @@ def cross_depth_gate_rejects_a_thin_pool():
+           f"sanity: the ungated comparison really was absurd ({phantom_bps:,.0f} bps)")
+ 
+ 
+-@test
++@case
+ def cross_route_compares_exec_not_mid():
+     """
+     The route must be chosen on executable prices. Choosing on mids and then
+@@ -1287,7 +1298,7 @@ def cross_route_compares_exec_not_mid():
+           f"the mixed-column figure ({mixed:.0f} bps) should dwarf the real one")
+ 
+ 
+-@test
++@case
+ def cross_split_of_mid_spread_and_execution_cost():
+     """mid_spread + gross_edge must reconcile through execution_cost."""
+     from dex.cross import CrossScanResult, VenueQuote, _pick_route
+@@ -1314,7 +1325,7 @@ def cross_split_of_mid_spread_and_execution_cost():
+     check(not res.same_venue, "two different venue keys must not read as same-venue")
+ 
+ 
+-@test
++@case
+ def bsc_network_and_testnet_are_configured():
+     """BNB Chain is where both DEXes have liquidity; testnet is for execution."""
+     from config import NETWORKS, get_network, get_venue
+@@ -1366,7 +1377,7 @@ def pool_cache_keys_include_the_factory():
+           "pair_address must derive a factory component for its cache key")
+ 
+ 
+-@test
++@case
+ def wrapped_tokens_get_an_exchange_listed_index_symbol():
+     """
+     WBNB is the base symbol of BNB Chain but no exchange lists it, so an index
+@@ -1393,7 +1404,7 @@ def wrapped_tokens_get_an_exchange_listed_index_symbol():
+         check(k.startswith("W"), f"{k} is not a wrapped symbol")
+ 
+ 
+-@test
++@case
+ def bnb_and_wbnb_resolve_to_the_same_contract():
+     """
+     Two symbol lookups that must NOT be confused, in opposite directions.
+@@ -1423,7 +1434,7 @@ def bnb_and_wbnb_resolve_to_the_same_contract():
+     check(index_symbol("BNB") == "BNB", "BNB needs no conversion")
+ 
+ 
+-@test
++@case
+ def cross_bps_figures_have_three_denominators():
+     """
+     Pins the convention, and the trap that comes with it.
+@@ -1495,7 +1506,7 @@ def cross_bps_figures_have_three_denominators():
+           "profit must equal edge x capital deployed")
+ 
+ 
+-@test
++@case
+ def cross_route_money_rows_sum_for_many_shapes():
+     """The currency accounting must hold regardless of which leg wins or loses."""
+     from dex.cross import CrossScanResult, VenueQuote, _pick_route
+@@ -1536,7 +1547,7 @@ def cross_route_money_rows_sum_for_many_shapes():
+               "execution_cost_bps disagrees with its own definition")
+ 
+ 
+-@test
++@case
+ def v2_venues_do_not_get_a_fee_tier_suffix():
+     """
+     A V2 pool has one fee and no tiers, so its label must not read like a tier.
+@@ -1564,7 +1575,7 @@ def v2_venues_do_not_get_a_fee_tier_suffix():
+     check(v2.fee_bps == 25.0 and v2.fee_pips == 2500, "V2 fee data was dropped")
+ 
+ 
+-@test
++@case
+ def cross_json_includes_computed_fields():
+     """
+     `dict(quote.__dict__)` silently drops every @property, so an earlier version
+@@ -1700,7 +1711,7 @@ def every_configured_address_is_a_valid_checksum():
+             raise AssertionError(f"{bad!r} was accepted as an address")
+ 
+ 
+-@test
++@case
+ def v3_factory_and_router_are_different_contracts():
+     """
+     PancakeSwap's own testnet docs list 0x9a489505a00cE272eAa5e07Dba6491314CaE3796
+@@ -1733,7 +1744,7 @@ def v3_factory_and_router_are_different_contracts():
+           f"testnet V3 router is {tn.router}")
+ 
+ 
+-@test
++@case
+ def testnet_gas_symbol_is_priced_by_an_exchange():
+     """
+     Gas is costed by looking up the network's native_symbol on an exchange. BNB
+@@ -1750,7 +1761,7 @@ def testnet_gas_symbol_is_priced_by_an_exchange():
+               f"which no exchange lists - gas costing will fail on this network")
+ 
+ 
+-@test
++@case
+ def cross_staleness_detector_sees_what_the_depth_gate_cannot():
+     """
+     Two independent gates, and neither substitutes for the other.
+@@ -2017,7 +2028,7 @@ def wallet_signs_a_transaction_offline():
+               f"signature recovers to {recovered}, not the wallet's {info.address}")
+ 
+ 
+-@test
++@case
+ def faucet_list_puts_free_ones_first():
+     """
+     Ordering is the whole point of this table. Most 2026 faucets gate claims
+@@ -2155,7 +2166,7 @@ _TESTNET_SPECS = (
+ )
+ 
+ 
+-@test
++@case
+ def to_wei_is_exact_where_float_truncation_is_not():
+     """
+     Two separate float failures, both of which hit on the small sizes a testnet
+@@ -2184,7 +2195,7 @@ def to_wei_is_exact_where_float_truncation_is_not():
+     check(to_wei(2_700.5, 6) == 2_700_500_000, "fractional 6-decimal amount wrong")
+ 
+ 
+-@test
++@case
+ def slippage_floor_biases_down_and_respects_decimals():
+     """
+     The floor must never exceed what the pool will actually return, or the swap
+@@ -2217,7 +2228,7 @@ def slippage_floor_biases_down_and_respects_decimals():
+         raise AssertionError("a negative slippage tolerance was accepted")
+ 
+ 
+-@test
++@case
+ def plan_picks_one_leg_per_protocol_generation():
+     """
+     The contract's leg 1 is a V2-style router and leg 2 is V3-style, so the best
+@@ -2302,7 +2313,7 @@ def plan_checksums_addresses_so_the_encoder_cannot_reject_them():
+         check(Web3.is_checksum_address(hop), f"v2_path[{i}] is not checksummed: {hop}")
+ 
+ 
+-@test
++@case
+ def plan_predicts_its_own_revert_when_the_edge_cannot_cover_the_fee():
+     """
+     On testnet the round trip is a LOSS, and the plan must say so before anyone
+@@ -2338,7 +2349,7 @@ def plan_predicts_its_own_revert_when_the_edge_cannot_cover_the_fee():
+           "the warning should name the error the contract will raise")
+ 
+ 
+-@test
++@case
+ def plan_refuses_routes_it_cannot_execute():
+     """Every refusal must say what to change, not just that it failed."""
+     from arb.executor import PlanError, plan_arbitrage
+@@ -2463,7 +2474,7 @@ def plan_calldata_encoding_survives_a_roundtrip():
+           "recipient/deadline/amountIn must be zeroed placeholders the contract overwrites")
+ 
+ 
+-@test
++@case
+ def tx_cost_renders_as_a_number_not_a_bound_method():
+     """
+     Regression: `human` was a plain method while every call site is an f-string
+@@ -2490,7 +2501,7 @@ def tx_cost_renders_as_a_number_not_a_bound_method():
+     check(rich.affordable is True, "0.0105 BNB should cover a 0.00009 BNB call")
+ 
+ 
+-@test
++@case
+ def deployment_record_survives_a_roundtrip_outside_build():
+     """
+     Records live in state/, not build/: .gitignore excludes build/ as a Python
+@@ -2581,7 +2592,7 @@ def keystore_password_prompting_decides_correctly():
+             raise AssertionError("a wrong password was accepted")
+ 
+ 
+-@test
++@case
+ def the_offline_import_chain_has_no_module_level_third_party_imports():
+     """
+     Guards the invariant that `main.py selftest` runs on a bare Python install.
+@@ -2790,7 +2801,7 @@ def wallet_password_prompt_retries_then_gives_up_with_guidance():
+             W.prompt_password, W.load_wallet = orig_prompt, orig_load
+ 
+ 
+-@test
++@case
+ def a_cached_solc_binary_that_lost_its_execute_bit_is_repaired():
+     """
+     solcx caches the compiler in ~/.solcx and reuses it forever. If that file
+@@ -2853,7 +2864,7 @@ def a_cached_solc_binary_that_lost_its_execute_bit_is_repaired():
+               "repairing an already-executable binary should be a no-op")
+ 
+ 
+-@test
++@case
+ def an_empty_wallet_is_reported_as_unfunded_not_as_a_broken_transaction():
+     """
+     Two very different problems arrive as the same failed `estimate_gas`, and
+@@ -2980,7 +2991,7 @@ def an_empty_wallet_is_reported_as_unfunded_not_as_a_broken_transaction():
+           == 7_000_000_000, "the legacy fallback is broken")
+ 
+ 
+-@test
++@case
+ def transaction_hashes_are_printed_and_stored_with_the_0x_prefix():
+     """
+     hexbytes changed `.hex()` across major versions - 0.x returned "0x0c8b…",
+@@ -3044,7 +3055,7 @@ def transaction_hashes_are_printed_and_stored_with_the_0x_prefix():
+               f"{to_hex(real)!r}")
+ 
+ 
+-@test
++@case
+ def the_v3_router_shape_is_read_from_bytecode_not_assumed():
+     """
+     `exactInputSingle` comes in two shapes and they differ BETWEEN MAINNET AND
+@@ -3129,7 +3140,7 @@ def the_v3_router_shape_is_read_from_bytecode_not_assumed():
+         raise AssertionError("a router with both selectors was silently assigned a shape")
+ 
+ 
+-@test
++@case
+ def each_legs_slippage_floor_is_denominated_in_the_token_that_leg_pays_out():
+     """
+     Leg 1 buys BASE with the borrowed QUOTE, so its `amountOutMin` is in BASE.
+@@ -3206,7 +3217,7 @@ def each_legs_slippage_floor_is_denominated_in_the_token_that_leg_pays_out():
+ # --------------------------------------------------------------------------
+ # Flash-loan pool selection — the 'LOK' reentrancy constraint
+ # --------------------------------------------------------------------------
+-@test
++@case
+ def the_flash_loan_never_comes_from_the_pool_leg_two_swaps_through():
+     """
+     A V3 pool's flash() takes its reentrancy lock and holds it across the whole
+@@ -3247,7 +3258,7 @@ def the_flash_loan_never_comes_from_the_pool_leg_two_swaps_through():
+         raise AssertionError("the locked pool was offered as the lender")
+ 
+ 
+-@test
++@case
+ def the_cheapest_pool_that_can_lend_wins_and_thin_pools_are_skipped():
+     """
+     PancakeSwap V3 charges the flash fee at the LENDING pool's own swap tier, so
+@@ -3292,7 +3303,7 @@ def the_cheapest_pool_that_can_lend_wins_and_thin_pools_are_skipped():
+     check(tier == 100, f"a locked preference should fall through, got {tier}")
+ 
+ 
+-@test
++@case
+ def when_no_pool_can_lend_the_refusal_states_every_reason():
+     """
+     A refusal that only says "failed" sends the reader hunting. This one has to
+@@ -3317,7 +3328,7 @@ def when_no_pool_can_lend_the_refusal_states_every_reason():
+         raise AssertionError("an impossible loan was accepted")
+ 
+ 
+-@test
++@case
+ def the_repay_is_checked_before_the_transfer_so_the_reason_is_legible():
+     """
+     Without an explicit check, an unprofitable round trip fails inside the token
+@@ -3345,7 +3356,7 @@ def the_repay_is_checked_before_the_transfer_so_the_reason_is_legible():
+     check(guard < transfer, "the guard must come BEFORE the transfer it protects")
+ 
+ 
+-@test
++@case
+ def known_revert_reasons_are_translated_into_a_cause():
+     """
+     These pools and routers revert with reasons that name a mechanism, not a
+@@ -3388,6 +3399,279 @@ def known_revert_reasons_are_translated_into_a_cause():
+     check("SOMETHING_NOVEL" in unknown, f"an unknown reason was hidden: {unknown}")
+ 
+ 
++# --------------------------------------------------------------------------
++# the profit floor (gas cost -> min_profit)
++# --------------------------------------------------------------------------
++# The floor exists because of one measured failure: a testnet run reported
++# "PROFIT" on a round trip that netted 1 wei while spending 331,190 gas. The
++# contract was doing what it was told -- min_profit was 0 -- so the fix belongs
++# here, in the planner, and its arithmetic has to be right in every edge case
++# because a floor that silently rounds down is the same bug again.
++def _fake_scan(buy_exec: float = 760.0, sell_exec: float = 765.0):
++    """A two-leg scan on BSC worth planning: V2 buy, V3 sell, both usable."""
++    from arb.executor import choose_flash_pool  # noqa: F401 - import check
++    from dex.cross import CrossScanResult, VenueQuote
++
++    v2 = VenueQuote(
++        venue_key="pancakeswap_v2", venue_name="PancakeSwap V2", version="v2",
++        fee_pips=25, fee_bps=25.0, ok=True, mid_price=buy_exec, exec_price=buy_exec,
++        impact_bps=9.0, trade_size_base=1.0, router_address="0x" + "AA" * 20,
++        pool_address="0x" + "BB" * 20, block_number=1,
++    )
++    v3 = VenueQuote(
++        venue_key="pancakeswap_v3", venue_name="PancakeSwap V3", version="v3",
++        fee_pips=100, fee_bps=1.0, ok=True, mid_price=sell_exec, exec_price=sell_exec,
++        impact_bps=1.0, trade_size_base=1.0, router_address="0x" + "CC" * 20,
++        pool_address="0x" + "11" * 20, block_number=1,
++    )
++    res = CrossScanResult(
++        network="bsc", base_symbol="WBNB", quote_symbol="USDT",
++        trade_size_base=1.0, max_impact_bps=50.0,
++        quotes=[v2, v3], buy_leg=v2, sell_leg=v3, block_number=1,
++    )
++    pools = {100: "0x" + "11" * 20, 500: "0x" + "22" * 20,
++             2500: "0x" + "33" * 20, 10000: "0x" + "44" * 20}
++
++    def pool_for_fee(fee: int) -> str:
++        return pools.get(int(fee), "")
++
++    return res, pool_for_fee
++
++
++@case
++def profit_floor_never_below_gas_cost():
++    """The regression this whole mechanism exists for: gas beats profit."""
++    from arb.executor import plan_arbitrage
++
++    res, pool_for_fee = _fake_scan()
++    gas = 1_000_000_000_000_000          # 0.001 BNB in wei, ~0.76 USDT at 760
++    plan = plan_arbitrage(
++        res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
++        min_profit_wei=0, gas_cost_quote_wei=gas, min_profit_buffer_bps=2500.0,
++    )
++    floor = plan.min_profit_floor
++    check(floor > gas, f"floor {floor} must exceed the raw gas figure {gas}")
++    check(plan.min_profit == floor,
++          f"min_profit must be raised to the floor, got {plan.min_profit} vs {floor}")
++    check(plan.min_profit >= gas,
++          "min_profit must cover gas or the run can 'profit' while losing money")
++    check(plan.gas_cost_quote_wei == gas, "the plan must carry the gas figure it used")
++
++
++@case
++def profit_floor_never_lowers_the_callers_setting():
++    """An explicit, higher --min-profit is a setting, not a suggestion."""
++    from arb.executor import plan_arbitrage
++
++    res, pool_for_fee = _fake_scan()
++    asked = 5_000_000_000_000_000
++    plan = plan_arbitrage(
++        res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
++        min_profit_wei=asked, gas_cost_quote_wei=1_000_000_000_000_000,
++    )
++    check(plan.min_profit == asked,
++          f"a caller asking for {asked} got {plan.min_profit} instead")
++    check(plan.min_profit_floor < asked, "fixture should make the floor the lower bound")
++
++
++@case
++def profit_floor_absent_without_a_gas_figure():
++    """No gas price known means no floor — and the CLI says so, it does not guess."""
++    from arb.executor import plan_arbitrage
++
++    res, pool_for_fee = _fake_scan()
++    plan = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
++                          min_profit_wei=0, gas_cost_quote_wei=0)
++    check(plan.min_profit == 0, f"expected no floor, got {plan.min_profit}")
++    check(plan.min_profit_floor == 0, "no gas figure must mean no floor")
++
++
++@case
++def profit_floor_buffer_rounds_up_and_rejects_negatives():
++    from arb.executor import PlanError, plan_arbitrage
++
++    res, pool_for_fee = _fake_scan()
++    # Zero buffer still adds 1 wei, so the floor is strictly above the estimate:
++    # landing exactly ON the estimate is the case where fee drift makes a
++    # marginally-profitable run revert.
++    plan = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
++                          gas_cost_quote_wei=3, min_profit_buffer_bps=0.0)
++    check(plan.min_profit_floor == 4, f"expected 3+1, got {plan.min_profit_floor}")
++
++    try:
++        plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
++                       gas_cost_quote_wei=10 ** 15, min_profit_buffer_bps=-1.0)
++    except PlanError:
++        pass
++    else:
++        raise AssertionError("a negative buffer must be refused, not silently used")
++
++
++@case
++def profit_floor_flags_a_run_that_cannot_clear_it():
++    """The planner must SAY a run will revert, not quietly send it."""
++    from arb.executor import plan_arbitrage
++
++    res, pool_for_fee = _fake_scan(buy_exec=760.0, sell_exec=760.10)
++    # Gross 0.10 USDT = 1e17 wei; the tier-500 loan costs 5 bps of 760 = 3.8e17,
++    # so the gross edge does not even cover the flash fee here.
++    plan = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
++                          gas_cost_quote_wei=5 * 10 ** 17)
++    joined = " ".join(plan.notes)
++    check("EXPECTED TO REVERT" in joined,
++          f"a plan that cannot clear its costs must warn; notes were: {plan.notes}")
++    check(plan.min_profit > 0, "the floor must still be set on a doomed plan")
++
++
++@case
++def gas_cost_conversion_is_exact_for_wrapped_native():
++    from arb.executor import gas_cost_in_quote_wei
++
++    wei = 1_234_567_890_000_000
++    check(gas_cost_in_quote_wei(wei, True) == wei,
++          "WBNB is BNB: the conversion must be the identity")
++    check(gas_cost_in_quote_wei(0, True) == 0, "zero gas must convert to zero")
++
++
++@case
++def gas_cost_conversion_uses_the_rate_or_refuses():
++    from arb.executor import gas_cost_in_quote_wei
++
++    # 0.001 BNB at 764.7 USDT/BNB = 0.7647 USDT, in 18-decimal wei.
++    got = gas_cost_in_quote_wei(10 ** 15, False, 764.7)
++    check(got == 764_700_000_000_000_000,
++          f"expected 764700000000000000, got {got}")
++    check(gas_cost_in_quote_wei(10 ** 15, False, 0.0) == 0,
++          "an unknown rate must produce no floor, never a guessed one")
++    # Rounding must go UP: an under-priced floor is the bug this prevents.
++    got = gas_cost_in_quote_wei(3, False, 1.5)
++    check(got == 5, f"3 wei x 1.5 = 4.5 must round up to 5, got {got}")
++
++
++@case
++def the_loan_is_sized_from_the_real_buy_cost_not_a_sell_quote():
++    """
++    The 50 bps bug, pinned down.
++
++    The scan reports what each venue PAYS per base sold. Sizing the flash loan
++    from the cheap venue's sell quote understates the cost of buying by ~2x its
++    fee, so the loan came up ~0.5% short, leg 2 sold less than the plan
++    assumed, and a plan the planner accepted reverted with CannotRepay on chain.
++    With the real getAmountIn cost supplied, the loan must be that number — and
++    gross must be measured against it, not against the optimistic one.
++    """
++    from arb.executor import plan_arbitrage
++
++    res, pool_for_fee = _fake_scan(buy_exec=760.0, sell_exec=765.0)
++    sell_quote_borrow = 760 * 10 ** 18
++    real_cost = int(760 * 10 ** 18 * 1.005)          # ~2 x a 0.25% fee
++
++    optimistic = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee)
++    check(optimistic.flash_amount == sell_quote_borrow,
++          f"without a buy cost the planner uses the sell quote: {optimistic.flash_amount}")
++    check(any("optimistic" in n for n in optimistic.notes),
++          "the fallback must SAY the edge is optimistic, not quietly be one")
++
++    corrected = plan_arbitrage(res, "0x" + "BB" * 20, "0x" + "EE" * 20, pool_for_fee,
++                               v2_buy_cost_wei=real_cost)
++    check(corrected.flash_amount == real_cost,
++          f"the loan must be sized from the real buy cost, got {corrected.flash_amount}")
++    check(corrected.expected_gross_bps < optimistic.expected_gross_bps,
++          "measuring against the true buy cost must LOWER the reported edge")
++    drop = optimistic.expected_gross_bps - corrected.expected_gross_bps
++    check(40 < drop < 60,
++          f"a 0.5% dearer loan should cut ~50 bps from the gross edge, drop was {drop:.1f}")
++    check(any("buy cost" in n for n in corrected.notes),
++          "the correction must be visible in the notes")
++
++
++@case
++def legs_without_a_router_are_never_chosen():
++    """
++    A quoted venue with no router cannot be sent to, so it must not be picked.
++
++    Found on BSC mainnet: the dearest usable V3 venue was Uniswap V3, whose
++    config had no router, and `arb plan` died with "v3=MISSING" instead of
++    trading the best route it COULD execute.
++    """
++    from arb.executor import best_leg
++    from dex.cross import CrossScanResult, VenueQuote
++
++    good = VenueQuote(
++        venue_key="pancakeswap_v3", venue_name="PancakeSwap V3", version="v3",
++        fee_pips=100, fee_bps=1.0, ok=True, exec_price=754.0,
++        router_address="0x" + "CC" * 20, pool_address="0x" + "11" * 20,
++    )
++    no_router = VenueQuote(
++        venue_key="uniswap_v3", venue_name="Uniswap V3", version="v3",
++        fee_pips=100, fee_bps=1.0, ok=True, exec_price=755.0,   # dearest
++        router_address="", pool_address="0x" + "22" * 20,
++    )
++    res = CrossScanResult(network="bsc", base_symbol="WBNB", quote_symbol="USDT",
++                          trade_size_base=1.0, max_impact_bps=50.0,
++                          quotes=[good, no_router], sell_leg=no_router)
++
++    chosen = best_leg(res, "v3", "sell")
++    check(chosen is not None, "a usable, executable V3 leg exists and must be chosen")
++    check(chosen.venue_key == "pancakeswap_v3",
++          f"picked {chosen.label} which has no router; execution would fail")
++    check(chosen.exec_price == 754.0, "the executable leg must win over the cheaper-to-quote one")
++
++    # With no executable candidate at all, the choice is unchanged so the
++    # missing-router error still names the real problem.
++    res2 = CrossScanResult(network="bsc", base_symbol="WBNB", quote_symbol="USDT",
++                           trade_size_base=1.0, max_impact_bps=50.0,
++                           quotes=[no_router], sell_leg=no_router)
++    still = best_leg(res2, "v3", "sell")
++    check(still is not None and still.venue_key == "uniswap_v3",
++          "with nothing executable, the planner must keep the leg so the error names "
++          "the missing router")
++
++
++@requires("requests")
++def private_submit_fails_loudly_never_falls_back():
++    """
++    A private relay that cannot be reached must raise, not silently rebroadcast
++    through the public mempool — that would defeat the whole point of --private.
++    """
++    from arb.deployer import DeployError, _send_raw_private
++
++    try:
++        _send_raw_private("http://127.0.0.1:9/nowhere", b"\x01\x02")
++    except DeployError as exc:
++        msg = str(exc).lower()
++        check("public" in msg,
++              f"the error must say nothing went to the public mempool: {exc}")
++    else:
++        raise AssertionError("an unreachable relay must raise DeployError")
++
++
++# --------------------------------------------------------------------------
++# pytest bridge
++# --------------------------------------------------------------------------
++# pytest collects module-level functions whose names start with `test`, which is
++# why the decorator above is `case`. This single function is the only collected
++# item: it runs the whole registered suite, so `pytest tests/` and
++# `python main.py selftest` can never disagree about whether the maths is right.
++def test_offline_maths_suite():
++    failures: List[str] = []
++    skipped = 0
++    for name, fn in TESTS:
++        try:
++            fn()
++        except SkipTest:
++            skipped += 1
++        except Exception:  # noqa: BLE001
++            failures.append(name)
++            traceback.print_exc(limit=3)
++    assert not failures, (f"{len(failures)} offline case(s) failed: "
++                          f"{', '.join(failures)}")
++    if TESTS and skipped == len(TESTS):
++        import pytest
++
++        pytest.skip("no offline case could run in this environment")
++
++
+ def run_all(verbose: bool = True) -> int:
+     passed = 0
+     skips: List[tuple] = []
