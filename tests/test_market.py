@@ -38,6 +38,7 @@ from eth_abi import encode as abi_encode                            # noqa: E402
 
 from dex import multicall as mc                                     # noqa: E402
 from dex import uniswap_v3_math as v3math                           # noqa: E402
+from dex import prefilter as pf                                       # noqa: E402
 from dex.market_index import (MarketIndex, PairRow,                    # noqa: E402
                              discover_pairs_by_key, discover_v3_pools,
                              load_token_metadata, refresh_mids,
@@ -56,6 +57,13 @@ def case(fn: Callable[[], None]):
 # ---------------------------------------------------------------------------
 # A chain in memory
 # ---------------------------------------------------------------------------
+def _isqrt(value: int) -> int:
+    """Integer square root, exact for the big integers reserves are made of."""
+    import math
+
+    return math.isqrt(int(value))
+
+
 class RateLimited(Exception):
     """Shaped like a provider's 429 — retryable, says nothing about the batch."""
 
@@ -202,6 +210,10 @@ class FakeChain:
                             if info[side] == target:
                                 return True, _word(info["balances"].get(target, 0))
                 return True, _word(0)
+            if sel == mc.selector("liquidity()"):
+                if target in self.pools:
+                    return True, _word(self.pools[target]["liquidity"])
+                return False, b""
             if sel == mc.selector("slot0()"):
                 if target in self.pools:
                     sqrt = self.pools[target]["sqrt"]
@@ -240,9 +252,22 @@ class FakeChain:
             "token0": token0.lower(), "token1": token1.lower(),
             "balances": {token0.lower(): bal0, token1.lower(): bal1},
             "sqrt": v3math.sqrt_ratio_x96_from_price(raw),
+            # Liquidity is what makes a V3 fill computable without tick data, and
+            # for a single-range pool it is determined by the balances:
+            #   r0 = L / sqrtP, r1 = L * sqrtP   =>   L = sqrt(r0 * r1)
+            # Using min(balances) instead — the obvious guess — gives a pool that
+            # is orders of magnitude too thin, and the fill it reports is
+            # nonsense (a 600 USDT trade "filling" for 20 cents). The fixture is
+            # the thing under test here, so it has to be the real relation.
+            "liquidity": _isqrt(bal0 * bal1),
             "fee": fee,
         }
         return addr
+
+    def set_v2_reserves(self, pair: str, r0: int, r1: int):
+        t0, t1, _a, _b = self.v2_pairs[pair.lower()]
+        self.v2_pairs[pair.lower()] = (t0, t1, r0, r1)
+        return pair
 
 
 def temp_index():
@@ -971,6 +996,337 @@ def one_bad_edit_cannot_hide_behind_a_catch_all_handler():
     # A row missing optional pieces must still print: the survey logs rows from
     # failed iterations too, and those have no direction or prices.
     check(main.format_scan_line({}) != "", "an empty row prints something")
+
+
+# ---------------------------------------------------------------------------
+# The fast prefilter — the burst detector's engine
+# ---------------------------------------------------------------------------
+def _watch_fixture(gap: float = 0.0):
+    """
+    Two venues for one pair with a controlled dislocation.
+
+    `gap` is how much richer the V3 pool's WBNB price is than the V2 pool's,
+    expressed as a fraction: the V2 pool always sits at 600 USDT/WBNB and the V3
+    pool at 600 * (1 + gap). Positive gap means WBNB is worth more on V3, which
+    is a buy-on-V2-sell-on-V3 opportunity.
+    """
+    from dex.prefilter import FamilyState, PoolState
+
+    chain = FakeChain()
+    wbnb = chain.add_token("0x" + "bb" * 20, "WBNB", 18)
+    usdt = chain.add_token("0x" + "dd" * 20, "USDT", 6)
+    one = 10 ** 18
+    v2 = chain.add_v2_pair("0x" + "11" * 20, wbnb, usdt, 10_000 * one, 6_000_000 * 10 ** 6)
+    v3pool = chain.add_pool("0x" + "22" * 20, wbnb, usdt, bal0=10_000 * one,
+                            bal1=6_000_000 * 10 ** 6,
+                            price_token1_per_token0=600.0 * (1.0 + gap), fee=100)
+    family = FamilyState(token_a=wbnb, token_b=usdt, pools=[
+        PoolState(address=v2.lower(), venue="pancakeswap_v2", kind="v2", fee_pips=0),
+        PoolState(address=v3pool.lower(), venue="pancakeswap_v3", kind="v3", fee_pips=100),
+    ])
+    order = {v2.lower(): (wbnb, usdt), v3pool.lower(): (wbnb, usdt)}
+    decimals = {wbnb.lower(): 18, usdt.lower(): 6}
+    return chain, family, order, decimals, wbnb
+
+
+@case
+def the_whole_watchlist_reads_in_one_request():
+    """
+    The property the burst loop lives on. A dozen families at a couple of reads
+    per pool has to be ONE request: anything that loops per pool puts the
+    network's latency back inside the loop, and a 60-second loop is what this
+    exists to replace.
+    """
+    from dex.prefilter import sweep
+
+    chain, family, order, decimals, wbnb = _watch_fixture(gap=0.0)
+    families = [family] * 6                      # six families, twelve pools
+    before = chain.requests
+    out = sweep(chain, families, order, decimals, size_base=1.0, base_token=wbnb,
+                gas_bps=0.0, batch_size=3000)
+    requests = chain.requests - before
+    check(requests == 1, f"the whole watchlist must be one request, took {requests}")
+    check(out["stats"]["calls"] >= 12, f"every pool was read: {out['stats']}")
+    check(all(e is not None for e in out["edges"].values()),
+          "and every family produced an edge")
+
+
+@case
+def a_dislocation_shows_up_in_the_right_direction_after_costs():
+    """
+    The sign has to be right, and it has to be right AFTER fees — a prefilter
+    that reports gross spreads sends the slow scanner chasing fee-sized noise all
+    day. Both directions are checked, because a sign error in one of them looks
+    exactly like a market that is always mispriced one way.
+    """
+    from dex.prefilter import sweep
+
+    fee_bps = 100 / 100.0            # 0.01% V3 tier
+    # A 60 bp dislocation: WBNB worth 0.6% more on the V3 pool.
+    chain, family, order, decimals, wbnb = _watch_fixture(gap=0.006)
+    out = sweep(chain, [family], order, decimals, size_base=1.0, base_token=wbnb,
+                gas_bps=0.0, v2_fee_bps=25.0, flash_fee_bps=1.0)
+    edge = out["edges"][0]
+    check(edge is not None, "a family with both legs must produce an edge")
+    check(edge.buy_venue == "pancakeswap_v2",
+          f"WBNB is cheaper on V2, so V2 is the buy leg: {edge.buy_venue}")
+    check(edge.sell_venue == "pancakeswap_v3", "and V3 is the sell leg")
+    check(edge.net_bps > 0,
+          f"60 bps of dislocation clears 25+1+1 bps of fees: {edge.net_bps:.2f}")
+    check(edge.net_bps < edge.gross_bps, "fees must be subtracted, not ignored")
+    check(abs(edge.buy_fee_bps - 25.0) < 1e-9 and abs(edge.sell_fee_bps - fee_bps) < 1e-9,
+          f"each leg pays its own venue's fee: {edge.buy_fee_bps}/{edge.sell_fee_bps}")
+
+    # Mirror the dislocation: now V3 is cheap, so the direction must flip.
+    chain2, family2, order2, decimals2, wbnb2 = _watch_fixture(gap=-0.006)
+    out2 = sweep(chain2, [family2], order2, decimals2, size_base=1.0, base_token=wbnb2,
+                 gas_bps=0.0, v2_fee_bps=25.0, flash_fee_bps=1.0)
+    edge2 = out2["edges"][0]
+    check(edge2.buy_venue == "pancakeswap_v3",
+          f"with the mirror image the buy leg flips: {edge2.buy_venue}")
+    check(edge2.net_bps > 0, f"and it is positive the other way too: {edge2.net_bps:.2f}")
+
+
+@case
+def the_fast_pricer_measures_the_dislocation_it_is_looking_at():
+    """
+    Two ways this measurement was wrong, both invisible in a pass/fail check on
+    the sign alone, and both found by comparing a live family against the real
+    routers (PancakeSwap's reference quote for USDT/USDC implied a +22.8 bps
+    dislocation; the prefilter said -0.16 bps gross).
+
+      1. The probe was sized from ONE reference price for the whole family. When
+         that reference is the higher-priced pool, the conversion subtracts the
+         dislocation from its own measurement. Sizing each pairing from its own
+         buy pool is the fix, and the spread below must come out at roughly the
+         dislocation it was built with: 60 bps, less the two leg fees the fills
+         already charge.
+      2. Venue fees were charged twice — once inside the fills, once again in
+         net_bps. The deep scanner's gross is post-venue-fee, so net must add
+         only the flash loan and gas.
+    """
+    from dex.prefilter import sweep
+
+    gap_bps = 60.0
+    chain, family, order, decimals, wbnb = _watch_fixture(gap=gap_bps / 10_000.0)
+    out = sweep(chain, [family], order, decimals, size_base=1.0, base_token=wbnb,
+                gas_bps=0.0, v2_fee_bps=25.0, flash_fee_bps=1.0)
+    edge = out["edges"][0]
+    check(edge is not None, "the family must price")
+
+    # Leg fees are inside gross; depth makes the fill a shade worse than mid.
+    expected = gap_bps - 25.0 - 1.0            # V2 0.25% buy, V3 0.01% sell
+    check(abs(edge.gross_bps - expected) < 5.0,
+          f"gross must be the dislocation less the leg fees ({expected:.1f} bps), "
+          f"got {edge.gross_bps:.2f}")
+    check(edge.gross_bps > 20.0,
+          f"a 60 bps dislocation must not read as ~0: {edge.gross_bps:.2f}")
+
+    # Fees are NOT charged a second time: only the flash loan is still owed.
+    check(abs((edge.net_bps - edge.gross_bps) + (edge.flash_fee_bps + edge.gas_bps)) < 1e-9,
+          f"net must be gross less flash+gas only: net {edge.net_bps:.4f} "
+          f"gross {edge.gross_bps:.4f} flash {edge.flash_fee_bps} gas {edge.gas_bps}")
+    check(abs(edge.buy_fee_bps - 25.0) < 1e-9 and abs(edge.sell_fee_bps - 1.0) < 1e-9,
+          "the leg fees are still reported, because they explain gross")
+
+
+@case
+def a_clean_market_is_not_reported_as_an_opportunity():
+    """
+    The most important negative result. Two venues at the same price, minus fees,
+    must come out negative — otherwise every sweep reports the deepest pair in
+    the market as a winner and the burst log becomes noise with a timestamp.
+    """
+    from dex.prefilter import sweep
+
+    chain, family, order, decimals, wbnb = _watch_fixture(gap=0.0)
+    out = sweep(chain, [family], order, decimals, size_base=1.0, base_token=wbnb,
+                gas_bps=0.0, v2_fee_bps=25.0, flash_fee_bps=1.0)
+    edge = out["edges"][0]
+    check(edge.net_bps < 0,
+          f"a pool quoting the same price as its neighbour has no edge: {edge.net_bps:.2f}")
+
+    # A dislocation too small to pay for itself must also stay negative: this is
+    # the boundary that decides whether the tool is useful or misleading.
+    chain2, family2, order2, decimals2, wbnb2 = _watch_fixture(gap=0.0005)   # 5 bps
+    out2 = sweep(chain2, [family2], order2, decimals2, size_base=1.0, base_token=wbnb2,
+                 gas_bps=0.0, v2_fee_bps=25.0, flash_fee_bps=1.0)
+    check(out2["edges"][0].net_bps < 0,
+          f"5 bps of spread cannot pay 27 bps of fees: {out2['edges'][0].net_bps:.2f}")
+
+
+@case
+def a_probe_too_big_for_the_pool_shrinks_instead_of_reporting_nonsense():
+    """
+    Live, this was the difference between a usable tool and a broken one: three
+    of eight families reported "gross -9,870 bps", which is what a probe that
+    consumes the entire pool looks like when it is treated as a price. The
+    shrink costs nothing — the state is already in memory — and the size that
+    worked is recorded, because that is the real finding.
+    """
+    from dex.prefilter import IMPOSSIBLE_LOSS_BPS, FamilyState, PoolState, quote_family
+
+    chain = FakeChain()
+    wbnb = chain.add_token("0x" + "bb" * 20, "WBNB", 18)
+    usdt = chain.add_token("0x" + "dd" * 20, "USDT", 6)
+    # A thin but real V2 pool and a V3 pool that agrees with it.
+    v2 = chain.add_v2_pair("0x" + "41" * 20, wbnb, usdt, 2 * 10 ** 16, 12 * 10 ** 6)
+    v3pool = chain.add_pool("0x" + "42" * 20, wbnb, usdt, 2 * 10 ** 16, 12 * 10 ** 6,
+                            price_token1_per_token0=600.0, fee=100)
+    family = FamilyState(token_a=wbnb, token_b=usdt, pools=[
+        PoolState(address=v2.lower(), venue="pancakeswap_v2", kind="v2", fee_pips=0),
+        PoolState(address=v3pool.lower(), venue="pancakeswap_v3", kind="v3", fee_pips=100),
+    ])
+    decimals = {wbnb.lower(): 18, usdt.lower(): 6}
+
+    # State must be read first: the shrink happens on data already in memory.
+    from dex.prefilter import sweep
+
+    out = sweep(chain, [family], {v2.lower(): (wbnb, usdt), v3pool.lower(): (wbnb, usdt)},
+                decimals, size_base=1.0, base_token=wbnb, gas_bps=0.0)
+    edge = out["edges"][0]
+    check(edge is not None, "a thin pool still quotes at SOME size")
+    check(edge.gross_bps > IMPOSSIBLE_LOSS_BPS,
+          f"the reported edge must be a price, not a swallowed probe: {edge.gross_bps:.0f} bps")
+    check(edge.reductions > 0,
+          "and the probe must have been divided to fit, not merely clamped")
+    check(edge.size_base < 1.0, f"the recorded size is the one that fit: {edge.size_base}")
+
+    # A family that fills at the requested size must not shrink at all.
+    chain2 = FakeChain()
+    wbnb2 = chain2.add_token("0x" + "bb" * 20, "WBNB", 18)
+    usdt2 = chain2.add_token("0x" + "dd" * 20, "USDT", 18)
+    v2b = chain2.add_v2_pair("0x" + "43" * 20, wbnb2, usdt2, 10_000 * 10 ** 18,
+                             6_000_000 * 10 ** 18)
+    v3b = chain2.add_pool("0x" + "44" * 20, wbnb2, usdt2, 10_000 * 10 ** 18,
+                          6_000_000 * 10 ** 18, price_token1_per_token0=600.0, fee=100)
+    family2 = FamilyState(token_a=wbnb2, token_b=usdt2, pools=[
+        PoolState(address=v2b.lower(), venue="pancakeswap_v2", kind="v2", fee_pips=0),
+        PoolState(address=v3b.lower(), venue="pancakeswap_v3", kind="v3", fee_pips=100),
+    ])
+    out2 = sweep(chain2, [family2],
+                 {v2b.lower(): (wbnb2, usdt2), v3b.lower(): (wbnb2, usdt2)},
+                 {wbnb2.lower(): 18, usdt2.lower(): 18}, size_base=1.0,
+                 base_token=wbnb2, gas_bps=0.0)
+    check(out2["edges"][0].reductions == 0,
+          "a deep pool is priced at the size asked for")
+
+
+@case
+def gas_is_charged_in_proportion_to_the_trade():
+    """
+    Gas is a fixed cost per transaction, so it eats a bigger share of a small
+    trade. A prefilter that used a flat bps would be wrong in the direction that
+    matters most: it would call thin, small trades profitable.
+    """
+    from dex.prefilter import gas_bps_for
+
+    small = gas_bps_for(gas_price_wei=int(1e9), gas_units=600_000,
+                        native_price_in_base=1.0, size_base=0.1)
+    large = gas_bps_for(gas_price_wei=int(1e9), gas_units=600_000,
+                        native_price_in_base=1.0, size_base=10.0)
+    check(small > large > 0, f"1 gwei of gas costs more of a small trade: {small} vs {large}")
+    check(abs(small / large - 100.0) < 1e-6, "and exactly in proportion to size")
+
+    # THE ABSOLUTE NUMBER, not just the ratio. The ratio was right while the units
+    # were wrong, which is how a factor of 591,000 hid here: the notional was
+    # multiplied by the native price instead of divided by it. Pinned to an
+    # arithmetic case that anyone can check on a napkin.
+    one_gwei = gas_bps_for(gas_price_wei=int(1e9), gas_units=600_000,
+                           native_price_in_base=1000.0, size_base=1.0)
+    # 600,000 * 1e-9 BNB = 0.0006 BNB = 0.6 USDT of gas ... on a 1 USDT trade.
+    check(abs(one_gwei - 6000.0) < 1e-6,
+          f"600k gas at 1 gwei against a 1 USDT trade is 6000 bps: {one_gwei}")
+    big = gas_bps_for(gas_price_wei=int(1e9), gas_units=600_000,
+                      native_price_in_base=1000.0, size_base=10_000.0)
+    check(abs(big - 0.6) < 1e-6, f"and 0.6 bps against a 10,000 USDT trade: {big}")
+
+    # An unpriced native token charges nothing and says nothing; the caller owns
+    # the warning (the burst loop prints one), because a huge penalty here would
+    # look like a market collapse rather than a missing rate.
+    check(gas_bps_for(1, 1, 0.0, 1.0) == 0.0,
+          "an unknown native price must not be charged as a made-up cost")
+
+
+@case
+def a_family_without_both_legs_is_never_priced():
+    """
+    Two V3 pools, or one pool: the contract cannot run it, so the fast path must
+    not spend its budget on it either. Caught before quoting, not after.
+    """
+    from dex.prefilter import FamilyState, PoolState, quote_family
+
+    chain = FakeChain()
+    wbnb = chain.add_token("0x" + "bb" * 20, "WBNB", 18)
+    usdt = chain.add_token("0x" + "dd" * 20, "USDT", 6)
+    p1 = chain.add_pool("0x" + "31" * 20, wbnb, usdt, 1000 * 10 ** 18,
+                        600_000 * 10 ** 6, price_token1_per_token0=600.0, fee=100)
+    p2 = chain.add_pool("0x" + "32" * 20, wbnb, usdt, 1000 * 10 ** 18,
+                        600_000 * 10 ** 6, price_token1_per_token0=612.0, fee=500)
+    order = {p1.lower(): (wbnb, usdt), p2.lower(): (wbnb, usdt)}
+    decimals = {wbnb.lower(): 18, usdt.lower(): 6}
+
+    v3_only = FamilyState(token_a=wbnb, token_b=usdt, pools=[
+        PoolState(address=p1.lower(), venue="pancakeswap_v3", kind="v3", fee_pips=100),
+        PoolState(address=p2.lower(), venue="uniswap_v3", kind="v3", fee_pips=500),
+    ])
+    check(quote_family(v3_only, 1.0, wbnb, decimals, gas_bps=0.0,
+                       v2_fee_bps=25.0, flash_fee_bps=1.0) is None,
+          "a V3+V3 pair has no V2 leg for this contract")
+
+    single = FamilyState(token_a=wbnb, token_b=usdt, pools=[v3_only.pools[0]])
+    check(quote_family(single, 1.0, wbnb, decimals, gas_bps=0.0,
+                       v2_fee_bps=25.0, flash_fee_bps=1.0) is None,
+          "one pool is not a cross-venue trade")
+
+
+@case
+def a_dead_pool_does_not_poison_the_family():
+    """A reverting getReserves must leave the rest of the family priceable."""
+    from dex.prefilter import sweep
+
+    chain, family, order, decimals, wbnb = _watch_fixture(gap=0.006)
+    chain.dead_calls = {(family.pools[0].address.lower(),
+                         mc.selector("getReserves()"))}
+    out = sweep(chain, [family], order, decimals, size_base=1.0, base_token=wbnb,
+                gas_bps=0.0)
+    check(out["edges"][0] is None,
+          "with the V2 leg dead there is nothing executable left in this family")
+    check(family.pools[0].error, "and the pool says why")
+
+
+@case
+def the_burst_loop_charges_the_venue_fee_the_venue_declares():
+    """
+    A one-line fee conversion cost the whole burst loop its signal: config stores
+    V2 fees as the FACTOR RETAINED (9975/10000), so multiplying by 10,000 and
+    calling it bps produced 9975.0 — a 99.75% fee. Every family then returned "no
+    edge", which reads exactly like a quiet market. The number the loop uses has
+    to come from the venue, not from arithmetic next to it.
+    """
+    from config import VENUES, venues_for
+
+    pancake_v2 = next(v for v in venues_for("bsc") if v.version == "v2")
+    check(abs(pancake_v2.v2_fee_bps - 25.0) < 1e-9,
+          f"PancakeSwap V2 charges 0.25%: {pancake_v2.v2_fee_bps}")
+    uni_v2 = next((v for v in VENUES.values() if v.key == "uniswap_v2"), None)
+    if uni_v2 is not None:
+        check(abs(uni_v2.v2_fee_bps - 30.0) < 1e-9,
+              f"Uniswap V2 charges 0.30%: {uni_v2.v2_fee_bps}")
+
+    # And the fee actually reaches the quote: a family at a perfect price with a
+    # 99.75% leg fee must be nowhere near break-even.
+    from dex.prefilter import FamilyState, PoolState, sweep
+
+    chain, family, order, decimals, wbnb = _watch_fixture(gap=0.0)
+    silly = sweep(chain, [family], order, decimals, size_base=1.0, base_token=wbnb,
+                  gas_bps=0.0, v2_fee_bps=9975.0, flash_fee_bps=1.0)
+    sane = sweep(chain, [family], order, decimals, size_base=1.0, base_token=wbnb,
+                 gas_bps=0.0, v2_fee_bps=25.0, flash_fee_bps=1.0)
+    check(silly["edges"][0] is None or silly["edges"][0].net_bps < -9_000,
+          "a 99.75% fee must not look like a tradeable market")
+    check(sane["edges"][0] is not None,
+          "while the real 0.25% fee leaves the same family priceable")
 
 
 @case

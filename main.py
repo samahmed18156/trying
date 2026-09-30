@@ -2646,6 +2646,367 @@ def cmd_arb_market(args) -> int:
     return 0
 
 
+def cmd_arb_burst(args) -> int:
+    """
+    Watch the deepest families continuously and record every dislocation.
+
+    WHAT IT ANSWERS THAT THE SURVEY CANNOT
+    --------------------------------------
+    The survey's rows are 60 seconds apart, and its wins arrive in bursts: on the
+    one hour-bucket that was positive, two rows out of two cleared, then nothing
+    for hours. That is the signature of an opportunity that is real but SHORT —
+    and a 60-second loop cannot tell the difference between "rare" and "too brief
+    to catch", because it only ever sees one instant per minute.
+
+    This loop spends its budget the other way round. It reads every pool in the
+    watchlist in a single Multicall3 request (a few hundred calls, about half a
+    second, for a dozen families) and prices each family with exact pool maths in
+    Python. So it can run every 2-5 seconds instead of every 60, and the question
+    becomes measurable: when a positive edge appears, how long does it last, how
+    big is it, and does it survive long enough for a transaction to land?
+
+    WHAT IT DOES NOT DO
+    -------------------
+    It does not trade, and it does not decide. A burst loop that acted on its own
+    signal would be trading the prefilter's approximation — no tick crossings, gas
+    from an estimate — and approximation errors that point the wrong way are how
+    a system loses money politely. Rows are marked `prefilter: true`; `arb market`
+    (or `--confirm`) is what turns one into a real quote.
+    """
+    from pathlib import Path
+
+    import time
+
+    from config import venues_for
+    from dex.fetcher import ChainReader
+    from dex.market_index import MarketIndex
+    from dex.prefilter import (FamilyState, PoolState, gas_bps_for, price_of,
+                               sweep)
+
+    settings = Settings()
+    _apply_overrides(args, settings)
+    net, provider = _connect(settings)
+    index = MarketIndex(Path(args.index_path))
+
+    if not index.counts()["pairs"]:
+        print(fmt.red("  the index is empty — build one first:"))
+        print(f"    python main.py arb index build --network {net.key}")
+        return 2
+
+    # The watchlist: the deepest families that a V2+V3 contract can actually run.
+    families = index.families(limit=args.pairs, min_pools=args.min_pools,
+                              min_venues=args.min_venues, require_mixed=True)
+    if not families:
+        print(fmt.yellow("  no executable family in the index (needs one V2 and "
+                         "one V3 pool on the same pair)."))
+        return 2
+
+    symbol_of = index.symbols_map()
+    decimals = {a: int(d) for a, d in index.decimals_map().items()}
+    order = {r[0].lower(): (r[1], r[2]) for r in index.db.execute(
+        "SELECT address, token0, token1 FROM pairs")}
+
+    watch = []
+    for token_a, token_b, pools in families:
+        family = FamilyState(token_a=token_a, token_b=token_b, pools=[
+            PoolState(address=p.address.lower(), venue=p.venue, kind=p.kind,
+                      fee_pips=int(p.fee_pips or 0))
+            for p in pools])
+        watch.append(family)
+
+    base_token = args.base_token
+    if not base_token:
+        # The quote side of a family is the side that repeats; watch the token
+        # that appears most often as the "other" side, so one size means the
+        # same thing across the watchlist.
+        counts: Dict[str, int] = {}
+        for family in watch:
+            for token in (family.token_a, family.token_b):
+                counts[token] = counts.get(token, 0) + 1
+        base_token = max(counts, key=counts.get)
+    base_symbol = symbol_of.get(base_token, base_token[:10])
+
+    # Every watched family must CONTAIN the token the probe is denominated in,
+    # or "1 USDT" means nothing to it: leg 1 would buy a token that is not the
+    # base and leg 2 would try to sell the base into a pool that does not hold
+    # it, which fills nothing at any size. Silently pricing such a family returns
+    # "no edge" for a reason that has nothing to do with the market — so they are
+    # dropped here, and counted out loud.
+    kept, dropped = [], []
+    for family in watch:
+        members = {family.token_a.lower(), family.token_b.lower()}
+        (kept if base_token.lower() in members else dropped).append(family)
+    if dropped:
+        print(fmt.dim(f"  {len(dropped)} family(ies) dropped: they do not trade "
+                      f"{base_symbol}, so a {base_symbol} probe cannot price them"))
+    watch = kept
+    if not watch:
+        print(fmt.red(f"  no watched family trades {base_symbol} — pass "
+                      f"--base-token to choose the probe's token"))
+        return 2
+    # The venue already knows its own fee in bps. Converting the numerator by hand
+    # instead gave 9975.0 bps (config stores 9975/10000 as the FACTOR RETAINED),
+    # which charged the V2 leg 99.75% and made every family in the watchlist
+    # return "no edge" — a whole-loop silent failure from one plausible-looking
+    # line, which is why the suite now pins this number to the property.
+    v2_fee = next((v.v2_fee_bps for v in venues_for(net.key) if v.version == "v2"),
+                  25.0)
+
+    log_path = Path(args.log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print(fmt.banner(f"ARB  ·  burst watch on {net.name}"))
+    print(f"  watch    {len(watch)} family(ies), "
+          f"{sum(len(f.pools) for f in watch)} pools, every {args.interval:g}s")
+    print(f"  size     {settings.trade_size_base:g} {base_symbol}")
+    print(f"  budget   {args.duration:g}s or {args.iterations} iteration(s)")
+    print(f"  log      {log_path}")
+    print(fmt.dim("  fast prefilter: exact pool maths, gas from an estimate, no tick "
+                  "crossings"))
+    print(fmt.dim("  this command never signs or sends anything"))
+    if args.show_watch:
+        for family in watch:
+            print(f"    {symbol_of.get(family.token_a, family.token_a[:10]):>10}"
+                  f"/{symbol_of.get(family.token_b, family.token_b[:10]):<10} "
+                  + ", ".join(f"{p.venue.split('_')[0][:5]}-{p.kind}{p.fee_pips or ''}"
+                              for p in family.pools))
+
+    # Gas is paid in the native token and the edge is measured in base units, so
+    # the loop needs a live native price. --native-price wins; otherwise the
+    # deepest native/base pool rides along in the same Multicall (see
+    # _native_sensor_family) and is priced fresh every sweep.
+    native_addr = (getattr(net, "tokens", None) or {}).get(net.native_symbol)
+    if not native_addr:                        # ETH chains name it differently
+        native_addr = (getattr(net, "tokens", None) or {}).get("W" + net.native_symbol)
+    sensor = None
+    native_price = float(args.native_price or 0.0)
+    if not native_price and native_addr and native_addr.lower() != base_token.lower():
+        sensor = _native_sensor_family(index, net, native_addr, base_token)
+        if sensor is not None:
+            watch.append(sensor)
+            print(fmt.dim(f"  gas price from {sensor.pools[0].venue} "
+                          f"{sensor.pools[0].address[:10]}… ({net.native_symbol}/{base_symbol})"))
+    elif not native_price:
+        print(fmt.yellow(f"  no live {net.native_symbol}/{base_symbol} pool available: "
+                         f"gas is NOT charged in the reported net edge"))
+
+    reader = ChainReader(provider, net)
+    started = time.time()
+    gas_price = None
+    last_heartbeat = time.time()
+    rows = 0
+    positives = 0
+    streaks: Dict[int, int] = {}          # family -> current consecutive-positive run
+    best_run: Dict[int, int] = {}
+    first_positive: Dict[int, float] = {}
+    attempts = 0
+    failures = 0
+
+    for i in range(1, args.iterations + 1):
+        if args.duration and (time.time() - started) >= args.duration:
+            break
+        t0 = time.time()
+        attempts += 1
+
+        # Request budget: the sweep itself is ONE request, and everything else is
+        # deliberately kept off the fast path. Gas price is nearly constant, so it
+        # is re-read once every GAS_REFRESH sweeps rather than every sweep — a
+        # per-sweep gas_price call would double the request count and halve the
+        # sampling rate for a number that moves in the fourth decimal. The native
+        # price, which does move, comes free inside the sweep's own request.
+        if gas_price is None or i % GAS_REFRESH == 1:
+            try:
+                gas_price = int(provider.w3.eth.gas_price)
+            except Exception:                 # noqa: BLE001 - use the fallback
+                gas_price = gas_price or int(1e9)
+        gas_units = int(args.gas_units or getattr(settings, "gas_units", 0) or 600_000)
+        gas_bps = gas_bps_for(gas_price or int(1e9), gas_units,
+                              native_price, settings.trade_size_base)
+
+        try:
+            out = sweep(provider.w3, watch, order, decimals,
+                        size_base=settings.trade_size_base,
+                        base_token=base_token, gas_bps=gas_bps,
+                        v2_fee_bps=v2_fee, batch_size=args.batch)
+        except Exception as exc:              # noqa: BLE001 - one bad sweep
+            failures += 1
+            print(f"  [{i:>4}] sweep failed: {type(exc).__name__}: {exc}")
+            time.sleep(max(args.interval - (time.time() - t0), 0.0))
+            continue
+
+        # The sensor pool came back in the same request: price the native token
+        # from live reserves before the next gas figure is computed.
+        if sensor is not None and sensor.pools and sensor.pools[0].ok:
+            rate = price_of(sensor.pools[0], native_addr, decimals)
+            if rate > 0:
+                native_price = rate
+
+        elapsed = time.time() - t0
+        now = time.time()
+        hits = []
+        for fi, edge in out["edges"].items():
+            if edge is None:
+                streaks[fi] = 0
+                continue
+            if edge.net_bps > 0:
+                positives += 1
+                streaks[fi] = streaks.get(fi, 0) + 1
+                best_run[fi] = max(best_run.get(fi, 0), streaks[fi])
+                first_positive.setdefault(fi, now)
+                hits.append((fi, edge))
+            else:
+                streaks[fi] = 0
+
+        # THE LOG MUST BE ABLE TO PROVE A NEGATIVE.
+        # Writing rows only when something wins produces a file where three rows
+        # could mean three wins out of three sweeps or three out of a million, and
+        # a stopped loop leaves exactly the same trace as a quiet market. So a
+        # heartbeat row goes out on a timer with the best candidate at that moment
+        # and the running counters — that is what makes "six hours, nothing above
+        # break-even, and here is how it looked the whole time" a measurement.
+        if args.heartbeat and (now - last_heartbeat) >= args.heartbeat:
+            last_heartbeat = now
+            best_i = max((i2 for i2, e in out["edges"].items() if e is not None),
+                         key=lambda i2: out["edges"][i2].net_bps, default=None)
+            best_edge = out["edges"][best_i] if best_i is not None else None
+            beat = {"ts": round(now, 3), "row_type": "heartbeat", "iteration": i,
+                    "network": net.key, "sweeps": attempts, "failures": failures,
+                    "positives_so_far": positives, "gas_price_wei": gas_price,
+                    "gas_bps": round(gas_bps, 3), "native_price": native_price,
+                    "reads": out["stats"].get("calls", 0),
+                    "requests": out["stats"].get("requests", 0),
+                    "elapsed_s": round(elapsed, 3)}
+            if best_edge is not None:
+                family = watch[best_i]
+                beat["pair"] = (f"{symbol_of.get(family.token_a, family.token_a[:10])}/"
+                                f"{symbol_of.get(family.token_b, family.token_b[:10])}")
+                beat.update(best_edge.row())
+            with log_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(beat, default=str) + "\n")
+            if args.each_sweep:
+                print(f"  [{i:>4}] heartbeat  best {best_edge.net_bps:+.2f} bps"
+                      if best_edge is not None else f"  [{i:>4}] heartbeat  no candidate")
+
+        if hits or i == 1 or args.each_sweep:
+            for fi, edge in hits:
+                family = watch[fi]
+                pair = (f"{symbol_of.get(family.token_a, family.token_a[:10])}/"
+                        f"{symbol_of.get(family.token_b, family.token_b[:10])}")
+                row = {"ts": round(now, 3), "row_type": "positive",
+                       "iteration": i, "network": net.key,
+                       "pair": pair, "prefilter": True,
+                       "block": getattr(reader, "block_number", lambda: 0)(),
+                       "streak": streaks.get(fi, 1),
+                       "best_streak": best_run.get(fi, 1),
+                       "gas_price_wei": gas_price, "gas_bps": round(gas_bps, 3),
+                       "native_price": native_price,
+                       **edge.row()}
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, default=str) + "\n")
+                rows += 1
+                print(f"  [{i:>4}] {pair:<22} net {edge.net_bps:>+7.2f} bps  "
+                      f"gross {edge.gross_bps:>+7.2f}  ({edge.buy_venue} -> "
+                      f"{edge.sell_venue})  streak {streaks.get(fi, 1)}")
+
+        if args.each_sweep:
+            # The BEST candidate is the interesting number; printing the worst
+            # made every sweep look equally hopeless and hid the runner-up.
+            near = max((e.net_bps for e in out["edges"].values() if e), default=0.0)
+            print(f"  [{i:>4}] {elapsed:5.2f}s  {out['stats'].get('calls', 0)} reads "
+                  f"in {out['stats'].get('requests', 0)} request(s)  "
+                  f"best {near:+.2f} bps", flush=True)
+
+        nap = args.interval - (time.time() - t0)
+        if nap > 0:
+            time.sleep(nap)
+
+    print(fmt.cyan("\n  SUMMARY"))
+    print(f"    iterations   {attempts} ({failures} failed sweeps)")
+    print(f"    positives    {positives} family-observations with a positive edge")
+    if native_price > 0:
+        print(f"    gas priced   1 {net.native_symbol} = {native_price:,.2f} "
+              f"{base_symbol} (live pool mid), {gas_units:,} units at "
+              f"{(gas_price or 0) / 1e9:.3f} gwei = {gas_bps:.3f} bps of a "
+              f"{settings.trade_size_base:g} {base_symbol} trade")
+    else:
+        print(fmt.yellow(f"    gas NOT priced: no live {net.native_symbol}/"
+                         f"{base_symbol} rate this run, so the net numbers above "
+                         f"are missing the gas cost. Pass --native-price to charge it."))
+    if rows:
+        print(f"    logged       {rows} row(s) -> {log_path}")
+    if best_run:
+        print(f"    {fmt.cyan('LONGEST POSITIVE RUNS')} (consecutive sweeps, at "
+              f"{args.interval:g}s each — this is the catchability measure)")
+        ranked = sorted(best_run.items(), key=lambda kv: -kv[1])[:5]
+        for fi, run in ranked:
+            family = watch[fi]
+            pair = (f"{symbol_of.get(family.token_a, family.token_a[:10])}/"
+                    f"{symbol_of.get(family.token_b, family.token_b[:10])}")
+            seconds = run * args.interval
+            verdict = ("would survive a transaction" if seconds >= 5
+                       else "too brief to act on")
+            print(f"      {pair:<22} {run:>3} sweeps (~{seconds:>5.1f}s)  {verdict}")
+    if not positives:
+        print(fmt.yellow("    No positive edge observed in this window. That is a "
+                         "measurement, not a failure — it says the watchlist did "
+                         "not misprice while it was watched."))
+    print(f"    log          {log_path}")
+    return 0
+
+
+# The burst loop's sweep is one request; gas price is re-read this often (in
+# sweeps) because it is nearly constant and a per-sweep read would halve the
+# sampling rate for no information.
+GAS_REFRESH = 20
+
+
+def _native_sensor_family(index, net, native_addr: str, base_token: str):
+    """
+    The deepest native/base pool in the index, as a one-pool family.
+
+    Why it exists: the burst loop reports a net edge in bps, and gas is part of
+    that — but gas is paid in BNB and the edge is measured in USDT, so something
+    has to price the cross. A hard-coded rate would be a silent lie, a second
+    RPC call per sweep would double the request count, and the survey's own
+    conversion only works when the quote IS the wrapped native.
+
+    So the pool that already quotes this pair rides along in the SAME Multicall as
+    the watchlist. Zero extra requests, always the current block, and the rate is
+    whatever the market's deepest V2 pool says it is — reserves, not an estimate.
+    Returns None when the index has no such pool, and the caller then says out
+    loud that gas is not being charged instead of pretending it is.
+    """
+    from dex.prefilter import FamilyState, PoolState
+
+    a, b = native_addr.lower(), base_token.lower()
+    rows = list(index.db.execute(
+        "SELECT address, venue, kind, fee_pips, token0, token1, reserve0, reserve1 "
+        "FROM pairs WHERE (token0=? AND token1=?) OR (token0=? AND token1=?)",
+        (a, b, b, a)))
+    if not rows:
+        return None
+
+    def native_depth(row):
+        # How much of the NATIVE token the pool holds, in raw units. Comparing raw
+        # units is only valid within one token, which is exactly the case here, and
+        # it avoids a decimals lookup before the state is even read. Reserves come
+        # back from SQLite as uint256 hex, the same encoding the index writes.
+        _addr, _venue, _kind, _fee, t0, t1, r0, r1 = row
+        raw = r0 if t0.lower() == a else r1
+        return int(raw, 16) if isinstance(raw, str) else int(raw)
+
+    rows.sort(key=native_depth, reverse=True)
+    best = None
+    for row in rows:
+        if str(row[2]) == "v2":                # a V2 mid is exact from reserves
+            best = row
+            break
+    if best is None:
+        best = rows[0]
+    return FamilyState(token_a=native_addr, token_b=base_token, pools=[
+        PoolState(address=best[0].lower(), venue=best[1], kind=best[2],
+                  fee_pips=int(best[3] or 0))])
+
+
 def cmd_arb_analyze(args) -> int:
     """
     Summarise the survey logs: which direction, venue pair and size the money is
@@ -3582,6 +3943,41 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--log", default="logs/arb_market.jsonl",
                     help="JSONL file to append results to (default logs/arb_market.jsonl)")
     ap.set_defaults(func=cmd_arb_market)
+
+    ap = asub.add_parser("burst",
+                         help="watch the deepest families continuously and record "
+                              "every dislocation — answers whether a win is "
+                              "catchable, not just whether it exists")
+    common(ap)
+    ap.add_argument("--venues", help="comma-separated venue keys (default: all)")
+    ap.add_argument("--pairs", type=int, default=12,
+                    help="families to watch, deepest first (default 12)")
+    ap.add_argument("--min-pools", type=int, default=2)
+    ap.add_argument("--min-venues", type=int, default=2)
+    ap.add_argument("--base-token", metavar="ADDRESS",
+                    help="token the size is denominated in (default: the one most "
+                         "families have in common)")
+    ap.add_argument("--native-price", type=float, default=0.0, metavar="BASE",
+                    help="price of the native token in the size token, for the gas "
+                         "share of the edge (0 = report gas as 0 bps)")
+    ap.add_argument("--interval", type=float, default=3.0,
+                    help="seconds between sweeps (default 3)")
+    ap.add_argument("--iterations", type=int, default=100000)
+    ap.add_argument("--duration", type=float, default=300.0, metavar="SECONDS",
+                    help="stop after this long (default 300; 0 = until iterations)")
+    ap.add_argument("--batch", type=int, default=3000)
+    ap.add_argument("--show-watch", action="store_true",
+                    help="print the watchlist before starting")
+    ap.add_argument("--heartbeat", type=float, default=60.0, metavar="SECONDS",
+                    help="write one log row every N seconds even when nothing is "
+                         "positive, so a quiet window is provable rather than "
+                         "indistinguishable from a stopped loop (default 60)")
+    ap.add_argument("--each-sweep", action="store_true", dest="each_sweep",
+                    help="a line per sweep, including sweeps with no candidate "
+                         "(named this way because --verbose is the global debug flag)")
+    ap.add_argument("--index-path", default="state/market_index.sqlite")
+    ap.add_argument("--log", default="logs/arb_burst.jsonl")
+    ap.set_defaults(func=cmd_arb_burst)
 
     ap = asub.add_parser("analyze",
                          help="read the survey logs and say where the edge lives "

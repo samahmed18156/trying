@@ -462,6 +462,9 @@ python main.py arb index stats --network bsc         # what is indexed, how much
 python main.py arb market --network bsc --pairs 25 --refresh
                                                      # deep-scan every pair quoted on
                                                      # two venues, log the evidence
+python main.py arb burst --network bsc --pairs 12 --size 1000 --interval 3
+                                                     # watch the deepest families every
+                                                     # 3s and log every dislocation
 python main.py arb preflight --network bsc --private https://bsc.blockrazor.xyz
                                                      # every check that real money depends on:
                                                      # market gate, deployment freshness, wallet,
@@ -481,6 +484,21 @@ the index holds every liquid pool the chain has (built by walking the factory,
 or in seconds by asking it about a token list), and the scan iterates the pairs
 that are quoted on more than one venue. Design, measurements and limits:
 [`docs/market-index.md`](docs/market-index.md).
+
+`arb survey` and `arb market` sample far too slowly to answer the question that
+decides whether this thing is worth running: not "is a pair ever mispriced" but
+"does a mispricing last long enough to land a transaction". `arb burst` watches
+the deepest executable families and reads every pool in the watchlist in ONE
+Multicall3 request — 0.4-0.6 s per sweep for a dozen families, so it runs every
+few seconds instead of every minute, prices each round trip with exact pool
+maths, and logs how many consecutive sweeps each positive edge survived. A
+positive that lasts one sweep is noise; one that lasts ten is a trade. It never
+signs or sends, and its rows are marked `prefilter: true` — `arb market` is what
+turns one into a real quote.
+
+Leaving either loop running for hours is what `scripts/run_evidence.sh` is for
+(installs dependencies if they are missing, restarts on any exit, appends to the
+same logs).
 
 `--venue` names one DEX for any command, e.g. `--venue pancakeswap_v3`.
 `--network bsc` and `--network bsc_testnet` are both supported. On testnet use

@@ -199,6 +199,40 @@ process that no longer exists.
 Best route found after all of it: **USDT/USDC at −3.68 bps net** (v3_first,
 Uniswap V3 0.30% → Pancake V2) — the closest to clearing yet, and still short.
 
+## 7c. `arb burst` — is a win catchable, not just present
+
+A 60-second loop measures the wrong thing. It answers "is the pair mispriced at
+this instant", and the honest answer to that has been yes often enough to matter
+and never often enough to act on — while the actual question is whether a
+mispricing survives long enough for a transaction to land. `arb burst` asks that
+one:
+
+* the watchlist is the deepest families that a V2+V3 contract can actually run,
+  read in a single Multicall3 request — 12 families / 50 pools in 0.4-0.6 s,
+  one request per sweep, so the loop runs every few seconds, not every minute;
+* each round trip is priced exactly (constant product for the V2 leg, the
+  project's own V3 maths for the other) with that leg's own fee, then the flash
+  fee and gas;
+* a probe too big for a thin pool is skipped and re-priced smaller — the state is
+  already in memory, so the shrink is free — and the size that fit is recorded,
+  because that is how much trade the pair can absorb;
+* a positive edge is logged with its streak length: consecutive sweeps it
+  survived. That, not the bps alone, is the catchability measure;
+* heartbeat rows go out every 60 s with the best candidate at that moment, so a
+  quiet window is provable instead of looking like a stopped loop.
+
+Gas is priced live. The deepest native/base pool rides along in the same request
+as the watchlist, so the loop knows what BNB costs in USDT at that block. This
+matters more than it sounds: 600k gas at 0.05 gwei is 231 bps of a 1 USDT trade
+and 0.231 bps of a 1,000 USDT one, which is why the evidence loop runs the
+survey at size 1 and the burst watch at size 1,000 — at 1 unit the gas cost alone
+is an order of magnitude larger than any spread observed so far.
+
+The prefilter is deliberately optimistic about size (single-range V3) and
+explicitly not about fees. Its job is to decide where to point the deep scanner,
+and its rows say so. Measured against the real routers on the one live family
+with a dislocation, the two agree to within a few bps at different instants.
+
 ## 8. Honest limits
 
 - **Reach of key discovery**: only pairs against the configured anchors
